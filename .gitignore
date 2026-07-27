@@ -1,0 +1,10 @@
+/target
+config.yaml
+
+# OS & IDE Junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.tmp

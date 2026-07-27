@@ -1,0 +1,17 @@
+[package]
+name = "mew-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mew-cdp = { workspace = true }
+mew-perception = { workspace = true }
+mew-agent = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
