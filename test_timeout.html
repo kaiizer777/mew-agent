@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><title>Timeout Test</title></head>
+<body>
+    <button id="btn1">Button 1</button>
+    <button id="btn2">Button 2</button>
+    <script>
+        document.getElementById('btn1').addEventListener('click', () => {
+            // Freeze the main thread so CDP times out!
+            while(true) {}
+        });
+    </script>
+</body>
+</html>

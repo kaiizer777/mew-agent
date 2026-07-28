@@ -1,0 +1,658 @@
+[Structural] | RootWebArea | name: "GitHub"
+  [Structural] | none
+    [Structural] | none
+      [Structural] | none
+        [Structural] | generic
+        [Structural] | generic
+          [Interactive] | link | ref: @e231 | name: "Skip to content"
+            [Content] | StaticText | name: "Skip to content"
+              [Content] | InlineTextBox | name: "S"
+              [Content] | InlineTextBox | name: "k"
+              [Content] | InlineTextBox | name: "i"
+              [Content] | InlineTextBox | name: "p "
+              [Content] | InlineTextBox | name: "t"
+              [Content] | InlineTextBox | name: "o "
+              [Content] | InlineTextBox | name: "c"
+              [Content] | InlineTextBox | name: "o"
+              [Content] | InlineTextBox | name: "n"
+              [Content] | InlineTextBox | name: "t"
+              [Content] | InlineTextBox | name: "e"
+              [Content] | InlineTextBox | name: "n"
+              [Content] | InlineTextBox | name: "t"
+          [Structural] | none
+            [Structural] | none
+          [Structural] | none
+            [Structural] | generic
+          [Structural] | none
+            [Structural] | generic
+              [Structural] | banner | name: "Global navigation menu"
+                [Structural] | none
+                  [Structural] | none
+                    [Structural] | generic
+                      [Interactive] | button | ref: @e261 | name: "Open menu"
+                    [Structural] | none
+                      [Structural] | none
+                    [Interactive] | link | ref: @e266 | name: "Homepage ( g then d )"
+                    [Structural] | none
+                      [Structural] | none
+                      [Structural] | none
+                        [Structural] | none
+                        [Structural] | none
+                        [Structural] | none
+                  [Structural] | none
+                    [Structural] | navigation | name: "Breadcrumbs"
+                      [Structural] | list
+                        [Structural] | listitem
+                          [Interactive] | link | ref: @e286 | name: "Dashboard"
+                            [Structural] | none
+                              [Content] | StaticText | name: "Dashboard"
+                                [Content] | InlineTextBox | name: "Dashboard"
+                    [Interactive] | button | ref: @e299 | name: "Search or jump to… ( forward slash )"
+                    [Structural] | none
+                      [Structural] | none
+                      [Structural] | none
+                        [Structural] | none
+                        [Structural] | none
+                        [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                        [Structural] | none
+                          [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                    [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                    [Structural] | none
+                    [Structural] | none
+                  [Structural] | none
+                    [Structural] | none
+                      [Structural] | none
+                        [Structural] | none
+                          [Structural] | none
+                            [Structural] | generic
+                              [Interactive] | link | ref: @e451 | name: "Chat with Copilot"
+                              [Structural] | none
+                                [Structural] | none
+                            [Structural] | generic
+                              [Interactive] | button | ref: @e458 | name: "Open Copilot…"
+                                [Structural] | none
+                        [Structural] | generic
+                      [Structural] | none
+                      [Interactive] | button | ref: @e469 | name: "Create new..."
+                        [Structural] | none
+                          [Structural] | none
+                        [Structural] | none
+                      [Structural] | none
+                        [Structural] | none
+                      [Structural] | none
+                        [Interactive] | link | ref: @e479 | name: "All issues ( g then i )"
+                        [Structural] | none
+                          [Structural] | none
+                          [Structural] | none
+                            [Structural] | none
+                            [Structural] | none
+                            [Structural] | none
+                        [Interactive] | link | ref: @e496 | name: "All pull requests ( g then p )"
+                        [Structural] | none
+                          [Structural] | none
+                          [Structural] | none
+                            [Structural] | none
+                            [Structural] | none
+                            [Structural] | none
+                        [Interactive] | link | ref: @e512 | name: "All repositories"
+                        [Structural] | none
+                          [Structural] | none
+                    [Interactive] | link | ref: @e517 | name: "You have no unread notifications ( g then n )"
+                    [Structural] | none
+                      [Structural] | none
+                      [Structural] | none
+                        [Structural] | none
+                        [Structural] | none
+                        [Structural] | none
+                    [Structural] | generic
+                      [Interactive] | button | ref: @e534 | name: "Open user navigation menu"
+                        [Content] | image | name: "User avatar"
+                      [Structural] | none
+                        [Structural] | none
+          [Structural] | none
+            [Structural] | none
+              [Structural] | none
+          [Structural] | none
+            [Structural] | none
+              [Structural] | none
+        [Structural] | generic
+        [Structural] | generic
+        [Structural] | none
+        [Structural] | none
+          [Structural] | none
+            [Structural] | none
+              [Structural] | complementary | name: "Account"
+                [Structural] | generic
+                  [Structural] | none
+                    [Structural] | none
+                    [Structural] | generic
+                      [Structural] | none
+                        [Structural] | none
+                          [Structural] | navigation | name: "Repositories"
+                            [Structural] | none
+                              [Structural] | none
+                                [Content] | heading | name: "Top repositories"
+                                  [Content] | StaticText | name: "Top repositories"
+                                    [Content] | InlineTextBox | name: "Top repositories"
+                                [Interactive] | link | ref: @e583 | name: "New"
+                                  [Structural] | none
+                                    [Structural] | none
+                                    [Structural] | none
+                                      [Content] | StaticText | name: "New"
+                                        [Content] | InlineTextBox | name: "New"
+                              [Structural] | search | name: "Top repositories"
+                                [Interactive] | textbox | ref: @e40 | name: "Find a repository…"
+                                  [Structural] | none
+                                  [Structural] | generic
+                              [Structural] | list
+                                [Structural] | listitem
+                                  [Structural] | none
+                                    [Interactive] | link | ref: @e595 | name: "Repository"
+                                      [Content] | image | name: "Repository"
+                                    [Structural] | generic
+                                      [Interactive] | link | ref: @e597 | name: "kaiizer777/MultiTenant-SaaS"
+                                        [Content] | StaticText | name: "kaiizer777"
+                                          [Content] | InlineTextBox | name: "kaiizer777"
+                                        [Content] | StaticText | name: "/"
+                                          [Content] | InlineTextBox | name: "/"
+                                        [Content] | StaticText | name: "MultiTenant-SaaS"
+                                          [Content] | InlineTextBox | name: "MultiTenant-SaaS"
+                                [Structural] | listitem
+                                  [Structural] | none
+                                    [Interactive] | link | ref: @e601 | name: "Repository"
+                                      [Content] | image | name: "Repository"
+                                    [Structural] | generic
+                                      [Interactive] | link | ref: @e603 | name: "kaiizer777/ui-components"
+                                        [Content] | StaticText | name: "kaiizer777"
+                                          [Content] | InlineTextBox | name: "kaiizer777"
+                                        [Content] | StaticText | name: "/"
+                                          [Content] | InlineTextBox | name: "/"
+                                        [Content] | StaticText | name: "ui-components"
+                                          [Content] | InlineTextBox | name: "ui-components"
+                                [Structural] | listitem
+                                  [Structural] | none
+                                    [Interactive] | link | ref: @e607 | name: "Repository"
+                                      [Content] | image | name: "Repository"
+                                    [Structural] | generic
+                                      [Interactive] | link | ref: @e609 | name: "kaiizer777/freelanceOS"
+                                        [Content] | StaticText | name: "kaiizer777"
+                                          [Content] | InlineTextBox | name: "kaiizer777"
+                                        [Content] | StaticText | name: "/"
+                                          [Content] | InlineTextBox | name: "/"
+                                        [Content] | StaticText | name: "freelanceOS"
+                                          [Content] | InlineTextBox | name: "freelanceOS"
+                                [Structural] | listitem
+                                  [Structural] | none
+                                    [Interactive] | link | ref: @e613 | name: "Repository"
+                                      [Content] | image | name: "Repository"
+                                    [Structural] | generic
+                                      [Interactive] | link | ref: @e615 | name: "kaiizer777/kaizer"
+                                        [Content] | StaticText | name: "kaiizer777"
+                                          [Content] | InlineTextBox | name: "kaiizer777"
+                                        [Content] | StaticText | name: "/"
+                                          [Content] | InlineTextBox | name: "/"
+                                        [Content] | StaticText | name: "kaizer"
+                                          [Content] | InlineTextBox | name: "kaizer"
+                                [Structural] | listitem
+                                  [Structural] | none
+                                    [Interactive] | link | ref: @e619 | name: "Repository"
+                                      [Content] | image | name: "Repository"
+                                    [Structural] | generic
+                                      [Interactive] | link | ref: @e621 | name: "kaiizer777/mew-agent"
+                                        [Content] | StaticText | name: "kaiizer777"
+                                          [Content] | InlineTextBox | name: "kaiizer777"
+                                        [Content] | StaticText | name: "/"
+                                          [Content] | InlineTextBox | name: "/"
+                                        [Content] | StaticText | name: "mew-agent"
+                                          [Content] | InlineTextBox | name: "mew-agent"
+                                [Structural] | listitem
+                                  [Structural] | none
+                                    [Interactive] | link | ref: @e625 | name: "Repository"
+                                      [Content] | image | name: "Repository"
+                                    [Structural] | generic
+                                      [Interactive] | link | ref: @e627 | name: "kaiizer777/onyx-scrapper"
+                                        [Content] | StaticText | name: "kaiizer777"
+                                          [Content] | InlineTextBox | name: "kaiizer777"
+                                        [Content] | StaticText | name: "/"
+                                          [Content] | InlineTextBox | name: "/"
+                                        [Content] | StaticText | name: "onyx-scrapper"
+                                          [Content] | InlineTextBox | name: "onyx-scrapper"
+                                [Structural] | listitem
+                                  [Structural] | none
+                                    [Interactive] | link | ref: @e631 | name: "Repository"
+                                      [Content] | image | name: "Repository"
+                                    [Structural] | generic
+                                      [Interactive] | link | ref: @e633 | name: "kaiizer777/triad"
+                                        [Content] | StaticText | name: "kaiizer777"
+                                          [Content] | InlineTextBox | name: "kaiizer777"
+                                        [Content] | StaticText | name: "/"
+                                          [Content] | InlineTextBox | name: "/"
+                                        [Content] | StaticText | name: "triad"
+                                          [Content] | InlineTextBox | name: "triad"
+                              [Structural] | generic
+                                [Interactive] | button | ref: @e636 | name: "Show more"
+                                  [Content] | StaticText | name: "Show more"
+                                    [Content] | InlineTextBox | name: "Show more"
+              [Structural] | none
+                [Structural] | none
+                  [Structural] | none
+                    [Structural] | none
+                      [Structural] | main
+                        [Structural] | none
+                          [Structural] | generic
+                            [Content] | heading | name: "Dashboard"
+                              [Content] | StaticText | name: "Dashboard"
+                                [Content] | InlineTextBox | name: "Dashboard"
+                            [Structural] | none
+                              [Content] | heading | name: "Home"
+                                [Content] | StaticText | name: "Home"
+                                  [Content] | InlineTextBox | name: "Home"
+                            [Structural] | none
+                              [Structural] | none
+                                [Structural] | none
+                                  [Structural] | generic
+                                    [Structural] | none
+                                      [Structural] | generic
+                                        [Structural] | none
+                                          [Structural] | generic
+                                            [Structural] | status
+                                            [Structural] | generic
+                                              [Structural] | generic
+                                                [Interactive] | textbox | ref: @e39 | name: "Ask anything or type @ to add context"
+                                                  [Structural] | none
+                                                  [Structural] | generic
+                                            [Structural] | none
+                                              [Structural] | generic
+                                                [Structural] | none
+                                                  [Interactive] | button | ref: @e1953 | name: "Ask"
+                                                    [Structural] | none
+                                                      [Structural] | none
+                                                      [Structural] | none
+                                                        [Content] | StaticText | name: "Ask"
+                                                          [Content] | InlineTextBox | name: "Ask"
+                                                    [Structural] | none
+                                              [Structural] | none
+                                                [Interactive] | button | ref: @e1962 | name: "Select repositories to attach to conversation"
+                                                  [Structural] | none
+                                                    [Structural] | none
+                                                    [Structural] | none
+                                                      [Structural] | generic
+                                                        [Content] | StaticText | name: "All repositories"
+                                                          [Content] | InlineTextBox | name: "All repositories"
+                                                  [Structural] | none
+                                                [Interactive] | button | ref: @e782 | name: "Add files, and spaces"
+                                                [Structural] | none
+                                                  [Structural] | none
+                                              [Structural] | none
+                                                [Structural] | generic
+                                                  [Interactive] | button | ref: @e787 | name: "Send now ( enter )"
+                                                  [Structural] | none
+                                                    [Structural] | none
+                                                    [Structural] | none
+                                                      [Structural] | none
+                                                      [Structural] | none
+                                                      [Structural] | none
+                                          [Structural] | none
+                                      [Content] | heading | name: "Chat commands"
+                                        [Content] | StaticText | name: "Chat commands"
+                                          [Content] | InlineTextBox | name: "Chat "
+                                          [Content] | InlineTextBox | name: "commands"
+                                      [Structural] | none
+                                        [Structural] | list
+                                          [Structural] | listitem
+                                            [Interactive] | button | ref: @e806 | name: "Agent"
+                                              [Structural] | none
+                                                [Structural] | none
+                                                [Structural] | none
+                                                  [Content] | StaticText | name: "Agent"
+                                                    [Content] | InlineTextBox | name: "Agent"
+                                          [Structural] | listitem
+                                            [Interactive] | button | ref: @e813 | name: "Create issue"
+                                              [Structural] | none
+                                                [Structural] | none
+                                                [Structural] | none
+                                                  [Content] | StaticText | name: "Create issue"
+                                                    [Content] | InlineTextBox | name: "Create issue"
+                                          [Structural] | listitem
+                                            [Interactive] | button | ref: @e820 | name: "Write code"
+                                              [Structural] | none
+                                                [Structural] | none
+                                                  [Structural] | generic
+                                                [Structural] | none
+                                                  [Content] | StaticText | name: "Write code"
+                                                    [Content] | InlineTextBox | name: "Write code"
+                                              [Structural] | none
+                                          [Structural] | listitem
+                                            [Interactive] | button | ref: @e831 | name: "Git"
+                                              [Structural] | none
+                                                [Structural] | none
+                                                  [Structural] | generic
+                                                [Structural] | none
+                                                  [Content] | StaticText | name: "Git"
+                                                    [Content] | InlineTextBox | name: "Git"
+                                              [Structural] | none
+                                          [Structural] | listitem
+                                            [Interactive] | button | ref: @e842 | name: "Pull requests"
+                                              [Structural] | none
+                                                [Structural] | none
+                                                  [Structural] | generic
+                                                [Structural] | none
+                                                  [Content] | StaticText | name: "Pull requests"
+                                                    [Content] | InlineTextBox | name: "Pull requests"
+                                              [Structural] | none
+                              [Structural] | none
+                                [Structural] | none
+                              [Structural] | none
+                              [Structural] | none
+                              [Structural] | none
+                                [Structural] | none
+                                  [Content] | heading | name: "Feed"
+                                    [Content] | StaticText | name: "Feed"
+                                      [Content] | InlineTextBox | name: "Feed"
+                                  [Structural] | none
+                                    [Structural] | none
+                                      [Structural] | group
+                                        [Structural] | none
+                                          [Interactive] | button | ref: @e15 | name: "Filter"
+                                            [Content] | StaticText | name: "Filter"
+                                              [Content] | InlineTextBox | name: "Filter"
+                                        [Structural] | none
+                                    [Structural] | generic
+                                      [Interactive] | button | ref: @e16 | name: "Explore"
+                                      [Structural] | none
+                                        [Structural] | none
+                                          [Structural] | none
+                                      [Structural] | none
+                                        [Structural] | none
+                                      [Structural] | none
+                                        [Structural] | none
+                                        [Structural] | none
+                                [Structural] | none
+                                  [Structural] | generic
+                                    [Structural] | generic
+                                    [Structural] | article
+                                      [Structural] | none
+                                        [Structural] | none
+                                          [Structural] | generic
+                                            [Structural] | sectionheader
+                                              [Structural] | none
+                                              [Content] | heading | name: "Trending repositories"
+                                                [Content] | StaticText | name: "Trending repositories"
+                                                  [Content] | InlineTextBox | name: "Trending repositories"
+                                              [Structural] | none
+                                                [Content] | StaticText | name: "·"
+                                                  [Content] | InlineTextBox | name: "·"
+                                              [Interactive] | link | ref: @e1073 | name: "See more"
+                                                [Content] | StaticText | name: "See more"
+                                                  [Content] | InlineTextBox | name: "See more"
+                                          [Structural] | none
+                                            [Structural] | none
+                                              [Structural] | none
+                                                [Structural] | region | name: "repository body 0-0"
+                                                  [Structural] | none
+                                                    [Structural] | none
+                                                      [Structural] | none
+                                                        [Interactive] | link | ref: @e1081 | name: "@fuadmefleh profile"
+                                                          [Content] | image | name: "@fuadmefleh profile"
+                                                        [Interactive] | link | ref: @e1082 | name: "fuadmefleh/Shared-Claude-Chats"
+                                                          [Content] | StaticText | name: "fuadmefleh/Shared-Claude-Chats"
+                                                            [Content] | InlineTextBox | name: "fuadmefleh/Shared-Claude-Chats"
+                                                      [Structural] | none
+                                                        [Structural] | generic
+                                                          [Content] | StaticText | name: "An archive of public Claude and Grok conversations, exported from their share links as plain markdown, plus the two scripts that produce it."
+                                                            [Content] | InlineTextBox | name: "An archive of public Claude and Grok "
+                                                            [Content] | InlineTextBox | name: "conversations, exported from their share links "
+                                                            [Content] | InlineTextBox | name: "as plain markdown, plus the two scripts that "
+                                                            [Content] | InlineTextBox | name: "produce it."
+                                                        [Structural] | none
+                                                          [Structural] | region | name: "Repo Details 0-0"
+                                                            [Structural] | generic
+                                                              [Structural] | generic
+                                                              [Content] | StaticText | name: "Python"
+                                                                [Content] | InlineTextBox | name: "Python"
+                                                            [Interactive] | link | ref: @e1090 | name: "516 stargazers"
+                                                              [Content] | StaticText | name: "516"
+                                                                [Content] | InlineTextBox | name: "516"
+                                                    [Structural] | none
+                                                      [Structural] | none
+                                                        [Structural] | none
+                                                          [Structural] | none
+                                                            [Structural] | none
+                                                        [Structural] | none
+                                                          [Structural] | none
+                                                        [Structural] | none
+                                                        [Structural] | none
+                                                        [Structural] | none
+                                                          [Structural] | none
+                                                          [Structural] | none
+                                                        [Structural] | none
+                                                          [Structural] | generic
+                                                            [Interactive] | button | ref: @e1165 | name: "Star this repository"
+                                                              [Content] | StaticText | name: " Star"
+                                                                [Content] | InlineTextBox | name: " Star"
+                                                          [Structural] | generic
+                                                            [Structural] | generic
+                                                              [Interactive] | button | ref: @e1172 | name: "Add this repository to a list"
+                                                              [Structural] | none
+                                                                [Structural] | none
+                                                                  [Structural] | none
+                                                              [Structural] | none
+                                                                [Structural] | none
+                                                              [Structural] | none
+                                                              [Structural] | none
+                                                              [Structural] | none
+                                                                [Structural] | none
+                                                                [Structural] | none
+                                            [Structural] | none
+                                              [Structural] | article
+                                                [Structural] | none
+                                                  [Structural] | none
+                                                    [Structural] | none
+                                                    [Structural] | separator
+                                                    [Structural] | none
+                                                      [Structural] | none
+                                                        [Structural] | none
+                                                          [Structural] | region | name: "repository body 0-1"
+                                                            [Structural] | none
+                                                              [Structural] | none
+                                                                [Structural] | none
+                                                                  [Interactive] | link | ref: @e1240 | name: "@mshumer profile"
+                                                                    [Content] | image | name: "@mshumer profile"
+                                                                  [Interactive] | link | ref: @e1241 | name: "mshumer/Claude-of-Duty"
+                                                                    [Content] | StaticText | name: "mshumer/Claude-of-Duty"
+                                                                      [Content] | InlineTextBox | name: "mshumer/Claude-of-Duty"
+                                                                [Structural] | none
+                                                                  [Structural] | generic
+                                                                    [Content] | StaticText | name: "A Call of Duty-quality FPS in Three.js, built from a single prompt."
+                                                                      [Content] | InlineTextBox | name: "A Call of Duty-quality FPS in Three.js, built from "
+                                                                      [Content] | InlineTextBox | name: "a single prompt."
+                                                                  [Structural] | none
+                                                                    [Structural] | region | name: "Repo Details 0-1"
+                                                                      [Structural] | generic
+                                                                        [Structural] | generic
+                                                                        [Content] | StaticText | name: "JavaScript"
+                                                                          [Content] | InlineTextBox | name: "JavaScript"
+                                                                      [Interactive] | link | ref: @e1250 | name: "1491 stargazers"
+                                                                        [Content] | StaticText | name: "1.5k"
+                                                                          [Content] | InlineTextBox | name: "1.5k"
+                                                              [Structural] | none
+                                                                [Structural] | none
+                                                                  [Structural] | none
+                                                                    [Structural] | none
+                                                                      [Structural] | none
+                                                                  [Structural] | none
+                                                                    [Structural] | none
+                                                                  [Structural] | none
+                                                                  [Structural] | none
+                                                                  [Structural] | none
+                                                                    [Structural] | none
+                                                                    [Structural] | none
+                                                                  [Structural] | none
+                                                                    [Structural] | generic
+                                                                      [Interactive] | button | ref: @e1325 | name: "Star this repository"
+                                                                        [Content] | StaticText | name: " Star"
+                                                                          [Content] | InlineTextBox | name: " Star"
+                                                                    [Structural] | generic
+                                                                      [Structural] | generic
+                                                                        [Interactive] | button | ref: @e1332 | name: "Add this repository to a list"
+                                                                        [Structural] | none
+                                                                          [Structural] | none
+                                                                            [Structural] | none
+                                                                        [Structural] | none
+                                                                          [Structural] | none
+                                                                        [Structural] | none
+                                                                        [Structural] | none
+                                                                        [Structural] | none
+                                                                          [Structural] | none
+                                                                          [Structural] | none
+                                    [Structural] | article
+                                      [Structural] | none
+                                        [Structural] | none
+                                          [Structural] | generic
+                                            [Structural] | sectionheader
+                                              [Structural] | none
+                                              [Content] | heading | name: "Popular projects among people you follow"
+                                                [Content] | StaticText | name: "Popular projects among "
+                                                  [Content] | InlineTextBox | name: "Popular projects among "
+                                                [Interactive] | link | ref: @e1420 | name: "people you follow"
+                                                  [Content] | StaticText | name: "people you follow"
+                                                    [Content] | InlineTextBox | name: "people you follow"
+                                          [Structural] | none
+                                            [Structural] | none
+                                              [Structural] | none
+                                                [Structural] | region | name: "repository body 1"
+                                                  [Structural] | none
+                                                    [Structural] | none
+                                                      [Structural] | none
+                                                        [Interactive] | link | ref: @e1428 | name: "@grafana profile"
+                                                          [Content] | image | name: "@grafana profile"
+                                                        [Interactive] | link | ref: @e1429 | name: "grafana/loki"
+                                                          [Content] | StaticText | name: "grafana/loki"
+                                                            [Content] | InlineTextBox | name: "grafana/loki"
+                                                      [Structural] | none
+                                                        [Structural] | generic
+                                                          [Content] | StaticText | name: "Like Prometheus, but for logs."
+                                                            [Content] | InlineTextBox | name: "Like Prometheus, but for logs."
+                                                        [Structural] | none
+                                                          [Structural] | region | name: "Repo Details 1"
+                                                            [Structural] | generic
+                                                              [Structural] | generic
+                                                              [Content] | StaticText | name: "Go"
+                                                                [Content] | InlineTextBox | name: "Go"
+                                                            [Interactive] | link | ref: @e1438 | name: "28633 stargazers"
+                                                              [Content] | StaticText | name: "28.6k"
+                                                                [Content] | InlineTextBox | name: "28.6k"
+                                                    [Structural] | none
+                                                      [Structural] | none
+                                                        [Structural] | none
+                                                          [Structural] | none
+                                                            [Structural] | none
+                                                        [Structural] | none
+                                                          [Structural] | none
+                                                        [Structural] | none
+                                                        [Structural] | none
+                                                        [Structural] | none
+                                                          [Structural] | none
+                                                          [Structural] | none
+                                                        [Structural] | none
+                                                          [Structural] | generic
+                                                            [Interactive] | button | ref: @e1513 | name: "Star this repository"
+                                                              [Content] | StaticText | name: " Star"
+                                                                [Content] | InlineTextBox | name: " Star"
+                                                          [Structural] | generic
+                                                            [Structural] | generic
+                                                              [Interactive] | button | ref: @e1520 | name: "Add this repository to a list"
+                                                              [Structural] | none
+                                                                [Structural] | none
+                                                                  [Structural] | none
+                                                              [Structural] | none
+                                                                [Structural] | none
+                                                              [Structural] | none
+                                                              [Structural] | none
+                                                              [Structural] | none
+                                                                [Structural] | none
+                                                                [Structural] | none
+                      [Structural] | contentinfo
+                        [Content] | heading | name: "Footer"
+                          [Content] | StaticText | name: "Footer"
+                            [Content] | InlineTextBox | name: "Footer"
+                        [Structural] | none
+                          [Structural] | none
+                            [Interactive] | link | ref: @e1591 | name: "GitHub Homepage"
+                            [Structural] | none
+                              [Content] | StaticText | name: "© 2026 GitHub,\u{a0}Inc."
+                                [Content] | InlineTextBox | name: "© 2026 GitHub,\u{a0}Inc."
+                          [Structural] | navigation | name: "Footer"
+                            [Content] | heading | name: "Footer navigation"
+                              [Content] | StaticText | name: "Footer navigation"
+                                [Content] | InlineTextBox | name: "Footer "
+                                [Content] | InlineTextBox | name: "navigation"
+                            [Structural] | list | name: "Footer navigation"
+                              [Structural] | listitem
+                                [Interactive] | link | ref: @e1599 | name: "Terms"
+                                  [Content] | StaticText | name: "Terms"
+                                    [Content] | InlineTextBox | name: "Terms"
+                              [Structural] | listitem
+                                [Interactive] | link | ref: @e1601 | name: "Privacy"
+                                  [Content] | StaticText | name: "Privacy"
+                                    [Content] | InlineTextBox | name: "Privacy"
+                              [Structural] | listitem
+                                [Interactive] | link | ref: @e1603 | name: "Security"
+                                  [Content] | StaticText | name: "Security"
+                                    [Content] | InlineTextBox | name: "Security"
+                              [Structural] | listitem
+                                [Interactive] | link | ref: @e1605 | name: "Status"
+                                  [Content] | StaticText | name: "Status"
+                                    [Content] | InlineTextBox | name: "Status"
+                              [Structural] | listitem
+                                [Interactive] | link | ref: @e1607 | name: "Community"
+                                  [Content] | StaticText | name: "Community"
+                                    [Content] | InlineTextBox | name: "Community"
+                              [Structural] | listitem
+                                [Interactive] | link | ref: @e1609 | name: "Docs"
+                                  [Content] | StaticText | name: "Docs"
+                                    [Content] | InlineTextBox | name: "Docs"
+                              [Structural] | listitem
+                                [Interactive] | link | ref: @e1611 | name: "Contact"
+                                  [Content] | StaticText | name: "Contact"
+                                    [Content] | InlineTextBox | name: "Contact"
+                              [Structural] | listitem
+                                [Structural] | generic
+                                  [Interactive] | button | ref: @e1614 | name: "Manage cookies"
+                                    [Content] | StaticText | name: "Manage cookies"
+                                      [Content] | InlineTextBox | name: "Manage cookies"
+                              [Structural] | listitem
+                                [Structural] | generic
+                                  [Interactive] | button | ref: @e1617 | name: "Do not share my personal information"
+                                    [Content] | StaticText | name: "Do not share my personal information"
+                                      [Content] | InlineTextBox | name: "Do not share my personal information"
+                    [Structural] | none
+                      [Structural] | none
+                      [Structural] | none
+        [Structural] | generic
+      [Structural] | generic
+      [Structural] | generic

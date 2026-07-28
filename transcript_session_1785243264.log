@@ -1,0 +1,9 @@
+[1785243279] [Observation: 70 bytes] TOOL CALL: navigate (args: {"url": "chrome://crash"})
+RESULT: ERROR: Action failed (Navigation). Domain for URL 'chrome://crash' is not in the allowlist. Do not attempt this domain.
+
+[1785243282] [Observation: 0 bytes] TOOL CALL: snapshot (args: {})
+RESULT: Snapshot taken. Observe the new page state in the next user message.
+
+[1785243294] [Observation: 0 bytes] TOOL CALL: navigate (args: {"url": "https://www.google.com"})
+RESULT: ERROR: Action failed (Navigation). Domain for URL 'https://www.google.com' is not in the allowlist. Do not attempt this domain.
+

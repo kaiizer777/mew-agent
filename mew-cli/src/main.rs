@@ -1,4 +1,7 @@
 use tracing_subscriber::EnvFilter;
+use std::env;
+
+mod stdin_chat;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -6,15 +9,40 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .try_init();
 
-    println!("=== Step 0: API Smoke Test ===");
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: mew run \"task description\" or mew run --preset \"preset_name\"");
+        return Ok(());
+    }
+
     let config = mew_agent::load_config()?;
-    mew_agent::smoke_test(&config).await?;
-    println!("API Smoke Test Passed!");
 
-    println!("\n=== Step 1.1: Launching Visible Chrome via CDP ===");
-    println!("Launching headed Chrome on remote debugging port {}...", mew_cdp::DEFAULT_PORT);
+    let mut task_desc = String::new();
 
-    let (browser, page, handler_task) = match mew_cdp::launch().await {
+    if args[1] == "run" {
+        if args.len() == 3 {
+            task_desc = args[2].clone();
+        } else if args.len() == 4 && args[2] == "--preset" {
+            let preset_name = &args[3];
+            if let Some(desc) = config.agent.task_presets.get(preset_name) {
+                task_desc = desc.clone();
+            } else {
+                eprintln!("Preset '{}' not found in config.yaml", preset_name);
+                return Ok(());
+            }
+        } else {
+            eprintln!("Usage: mew run \"task description\" or mew run --preset \"preset_name\"");
+            return Ok(());
+        }
+    } else {
+        eprintln!("Usage: mew run \"task description\" or mew run --preset \"preset_name\"");
+        return Ok(());
+    }
+
+    println!("Task: {}", task_desc);
+
+    println!("Launching headed Chrome...");
+    let (browser, page, handler_task) = match mew_cdp::launch(config.browser.as_ref().and_then(|b| b.binary_path.clone())).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to launch Chrome: {e}");
@@ -22,207 +50,27 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    println!("Chrome process launched successfully!");
-    println!("CDP listening on port: 9222");
+    println!("Starting agent loop...");
+    let mut agent = mew_agent::agent::Agent::new(config, &task_desc);
 
-    if let Ok(url) = page.url().await {
-        println!("Page active and navigated to: {:?}", url);
+    // Phase 13.1: wire the live chat channel. Take the sender half from
+    // the agent's MessageBus and hand it to the stdin reader thread. The
+    // reader pushes whatever the user types into the channel; the agent
+    // loop drains it at every checkpoint via `drain_and_apply_user_messages`.
+    //
+    // Per the spec: "Make sure typing a message doesn't require the agent
+    // to be paused" — the agent starts in Running, and `drain_pending`
+    // uses a non-blocking try_recv, so messages typed right now will be
+    // picked up on the very next loop iteration. No pause() needed.
+    let chat_tx = agent.take_message_sender();
+    stdin_chat::spawn_stdin_reader(chat_tx);
+    println!("Live chat channel ready: type while the agent is running to steer it.");
+
+    let result = agent.run(&page).await;
+    match result {
+        Ok(res) => println!("\nTask completed successfully.\nResult: {}", res),
+        Err(e) => eprintln!("\nAgent loop terminated with error: {}", e),
     }
-
-    println!("\n=== Step 2.1: Testing Action Primitives ===");
-    println!("1. Navigating to Wikipedia...");
-    if let Err(e) = mew_cdp::navigate(&page, "https://www.wikipedia.org/").await {
-        eprintln!("Navigation failed: {e}");
-    }
-
-    // Wait a bit for page to be fully interactive
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-    println!("2. Extracting tree to find refs...");
-    let (tree, ref_map, _) = match mew_perception::extract_tree(&page, true).await {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("Failed to extract tree: {e}");
-            return Err(e.into());
-        }
-    };
-
-    fn find_ref(node: &mew_perception::TreeNode, role: &str) -> Option<String> {
-        if node.role.eq_ignore_ascii_case(role) {
-            if let Some(r) = &node.ref_id {
-                return Some(r.clone());
-            }
-        }
-        for child in &node.children {
-            if let Some(r) = find_ref(child, role) {
-                return Some(r);
-            }
-        }
-        None
-    }
-
-    let searchbox_ref = find_ref(&tree, "searchbox").or_else(|| find_ref(&tree, "combobox"));
-    let mut search_button_backend = None;
-
-    if let Some(r) = searchbox_ref {
-        if let Some(backend_id) = ref_map.get(&r) {
-            println!("3. Typing text into search box using ref {}...", r);
-            if let Err(e) = mew_cdp::type_ref(&page, backend_id.clone(), "Rust programming language").await {
-                eprintln!("Type ref failed: {}", e);
-            }
-        }
-    } else {
-        println!("Could not find searchbox ref in tree!");
-    }
-
-    // Small delay to make it visually clear
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-    // Find a button to click. Wikipedia has a search button
-    let button_ref = find_ref(&tree, "button");
-    if let Some(r) = button_ref {
-        if let Some(backend_id) = ref_map.get(&r) {
-            search_button_backend = Some(backend_id.clone());
-            println!("4. Clicking search button using ref {}...", r);
-            if let Err(e) = mew_cdp::click_ref(&page, backend_id.clone()).await {
-                eprintln!("Click ref failed: {}", e);
-            }
-        }
-    } else {
-        println!("Could not find a button ref in tree to click!");
-    }
-
-    // Wait for search results
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-    println!("5. Scrolling down the results...");
-    if let Err(e) = mew_cdp::scroll(&page, mew_cdp::ScrollDirection::Down, 800).await {
-        eprintln!("Scroll failed: {e}");
-    }
-
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-    println!("6. Pressing 'PageDown' key...");
-    if let Err(e) = mew_cdp::press_key(&page, "PageDown").await {
-        eprintln!("Press key failed: {e}");
-    }
-
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-    println!("7. Testing deliberate failure on stale ref...");
-    if let Some(backend_id) = search_button_backend {
-        match mew_cdp::click_ref(&page, backend_id).await {
-            Ok(_) => println!("WARNING: Click succeeded unexpectedly on a stale ref!"),
-            Err(e) => println!("SUCCESS: Caught expected stale ref error: {}", e),
-        }
-    }
-
-    println!("\n=== Step 3.1: Extracting Accessibility Tree ===");
-    println!("1. Navigating to a complex page (e.g. GitHub login)...");
-    if let Err(e) = mew_cdp::navigate(&page, "https://github.com/login").await {
-        eprintln!("Navigation failed: {e}");
-    }
-
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-    println!("2. Extracting Accessibility Tree...");
-    match mew_perception::extract_tree(&page, true).await {
-        Ok((tree, _ref_map, duration)) => {
-            println!("Extraction took: {:?}", duration);
-            println!("--- Extracted Tree ---");
-            tree.print(0);
-            println!("----------------------");
-        },
-        Err(e) => {
-            eprintln!("Failed to extract accessibility tree: {e}");
-        }
-    }
-
-    println!("\n=== Step 5.1: Deterministic Snapshot Diffing ===");
-    let cwd = std::env::current_dir().unwrap();
-    let file_url = format!("file:///{}/test_diff.html", cwd.display()).replace("\\", "/");
-    println!("1. Navigating to {}", file_url);
-    if let Err(e) = mew_cdp::navigate(&page, &file_url).await {
-        eprintln!("Navigation failed: {e}");
-    }
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    
-    let mut state = mew_perception::state::PerceptionState::new();
-    let session_id = "test_session";
-    
-    println!("Taking baseline snapshot...");
-    let (tree1, _ref_map1, _) = mew_perception::extract_tree(&page, true).await?;
-    let full_text = mew_perception::diff::serialize_full_tree(&tree1);
-    println!("Full tree char count: {}", full_text.len());
-    state.save_tree(session_id, tree1.clone());
-    
-    println!("\nTest 1: No-op re-snapshot of static unchanged page");
-    let (tree2, ref_map2, _) = mew_perception::extract_tree(&page, true).await?;
-    let diff_noop = mew_perception::diff::compute_diff(&tree1, &tree2);
-    let diff_noop_text = diff_noop.serialize_compact();
-    println!("No-op diff is empty: {}", diff_noop.is_empty());
-    println!("No-op diff text:\n{}", diff_noop_text);
-    state.save_tree(session_id, tree2.clone());
-    
-    fn find_ref_by_name(node: &mew_perception::TreeNode, name: &str) -> Option<String> {
-        if node.name == name {
-            if let Some(r) = &node.ref_id {
-                return Some(r.clone());
-            }
-        }
-        for child in &node.children {
-            if let Some(r) = find_ref_by_name(child, name) {
-                return Some(r);
-            }
-        }
-        None
-    }
-    
-    println!("\nTest 2: Click 'Change 1' button to change text on page");
-    if let Some(r) = find_ref_by_name(&tree2, "Change 1") {
-        if let Some(backend_id) = ref_map2.get(&r) {
-            println!("Clicking button '{}'", r);
-            if let Err(e) = mew_cdp::click_ref(&page, backend_id.clone()).await {
-                eprintln!("Click ref failed: {}", e);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-    }
-    let (tree3, ref_map3, _) = mew_perception::extract_tree(&page, true).await?;
-    let prev_tree = state.get_previous_tree(session_id).unwrap();
-    let diff_change1 = mew_perception::diff::compute_diff(prev_tree, &tree3);
-    println!("Change 1 diff text:\n{}", diff_change1.serialize_compact());
-    state.save_tree(session_id, tree3.clone());
-
-    println!("\nTest 3: Click 'Change 2' button, diff against step 2");
-    if let Some(r) = find_ref_by_name(&tree3, "Change 2") {
-        if let Some(backend_id) = ref_map3.get(&r) {
-            println!("Clicking button '{}'", r);
-            if let Err(e) = mew_cdp::click_ref(&page, backend_id.clone()).await {
-                eprintln!("Click ref failed: {}", e);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-    }
-    let (tree4, _ref_map4, _) = mew_perception::extract_tree(&page, true).await?;
-    let prev_tree = state.get_previous_tree(session_id).unwrap();
-    let diff_change2 = mew_perception::diff::compute_diff(prev_tree, &tree4);
-    println!("Change 2 diff text:\n{}", diff_change2.serialize_compact());
-    state.save_tree(session_id, tree4.clone());
-    
-    println!("\nTest 4: Click on whitespace/no visible change");
-    if let Err(e) = mew_cdp::scroll(&page, mew_cdp::ScrollDirection::Down, 500).await {
-        eprintln!("Scroll failed: {}", e);
-    }
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let (tree5, _ref_map5, _) = mew_perception::extract_tree(&page, true).await?;
-    let prev_tree = state.get_previous_tree(session_id).unwrap();
-    let diff_noop2 = mew_perception::diff::compute_diff(prev_tree, &tree5);
-    println!("Whitespace/scroll diff text:\n{}", diff_noop2.serialize_compact());
-    state.save_tree(session_id, tree5.clone());
-
-    println!("\nTest flow complete. Waiting 3 seconds before closing...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     println!("Shutting down browser cleanly...");
     if let Err(e) = mew_cdp::shutdown(browser, handler_task).await {

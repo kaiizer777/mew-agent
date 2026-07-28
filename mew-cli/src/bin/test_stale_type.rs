@@ -1,11 +1,11 @@
-﻿use mew_cdp::{launch, shutdown, type_ref};
+use mew_cdp::{launch, shutdown, type_ref};
 use mew_perception::extract_tree;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt().try_init();
 
-    let (browser, page, handler_task) = launch().await?;
+    let (browser, page, handler_task) = launch(None).await?;
     
     // Create an HTML file that has an input text field and something else
     let html = r#"

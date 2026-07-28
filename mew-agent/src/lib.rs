@@ -1,4 +1,6 @@
 pub mod agent;
+pub mod chat;
+pub mod session;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +20,24 @@ pub struct OpencodeZenConfig {
 fn default_max_iterations() -> usize { 15 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BrowserConfig {
+    pub binary_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AgentConfig {
+    #[serde(default)]
+    pub task_presets: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub allowed_domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {
     pub opencode_zen: OpencodeZenConfig,
+    pub browser: Option<BrowserConfig>,
+    #[serde(default)]
+    pub agent: AgentConfig,
 }
 
 pub fn load_config() -> anyhow::Result<ProviderConfig> {

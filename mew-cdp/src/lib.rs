@@ -5,6 +5,8 @@ use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, FocusParams, Reso
 use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
 use futures::StreamExt;
 use thiserror::Error;
+use chromiumoxide::cdp::browser_protocol::dom::GetBoxModelParams;
+use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotParams, CaptureScreenshotFormat, Viewport};
 
 #[derive(Error, Debug)]
 pub enum StaleRefError {
@@ -19,14 +21,20 @@ pub const DEFAULT_PORT: u16 = 9222;
 
 /// Launches a headed Chrome instance via CDP using chromiumoxide.
 /// Configured with a fixed remote debugging port (9222) and persistent user data directory (`./profile`).
-pub async fn launch() -> Result<(Browser, Page, tokio::task::JoinHandle<()>)> {
+pub async fn launch(binary_path: Option<String>) -> Result<(Browser, Page, tokio::task::JoinHandle<()>)> {
     let profile_dir = std::env::current_dir()?.join("profile");
 
-    let config = BrowserConfig::builder()
+    let mut config_builder = BrowserConfig::builder()
         .with_head()
         .port(9222)
-        .user_data_dir(profile_dir)
-        .build()
+        .window_size(1280, 800)
+        .user_data_dir(profile_dir);
+        
+    if let Some(path) = binary_path {
+        config_builder = config_builder.chrome_executable(path);
+    }
+        
+    let config = config_builder.build()
         .map_err(|e| anyhow::anyhow!("Failed to build BrowserConfig: {e}"))?;
 
     tracing::info!("Launching headed Chrome on remote debugging port 9222...");
@@ -41,8 +49,20 @@ pub async fn launch() -> Result<(Browser, Page, tokio::task::JoinHandle<()>)> {
         }
     });
 
-    let page = browser.new_page("https://example.com").await?;
-
+    let page = browser.new_page("about:blank").await?;
+    
+    // Inject defense-in-depth stealth patches
+    let js_patch = r#"
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        if (window.chrome && window.chrome.runtime) delete window.chrome.runtime;
+    "#;
+    
+    page.execute(
+        chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::builder()
+            .source(js_patch)
+            .build()
+            .unwrap()
+    ).await?;
     Ok((browser, page, handle))
 }
 
@@ -218,4 +238,56 @@ pub async fn type_ref(page: &Page, backend_id: BackendNodeId, text: &str) -> Res
     Ok(())
 }
 
+pub async fn screenshot_region(page: &Page, backend_id: BackendNodeId) -> Result<(String, f64, f64, f64, f64), StaleRefError> {
+    tracing::info!("Screenshot region for ref: {:?}", backend_id);
+    
+    // Get box model to find the actual element bounds
+    let box_model_params = GetBoxModelParams::builder().backend_node_id(backend_id.clone()).build();
+    let box_model_res = page.execute(box_model_params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
+    
+    // The quad is an array of 8 numbers: [x1, y1, x2, y2, x3, y3, x4, y4]
+    // representing the 4 corners of the box. 
+    let quad_val = serde_json::to_value(&box_model_res.model.border).unwrap_or_default();
+    println!("RAW DOM.getBoxModel border quad: {}", quad_val);
 
+    let quad: Vec<f64> = serde_json::from_value(quad_val).unwrap_or_default();
+    if quad.len() != 8 {
+        return Err(StaleRefError::InteractionFailed(backend_id.clone(), "Invalid box model quad".to_string()));
+    }
+    
+    // Calculate the bounding box
+    let x_coords = [quad[0], quad[2], quad[4], quad[6]];
+    let y_coords = [quad[1], quad[3], quad[5], quad[7]];
+    
+    let x = x_coords.iter().cloned().fold(f64::INFINITY, f64::min);
+    let y = y_coords.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_x = x_coords.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max_y = y_coords.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    
+    let width = max_x - x;
+    let height = max_y - y;
+    
+    if width <= 0.0 || height <= 0.0 {
+        return Err(StaleRefError::InteractionFailed(backend_id.clone(), "Element has zero width or height".to_string()));
+    }
+    
+    println!("COMPUTED CLIP PARAMS: x={}, y={}, width={}, height={}", x, y, width, height);
+    
+    let viewport = Viewport::builder()
+        .x(x)
+        .y(y)
+        .width(width)
+        .height(height)
+        .scale(1.0)
+        .build()
+        .unwrap();
+        
+    let screenshot_params = CaptureScreenshotParams::builder()
+        .format(CaptureScreenshotFormat::Png)
+        .clip(viewport)
+        .build();
+        
+    let screenshot_res = page.execute(screenshot_params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
+    
+    Ok((screenshot_res.data.clone().into(), x, y, width, height))
+}

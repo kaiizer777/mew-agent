@@ -1,0 +1,6 @@
+[1785266700] [Observation: 70 bytes] TOOL CALL: navigate (args: {"url": "https://www.google.com"})
+RESULT: Navigated successfully
+
+[1785266702] [Observation: 4153 bytes] TOOL CALL: type (args: {"ref": "@e2", "text": "instagram"})
+RESULT: ERROR: Action failed (Stale Element Reference). The element was removed from the DOM before your action could execute. Your action had NO effect. Do not assume your action succeeded. Re-evaluate the new page state and decide your next step.
+

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { font-family: sans-serif; padding: 20px; }
+  .canvas-container { margin: 20px 0; }
+  .normal-button { padding: 10px; font-size: 16px; }
+</style>
+</head>
+<body>
+  <h1>Vision Test Page</h1>
+  <button class="normal-button" id="btn1">Click Me Normal</button>
+  
+  <div class="canvas-container">
+    <button style="border: none; background: none; cursor: pointer;" id="btn2">
+      <!-- Just an image with no alt text -->
+      <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADIAAAAyCAIAAACRXR/mAAAAMklEQVR4nO3RoQAAAAAAwsD/TxO4QQUMMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjLy/AEwZgEy5eYh2wAAAABJRU5ErkJggg==" width="50" height="50" />
+    </button>
+  </div>
+  
+  <div class="canvas-container">
+    <!-- Just a raw canvas -->
+    <canvas id="myCanvas" width="50" height="50" style="background-color: red;"></canvas>
+  </div>
+  
+  <script>
+    document.getElementById('btn1').onclick = () => {
+      document.body.insertAdjacentHTML('beforeend', '<p>Normal button clicked!</p>');
+    };
+    document.getElementById('btn2').onclick = () => {
+      document.body.insertAdjacentHTML('beforeend', '<p>Image button clicked!</p>');
+    };
+    document.getElementById('myCanvas').onclick = () => {
+      document.body.insertAdjacentHTML('beforeend', '<p>Canvas clicked!</p>');
+    };
+  </script>
+</body>
+</html>
