@@ -12,7 +12,8 @@ mew-cdp = { path = "mew-cdp" }
 mew-perception = { path = "mew-perception" }
 mew-agent = { path = "mew-agent" }
 
-chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
+chromiumoxide = { version = "0.9.1" }
+futures = "0.3"
 tokio = { version = "1.38", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -20,4 +21,4 @@ serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["json"] }
 anyhow = "1.0"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
