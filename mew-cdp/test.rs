@@ -1,0 +1,1 @@
+use chromiumoxide::Page; fn test(page: &Page) { page.foo(); }

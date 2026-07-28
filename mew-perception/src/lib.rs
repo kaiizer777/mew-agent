@@ -1,5 +1,6 @@
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::accessibility::{AxNode, AxValue, GetFullAxTreeParams};
+use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -17,6 +18,8 @@ pub struct TreeNode {
     pub name: String,
     pub value: String,
     pub category: NodeCategory,
+    pub ref_id: Option<String>,
+    pub backend_node_id: Option<BackendNodeId>,
     pub children: Vec<TreeNode>,
 }
 
@@ -58,10 +61,11 @@ fn extract_string(val: &Option<AxValue>) -> String {
     String::new()
 }
 
-pub fn build_tree(nodes: Vec<AxNode>, compact: bool) -> Option<TreeNode> {
+pub fn build_tree(nodes: Vec<AxNode>, compact: bool) -> Option<(TreeNode, HashMap<String, BackendNodeId>)> {
     let mut node_map = HashMap::new();
     let mut child_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut root_id = None;
+    let mut ref_map = HashMap::new();
     
     for node in nodes {
         let id = node.node_id.as_ref().to_string();
@@ -74,12 +78,25 @@ pub fn build_tree(nodes: Vec<AxNode>, compact: bool) -> Option<TreeNode> {
         let value = extract_string(&node.value);
         let category = categorize_role(&role);
         
+        let mut ref_id = None;
+        if category == NodeCategory::Interactive {
+            if let Some(backend_id) = &node.backend_dom_node_id {
+                let id_val = format!("{:?}", backend_id);
+                let numbers: String = id_val.chars().filter(|c| c.is_ascii_digit()).collect();
+                let short_ref = format!("@e{}", numbers);
+                ref_map.insert(short_ref.clone(), backend_id.clone());
+                ref_id = Some(short_ref);
+            }
+        }
+        
         let t_node = TreeNode {
             id: id.clone(),
             role,
             name,
             value,
             category,
+            ref_id,
+            backend_node_id: node.backend_dom_node_id.clone(),
             children: Vec::new(),
         };
         
@@ -159,13 +176,16 @@ pub fn build_tree(nodes: Vec<AxNode>, compact: bool) -> Option<TreeNode> {
         root_node = prune(root_node)?;
     }
     
-    Some(root_node)
+    Some((root_node, ref_map))
 }
 
 impl TreeNode {
     pub fn print(&self, depth: usize) {
         let indent = "  ".repeat(depth);
         let mut parts = vec![format!("[{:?}]", self.category), self.role.clone()];
+        if let Some(r) = &self.ref_id {
+            parts.push(format!("ref: {}", r));
+        }
         if !self.name.is_empty() {
             parts.push(format!("name: {:?}", self.name));
         }
@@ -180,11 +200,11 @@ impl TreeNode {
     }
 }
 
-pub async fn extract_tree(page: &Page, compact: bool) -> anyhow::Result<(TreeNode, std::time::Duration)> {
+pub async fn extract_tree(page: &Page, compact: bool) -> anyhow::Result<(TreeNode, HashMap<String, BackendNodeId>, std::time::Duration)> {
     let start = Instant::now();
     let res = page.execute(GetFullAxTreeParams::default()).await?;
     let duration = start.elapsed();
     
-    let root = build_tree(res.nodes.clone(), compact).ok_or_else(|| anyhow::anyhow!("Failed to build tree: no root found"))?;
-    Ok((root, duration))
+    let (root, ref_map) = build_tree(res.nodes.clone(), compact).ok_or_else(|| anyhow::anyhow!("Failed to build tree: no root found"))?;
+    Ok((root, ref_map, duration))
 }

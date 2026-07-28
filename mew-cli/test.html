@@ -1,0 +1,14 @@
+﻿<!DOCTYPE html>
+<html>
+<body>
+  <button id="b1" onclick="document.body.style.backgroundColor='red'; this.remove();">Button 1</button>
+  <button id="b2" onclick="document.body.style.backgroundColor='green';">Button 2</button>
+  <button id="b3" onclick="document.body.style.backgroundColor='blue';">Button 3</button>
+  <div id="result">None</div>
+  <script>
+    document.querySelectorAll('button').forEach((b, i) => {
+      b.addEventListener('click', () => { document.getElementById('result').innerText = 'Clicked ' + (i+1); });
+    });
+  </script>
+</body>
+</html>

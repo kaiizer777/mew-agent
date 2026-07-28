@@ -1,7 +1,19 @@
 use anyhow::Result;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::Page;
+use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, FocusParams, ResolveNodeParams};
+use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
 use futures::StreamExt;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum StaleRefError {
+    #[error("Stale ref: Node with BackendNodeId {0:?} could not be found or resolved.")]
+    NotFound(BackendNodeId),
+    
+    #[error("Stale ref: Failed to interact with BackendNodeId {0:?}: {1}")]
+    InteractionFailed(BackendNodeId, String),
+}
 
 pub const DEFAULT_PORT: u16 = 9222;
 
@@ -109,4 +121,73 @@ pub async fn press_key(page: &Page, key: &str) -> Result<()> {
         
     Ok(())
 }
+
+pub async fn click_ref(page: &Page, backend_id: BackendNodeId) -> Result<(), StaleRefError> {
+    tracing::info!("Clicking ref: {:?}", backend_id);
+    let resolve_res = page.execute(
+        ResolveNodeParams::builder().backend_node_id(backend_id.clone()).build()
+    ).await.map_err(|_| StaleRefError::NotFound(backend_id.clone()))?;
+
+    let object_id = resolve_res.object.object_id.clone().ok_or_else(|| StaleRefError::NotFound(backend_id.clone()))?;
+
+    let call_params = CallFunctionOnParams::builder()
+        .object_id(object_id.clone())
+        .function_declaration("function() { if (!this.isConnected) return { stale: true }; this.click(); return { stale: false }; }")
+        .return_by_value(true)
+        .build()
+        .unwrap();
+
+    let exec_res = page.execute(call_params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
+    
+    if let Some(val) = exec_res.result.result.value {
+        if let Some(stale) = val.get("stale").and_then(|v| v.as_bool()) {
+            if stale {
+                return Err(StaleRefError::NotFound(backend_id));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn type_ref(page: &Page, backend_id: BackendNodeId, text: &str) -> Result<(), StaleRefError> {
+    tracing::info!("Typing text into ref: {:?}", backend_id);
+    let resolve_res = page.execute(
+        ResolveNodeParams::builder().backend_node_id(backend_id.clone()).build()
+    ).await.map_err(|_| StaleRefError::NotFound(backend_id.clone()))?;
+
+    let object_id = resolve_res.object.object_id.clone().ok_or_else(|| StaleRefError::NotFound(backend_id.clone()))?;
+
+    // Check if stale before focusing
+    let check_params = CallFunctionOnParams::builder()
+        .object_id(object_id)
+        .function_declaration("function() { return !this.isConnected; }")
+        .return_by_value(true)
+        .build()
+        .unwrap();
+    let check_res = page.execute(check_params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
+    if let Some(val) = check_res.result.result.value {
+        if val.as_bool() == Some(true) {
+            return Err(StaleRefError::NotFound(backend_id));
+        }
+    }
+    
+    // Focus the element using CDP
+    page.execute(
+        FocusParams::builder().backend_node_id(backend_id.clone()).build()
+    ).await.map_err(|_| StaleRefError::NotFound(backend_id.clone()))?;
+
+    // Dispatch key events
+    for c in text.chars() {
+        let params = chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventParams::builder()
+            .r#type(chromiumoxide::cdp::browser_protocol::input::DispatchKeyEventType::Char)
+            .text(c.to_string())
+            .build()
+            .unwrap();
+        page.execute(params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
+    }
+    
+    Ok(())
+}
+
 
