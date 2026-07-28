@@ -13,11 +13,30 @@ pub struct ProviderConfig {
 }
 
 pub fn load_config() -> anyhow::Result<ProviderConfig> {
-    let config_path = "config.yaml";
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config file '{config_path}': {e}"))?;
+    let mut current_dir = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("Failed to get current directory: {e}"))?;
+        
+    let mut config_path = None;
+    
+    loop {
+        let potential_path = current_dir.join("config.yaml");
+        if potential_path.exists() {
+            config_path = Some(potential_path);
+            break;
+        }
+        
+        if !current_dir.pop() {
+            break;
+        }
+    }
+    
+    let config_path = config_path.ok_or_else(|| anyhow::anyhow!("Could not find config.yaml in current or any parent directory"))?;
+    let path_str = config_path.display().to_string();
+    
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read config file '{path_str}': {e}"))?;
     let config: ProviderConfig = serde_yaml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config file '{config_path}': {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file '{path_str}': {e}"))?;
     Ok(config)
 }
 

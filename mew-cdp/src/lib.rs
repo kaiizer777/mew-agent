@@ -51,3 +51,62 @@ pub async fn shutdown(mut browser: Browser, handler_task: tokio::task::JoinHandl
 
     Ok(())
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDirection {
+    Up,
+    Down,
+}
+
+pub async fn navigate(page: &Page, url: &str) -> Result<()> {
+    tracing::info!("Navigating to {}", url);
+    page.goto(url).await?.wait_for_navigation().await?;
+    Ok(())
+}
+
+pub async fn click_selector(page: &Page, selector: &str) -> Result<()> {
+    tracing::info!("Clicking selector: {}", selector);
+    let element = page.find_element(selector).await
+        .map_err(|e| anyhow::anyhow!("Failed to find element with selector '{}': {}", selector, e))?;
+    element.click().await
+        .map_err(|e| anyhow::anyhow!("Failed to click element with selector '{}': {}", selector, e))?;
+    Ok(())
+}
+
+pub async fn type_text(page: &Page, selector: &str, text: &str) -> Result<()> {
+    tracing::info!("Typing text into selector: {}", selector);
+    let element = page.find_element(selector).await
+        .map_err(|e| anyhow::anyhow!("Failed to find element with selector '{}': {}", selector, e))?;
+    element.type_str(text).await
+        .map_err(|e| anyhow::anyhow!("Failed to type text into selector '{}': {}", selector, e))?;
+    Ok(())
+}
+
+pub async fn scroll(page: &Page, direction: ScrollDirection, amount: i32) -> Result<()> {
+    tracing::info!("Scrolling {:?} by {}", direction, amount);
+    let y_offset = match direction {
+        ScrollDirection::Up => -amount,
+        ScrollDirection::Down => amount,
+    };
+    page.evaluate(format!("window.scrollBy(0, {});", y_offset)).await
+        .map_err(|e| anyhow::anyhow!("Failed to scroll: {}", e))?;
+    Ok(())
+}
+
+pub async fn press_key(page: &Page, key: &str) -> Result<()> {
+    tracing::info!("Pressing key: {}", key);
+    // Use CDP Input domain for key press to ensure trusted events
+    use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+    
+    let params = DispatchKeyEventParams::builder()
+        .r#type(DispatchKeyEventType::KeyDown)
+        .key(key)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build key event: {}", e))?;
+        
+    page.execute(params).await
+        .map_err(|e| anyhow::anyhow!("Failed to press key {}: {}", key, e))?;
+        
+    Ok(())
+}
+
