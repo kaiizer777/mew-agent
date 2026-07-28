@@ -1,3 +1,5 @@
+pub mod agent;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5,7 +7,15 @@ pub struct OpencodeZenConfig {
     pub base_url: String,
     pub api_key: String,
     pub default_model: String,
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: usize,
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    #[serde(default)]
+    pub max_cost: Option<f64>,
 }
+
+fn default_max_iterations() -> usize { 15 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {

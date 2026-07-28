@@ -110,14 +110,42 @@ pub async fn press_key(page: &Page, key: &str) -> Result<()> {
     // Use CDP Input domain for key press to ensure trusted events
     use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
     
-    let params = DispatchKeyEventParams::builder()
-        .r#type(DispatchKeyEventType::KeyDown)
+    let text = if key == "Enter" { "\r" } else { "" };
+    let code = if key == "Enter" { "Enter" } else { key };
+
+    // RawKeyDown
+    let raw_key_down = DispatchKeyEventParams::builder()
+        .r#type(DispatchKeyEventType::RawKeyDown)
         .key(key)
+        .code(code)
+        .text(text)
         .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build key event: {}", e))?;
-        
-    page.execute(params).await
+        .map_err(|e| anyhow::anyhow!("Failed to build RawKeyDown: {}", e))?;
+    page.execute(raw_key_down).await
         .map_err(|e| anyhow::anyhow!("Failed to press key {}: {}", key, e))?;
+
+    // Char
+    if !text.is_empty() {
+        let char_event = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::Char)
+            .key(key)
+            .code(code)
+            .text(text)
+            .build()
+            .unwrap();
+        page.execute(char_event).await
+            .map_err(|e| anyhow::anyhow!("Failed to dispatch Char for {}: {}", key, e))?;
+    }
+
+    // KeyUp
+    let key_up = DispatchKeyEventParams::builder()
+        .r#type(DispatchKeyEventType::KeyUp)
+        .key(key)
+        .code(code)
+        .build()
+        .unwrap();
+    page.execute(key_up).await
+        .map_err(|e| anyhow::anyhow!("Failed to dispatch KeyUp for {}: {}", key, e))?;
         
     Ok(())
 }

@@ -1,3 +1,5 @@
+pub mod diff;
+pub mod state;
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::accessibility::{AxNode, AxValue, GetFullAxTreeParams};
 use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;

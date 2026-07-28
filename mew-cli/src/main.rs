@@ -138,6 +138,89 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    println!("\n=== Step 5.1: Deterministic Snapshot Diffing ===");
+    let cwd = std::env::current_dir().unwrap();
+    let file_url = format!("file:///{}/test_diff.html", cwd.display()).replace("\\", "/");
+    println!("1. Navigating to {}", file_url);
+    if let Err(e) = mew_cdp::navigate(&page, &file_url).await {
+        eprintln!("Navigation failed: {e}");
+    }
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    
+    let mut state = mew_perception::state::PerceptionState::new();
+    let session_id = "test_session";
+    
+    println!("Taking baseline snapshot...");
+    let (tree1, _ref_map1, _) = mew_perception::extract_tree(&page, true).await?;
+    let full_text = mew_perception::diff::serialize_full_tree(&tree1);
+    println!("Full tree char count: {}", full_text.len());
+    state.save_tree(session_id, tree1.clone());
+    
+    println!("\nTest 1: No-op re-snapshot of static unchanged page");
+    let (tree2, ref_map2, _) = mew_perception::extract_tree(&page, true).await?;
+    let diff_noop = mew_perception::diff::compute_diff(&tree1, &tree2);
+    let diff_noop_text = diff_noop.serialize_compact();
+    println!("No-op diff is empty: {}", diff_noop.is_empty());
+    println!("No-op diff text:\n{}", diff_noop_text);
+    state.save_tree(session_id, tree2.clone());
+    
+    fn find_ref_by_name(node: &mew_perception::TreeNode, name: &str) -> Option<String> {
+        if node.name == name {
+            if let Some(r) = &node.ref_id {
+                return Some(r.clone());
+            }
+        }
+        for child in &node.children {
+            if let Some(r) = find_ref_by_name(child, name) {
+                return Some(r);
+            }
+        }
+        None
+    }
+    
+    println!("\nTest 2: Click 'Change 1' button to change text on page");
+    if let Some(r) = find_ref_by_name(&tree2, "Change 1") {
+        if let Some(backend_id) = ref_map2.get(&r) {
+            println!("Clicking button '{}'", r);
+            if let Err(e) = mew_cdp::click_ref(&page, backend_id.clone()).await {
+                eprintln!("Click ref failed: {}", e);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    }
+    let (tree3, ref_map3, _) = mew_perception::extract_tree(&page, true).await?;
+    let prev_tree = state.get_previous_tree(session_id).unwrap();
+    let diff_change1 = mew_perception::diff::compute_diff(prev_tree, &tree3);
+    println!("Change 1 diff text:\n{}", diff_change1.serialize_compact());
+    state.save_tree(session_id, tree3.clone());
+
+    println!("\nTest 3: Click 'Change 2' button, diff against step 2");
+    if let Some(r) = find_ref_by_name(&tree3, "Change 2") {
+        if let Some(backend_id) = ref_map3.get(&r) {
+            println!("Clicking button '{}'", r);
+            if let Err(e) = mew_cdp::click_ref(&page, backend_id.clone()).await {
+                eprintln!("Click ref failed: {}", e);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    }
+    let (tree4, _ref_map4, _) = mew_perception::extract_tree(&page, true).await?;
+    let prev_tree = state.get_previous_tree(session_id).unwrap();
+    let diff_change2 = mew_perception::diff::compute_diff(prev_tree, &tree4);
+    println!("Change 2 diff text:\n{}", diff_change2.serialize_compact());
+    state.save_tree(session_id, tree4.clone());
+    
+    println!("\nTest 4: Click on whitespace/no visible change");
+    if let Err(e) = mew_cdp::scroll(&page, mew_cdp::ScrollDirection::Down, 500).await {
+        eprintln!("Scroll failed: {}", e);
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    let (tree5, _ref_map5, _) = mew_perception::extract_tree(&page, true).await?;
+    let prev_tree = state.get_previous_tree(session_id).unwrap();
+    let diff_noop2 = mew_perception::diff::compute_diff(prev_tree, &tree5);
+    println!("Whitespace/scroll diff text:\n{}", diff_noop2.serialize_compact());
+    state.save_tree(session_id, tree5.clone());
+
     println!("\nTest flow complete. Waiting 3 seconds before closing...");
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 

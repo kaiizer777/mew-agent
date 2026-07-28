@@ -788,12 +788,16 @@ name = "mew-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chromiumoxide",
+ "mew-cdp",
+ "mew-perception",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
