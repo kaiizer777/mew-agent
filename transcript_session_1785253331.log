@@ -1,3 +1,0 @@
-[1785253382] [Observation: 70 bytes] TOOL CALL: navigate (args: {"url": "https://github.com"})
-RESULT: ERROR: Action failed (Timeout while navigating). The navigation timed out and did not complete successfully. Do not assume your action succeeded.
-

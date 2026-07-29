@@ -1,9 +1,0 @@
-[1785252844] [Observation: 70 bytes] TOOL CALL: navigate (args: {"url": "https://www.google.com/search?q=top+3+mobile+phones+under+20000+inr+2024"})
-RESULT: Navigated successfully
-
-[1785252849] [Observation: 61102 bytes] TOOL CALL: click (args: {"ref": "@e2903"})
-RESULT: Clicked successfully
-
-[1785252852] [Observation: 4735 bytes] TOOL CALL: snapshot (args: {})
-RESULT: Snapshot taken. Observe the new page state in the next user message.
-

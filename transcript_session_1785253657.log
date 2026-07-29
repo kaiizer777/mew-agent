@@ -1,9 +1,0 @@
-[1785253668] [Observation: 70 bytes] TOOL CALL: snapshot (args: {})
-RESULT: Snapshot taken. Observe the new page state in the next user message.
-
-[1785253718] [Observation: 0 bytes] TOOL CALL: navigate (args: {"url": "https://github.com"})
-RESULT: ERROR: Action failed (Timeout while navigating). The navigation timed out and did not complete successfully. Do not assume your action succeeded.
-
-[1785253724] [Observation: 0 bytes] TOOL CALL: snapshot (args: {})
-RESULT: Snapshot taken. Observe the new page state in the next user message.
-
