@@ -1,0 +1,24 @@
+
+===== SCENARIO: A_repeated_actions (config: enabled=true min=200ms max=400ms threshold=3) =====
+[1785332618] CLICK 1 fired (elapsed=6us)
+[1785332618] CLICK 2 fired (elapsed=1us)
+[1785332618] PACING: action=click streak=3 delay_ms=372
+[1785332619] CLICK 3 fired (elapsed=372966us)
+[1785332619] PACING: action=click streak=4 delay_ms=257
+[1785332619] CLICK 4 fired (elapsed=257958us)
+[1785332619] PACING: action=click streak=5 delay_ms=373
+[1785332619] CLICK 5 fired (elapsed=373722us)
+
+===== SCENARIO: B_one_off (config: enabled=true min=200ms max=400ms threshold=2) =====
+[1785332619] ACTION click fired (elapsed=0us)
+[1785332619] ACTION snapshot fired (elapsed=0us)
+[1785332619] ACTION click fired (elapsed=0us)
+[1785332619] ACTION type fired (elapsed=0us)
+[1785332619] ACTION scroll fired (elapsed=1us)
+
+===== SCENARIO: C_zero_range (config: enabled=true min=0ms max=0ms threshold=1) =====
+[1785332619] CLICK fired (elapsed=0us)
+[1785332619] PACING: action=click streak=2 delay_ms=0
+[1785332619] CLICK fired (elapsed=396us)
+[1785332619] PACING: action=click streak=3 delay_ms=0
+[1785332619] CLICK fired (elapsed=630us)

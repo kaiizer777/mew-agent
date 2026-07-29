@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Test Stock Chrome
     println!("=== Testing STOCK Chrome (10 Navigations) ===");
-    let (browser1, page1, handle1) = launch(None).await?;
+    let (browser1, page1, handle1) = launch(None, false).await?;
     
     for i in 1..=10 {
         page1.goto("https://en.wikipedia.org/wiki/Main_Page").await?.wait_for_navigation().await?;
@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     // Test Stealth Chrome
     println!("=== Testing STEALTH Chrome (10 Navigations) ===");
     let binary_path = config.browser.as_ref().and_then(|b| b.binary_path.clone());
-    let (browser2, page2, handle2) = launch(binary_path).await?;
+    let (browser2, page2, handle2) = launch(binary_path, false).await?;
     
     for i in 1..=10 {
         page2.goto("https://en.wikipedia.org/wiki/Main_Page").await?.wait_for_navigation().await?;

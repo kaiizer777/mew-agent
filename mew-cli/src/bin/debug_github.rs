@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config()?;
     let binary_path = config.browser.as_ref().and_then(|b| b.binary_path.clone());
     
-    let (browser, page, handle) = launch(binary_path).await?;
+    let (browser, page, handle) = launch(binary_path, false).await?;
     
     println!("Navigating to https://github.com...");
     let _ = tokio::time::timeout(

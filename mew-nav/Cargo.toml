@@ -1,0 +1,21 @@
+[package]
+name = "mew-nav"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+url = { workspace = true }
+tokio = { workspace = true }
+chromiumoxide = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# The test harness launches a real browser via `mew_cdp::launch` to
+# exercise `resolve_with_probe` against live navigation. Pulled in as a
+# dev-dep only — `mew-nav` itself doesn't depend on `mew-cdp`, keeping
+# the resolver crate pure / independently testable.
+mew-cdp = { path = "../mew-cdp" }
+tokio = { version = "1.38", features = ["full", "test-util", "macros"] }

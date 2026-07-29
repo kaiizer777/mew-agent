@@ -18,7 +18,10 @@ async fn main() -> anyhow::Result<()> {
     let task = &args[2];
     
     println!("Launching browser...");
-    let (browser, page, handler) = mew_cdp::launch(config.browser.as_ref().and_then(|b| b.binary_path.clone())).await?;
+    let (browser, page, handler) = mew_cdp::launch(
+        config.browser.as_ref().and_then(|b| b.binary_path.clone()),
+        false,
+    ).await?;
     
     // Optional: enable network throttling if '--throttle' is in args
     if args.iter().any(|a| a == "--throttle") {

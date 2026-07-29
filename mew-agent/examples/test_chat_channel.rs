@@ -503,7 +503,7 @@ fn make_test_config() -> mew_agent::ProviderConfig {
             max_tokens: None,
             max_cost: None,
         },
-        browser: Some(BrowserConfig { binary_path: None }),
+        browser: Some(BrowserConfig { binary_path: None, visible_cursor: false }),
         agent: AgentConfig::default(),
     }
 }

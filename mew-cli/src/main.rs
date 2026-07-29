@@ -42,7 +42,10 @@ async fn main() -> anyhow::Result<()> {
     println!("Task: {}", task_desc);
 
     println!("Launching headed Chrome...");
-    let (browser, page, handler_task) = match mew_cdp::launch(config.browser.as_ref().and_then(|b| b.binary_path.clone())).await {
+    let (browser, page, handler_task) = match mew_cdp::launch(
+        config.browser.as_ref().and_then(|b| b.binary_path.clone()),
+        config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
+    ).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to launch Chrome: {e}");

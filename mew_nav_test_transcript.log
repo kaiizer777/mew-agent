@@ -1,0 +1,20 @@
+
+--- 14.2 test run @ Instant { t: 4611712441.677505303s } ---
+[1785271914] NAV-RESOLVE: input="instagram" path=map-hit resolved_url=https://www.instagram.com elapsed_ms=0 label=map-hit (social)
+[1785271914] NAV-RESOLVE: input="github" path=map-hit resolved_url=https://github.com elapsed_ms=0 label=map-hit (dev)
+[1785271914] NAV-RESOLVE: input="gmail" path=map-hit resolved_url=https://mail.google.com elapsed_ms=0 label=map-hit (mail)
+[1785271917] NAV-RESOLVE: input="rustlang" path=direct-guess resolved_url=https://rustlang.com elapsed_ms=2509 label=direct-guess (real .com, not in map)
+[1785271917] NAV-RESOLVE: input="!!!" path=search-fallback resolved_url=https://www.google.com/search?q=%21%21%21 elapsed_ms=0 label=search-fallback (empty after sanitize)
+[1785271917] NAV-RESOLVE: input="  InStaGram  " path=map-hit resolved_url=https://www.instagram.com elapsed_ms=0 label=original-failing-phrasing (case + whitespace variant)
+[1785271917] NAV-RESOLVE: input="thisisnotawebsite-zzz-abc" path=search-fallback resolved_url=https://www.google.com/search?q=thisisnotawebsite-zzz-abc elapsed_ms=263 label=timeout-fallthrough-test
+[1785271917] PROBE-TIMEOUT: url=https://localhost:1/ outcome=errored elapsed_ms=62
+
+--- 14.2 test run @ Instant { t: 4611712486.395218803s } ---
+[1785271958] NAV-RESOLVE: input="instagram" path=map-hit resolved_url=https://www.instagram.com elapsed_ms=0 label=map-hit (social)
+[1785271958] NAV-RESOLVE: input="github" path=map-hit resolved_url=https://github.com elapsed_ms=0 label=map-hit (dev)
+[1785271958] NAV-RESOLVE: input="gmail" path=map-hit resolved_url=https://mail.google.com elapsed_ms=0 label=map-hit (mail)
+[1785271958] NAV-RESOLVE: input="rustlang" path=direct-guess resolved_url=https://rustlang.com elapsed_ms=332 label=direct-guess (real .com, not in map)
+[1785271958] NAV-RESOLVE: input="!!!" path=search-fallback resolved_url=https://www.google.com/search?q=%21%21%21 elapsed_ms=0 label=search-fallback (empty after sanitize)
+[1785271958] NAV-RESOLVE: input="  InStaGram  " path=map-hit resolved_url=https://www.instagram.com elapsed_ms=0 label=original-failing-phrasing (case + whitespace variant)
+[1785271959] NAV-RESOLVE: input="thisisnotawebsite-zzz-abc" path=search-fallback resolved_url=https://www.google.com/search?q=thisisnotawebsite-zzz-abc elapsed_ms=1295 label=timeout-fallthrough-test
+[1785271961] PROBE-TIMEOUT: url=https://192.0.2.1/ outcome=timed-out elapsed_ms=1502 timeout_ms=1500

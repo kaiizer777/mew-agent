@@ -1,5 +1,7 @@
 pub mod agent;
 pub mod chat;
+pub mod completeness;
+pub mod pacing;
 pub mod session;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,11 @@ fn default_max_iterations() -> usize { 15 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BrowserConfig {
     pub binary_path: Option<String>,
+    /// Phase 16.1: when true, a fixed-position ghost cursor is injected on
+    /// every navigation and visibly moves to each click target before the
+    /// real click fires. Default false — zero overhead, zero CDP calls.
+    #[serde(default)]
+    pub visible_cursor: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -30,6 +37,14 @@ pub struct AgentConfig {
     pub task_presets: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub allowed_domains: Option<Vec<String>>,
+    /// Phase 17.1: per-action-type pacing guard. When `enabled` is
+    /// true, consecutive identical actions in a tight loop (no
+    /// different action type between them) are spaced out by a
+    /// random delay in `[min_delay_ms, max_delay_ms]`. Default is
+    /// off — pacing is opt-in so existing task patterns aren't
+    /// silently slowed.
+    #[serde(default)]
+    pub pacing: pacing::PacingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

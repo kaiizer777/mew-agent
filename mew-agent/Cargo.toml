@@ -15,5 +15,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 mew-cdp = { path = "../mew-cdp" }
 mew-perception = { path = "../mew-perception" }
+mew-nav = { path = "../mew-nav" }
 chromiumoxide = { workspace = true }
 url = { workspace = true }
+rand = "0.8"

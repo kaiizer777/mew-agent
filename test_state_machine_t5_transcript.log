@@ -1,10 +1,10 @@
-[1785271081] [t5_transcript] STATE: Running -> Running (start)
+[1785326230] [t5_transcript] STATE: Running -> Running (start)
 
-[1785271081] [t5_transcript] STATE: Running -> Paused (pause) reason=first
+[1785326230] [t5_transcript] STATE: Running -> Paused (pause) reason=first
 
-[1785271081] [t5_transcript] STATE: Paused -> Running (resume) reason=back
+[1785326230] [t5_transcript] STATE: Paused -> Running (resume) reason=back
 
-[1785271081] [t5_transcript] STATE: Running -> Paused (pause) reason=again
+[1785326230] [t5_transcript] STATE: Running -> Paused (pause) reason=again
 
-[1785271081] [t5_transcript] STATE: Paused -> Stopped (stop) reason=done
+[1785326230] [t5_transcript] STATE: Paused -> Stopped (stop) reason=done
 

@@ -15,7 +15,10 @@ async fn main() -> anyhow::Result<()> {
     
     println!("Running The Verge Run 2...");
     let task_verge = "Navigate to https://www.theverge.com/. Click the consent banner if it appears. Then click on the first article link.";
-    let (browser2, page2, handler2) = mew_cdp::launch(config.browser.as_ref().and_then(|b| b.binary_path.clone())).await?;
+    let (browser2, page2, handler2) = mew_cdp::launch(
+        config.browser.as_ref().and_then(|b| b.binary_path.clone()),
+        false,
+    ).await?;
     let mut agent_verge = Agent::new(config, task_verge);
     if let Err(e) = agent_verge.run(&page2).await {
         eprintln!("Agent verge error: {}", e);

@@ -11,7 +11,10 @@ async fn main() -> anyhow::Result<()> {
     let cwd = env::current_dir().unwrap();
     let file_url = format!("file:///{}/test_vision.html", cwd.display().to_string().replace("\\", "/"));
     
-    let (browser, page, handler) = mew_cdp::launch(config.browser.as_ref().and_then(|b| b.binary_path.clone())).await?;
+    let (browser, page, handler) = mew_cdp::launch(
+        config.browser.as_ref().and_then(|b| b.binary_path.clone()),
+        false,
+    ).await?;
     
     // Navigate
     println!("Navigating to test page...");

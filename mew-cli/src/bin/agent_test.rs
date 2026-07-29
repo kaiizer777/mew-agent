@@ -8,7 +8,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = mew_agent::load_config()?;
     
-    let (browser, page, handler_task) = mew_cdp::launch(config.browser.as_ref().and_then(|b| b.binary_path.clone())).await?;
+    let (browser, page, handler_task) = mew_cdp::launch(
+        config.browser.as_ref().and_then(|b| b.binary_path.clone()),
+        false,
+    ).await?;
     
     let task = "Navigate to en.wikipedia.org. Search for 'Rust programming language'. Then, click at least 10 different internal links to explore related topics like Mozilla, C++, Memory Safety, etc. Scroll around if needed. Do not call finish() until you have explored for at least 15 steps.";
     

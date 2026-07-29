@@ -1,5 +1,7 @@
 use crate::ProviderConfig;
 use crate::chat::{MessageBus, UserMessage};
+use crate::completeness::{CompletenessTracker, DeclareItem, MarkOutcome, SubTaskStatus};
+use crate::pacing::{PacingDecision, PacingGuard};
 use crate::session::{SessionError, SessionHandle};
 use chromiumoxide::Page;
 use serde_json::json;
@@ -30,15 +32,62 @@ pub struct Agent {
     /// loop can detect "no bus attached" and skip the drain entirely.
     /// Sized to None after `take_message_sender` so we don't double-take.
     bus: Option<MessageBus>,
+    /// Phase 15.1: completeness tracker. Owns the canonical list of
+    /// sub-items the model has declared for the current task, and the
+    /// "evidence is a fresh snapshot" rule the loop enforces on
+    /// `mark_subtask_done`. The `finish()` tool handler is gated on
+    /// this; the per-subtask end-of-session summary is read from this.
+    completeness: CompletenessTracker,
+    /// Phase 15.1: how many `finish()` calls have been made *for the
+    /// current gate pass*. The first call is a "force a re-prompt if
+    /// any subtask is still incomplete"; the second call is the real
+    /// finish. We keep this separate from `CompletenessTracker::
+    /// finish_attempts` because the loop wants to reset on every
+    /// snapshot re-prompt (so the LLM gets a *fresh* chance), while
+    /// the tracker counts lifetime attempts for the summary.
+    finish_calls_this_gate: usize,
+    /// Phase 15.1: when the gate is open and `finish()` is honored, the
+    /// match-arm stores the model's result string here, and the
+    /// post-match block in `run_inner` returns it via `Ok(...)`. This
+    /// keeps the post-match tool-result logging path shared between
+    /// the gated and ungated cases.
+    pending_finish_result: Option<String>,
+    /// Phase 15.1: set to `true` once the per-subtask summary has been
+    /// written to the transcript. The outer `run` wrapper checks this
+    /// so the summary is written exactly once — either by the finish
+    /// handler (gate open) or by the error/stop path (gate never
+    /// closed or session terminated mid-task). The 15.1 spec says
+    /// "log at the end of every session," not "log multiple times";
+    /// this flag enforces that.
+    summary_written: bool,
+    /// Phase 17.1: pacing guard. Tracks the current streak of
+    /// same-type actions and emits a sleep-before-dispatch when a
+    /// tight loop is detected. Built from the config's `agent.pacing`
+    /// block at construction; fully disabled when the block is
+    /// absent or `enabled: false` — then the guard is a no-op and
+    /// adds zero latency to any dispatch.
+    pacing: PacingGuard,
 }
 
 impl Agent {
     pub fn new(config: ProviderConfig, task: &str) -> Self {
+        // Phase 17.1: clone the pacing config out of `config`
+        // before `config` is moved into `Self`. The pacing guard
+        // is built from this clone; if we tried to read
+        // `config.agent.pacing` after the move it'd be a use-after-
+        // move error.
+        let pacing_config = config.agent.pacing.clone();
         let system_prompt = "You are mew, a visible browser agent. You drive a real Chromium window.
 You can perceive pages via accessibility-tree snapshots and take actions like click, type, scroll.
 If you need to interact with an element that has no meaningful accessible name/role (e.g. an empty button or canvas), use the `vision_inspect` tool first to visually inspect it.
 You must achieve the user's objective by observing the state, choosing a tool, and waiting for the next turn.
-When you are completely done and have the final answer or outcome, call finish() with the result. CRITICAL RULE: If an action times out or fails (e.g., stale reference), NEVER report in finish() that the action 'was performed', 'succeeded', or 'was completed'. You must explicitly state that you attempted the action and it failed/timed out, and do not conflate the attempt with success.";
+When you are completely done and have the final answer or outcome, call finish() with the result. CRITICAL RULE: If an action times out or fails (e.g., stale reference), NEVER report in finish() that the action 'was performed', 'succeeded', or 'was completed'. You must explicitly state that you attempted the action and it failed/timed out, and do not conflate the attempt with success.
+
+COMPLETENESS PROTOCOL (mandatory for multi-item tasks):
+If the task contains multiple similar sub-actions (e.g. 'do X for each of these N things', 'send a message to each person on the list', 'fill in N form fields'), you MUST at the start call the `declare_subtasks` tool with a short id and one-line description for each sub-item. The `items` parameter must be a JSON array of objects with `id` and `description` fields. The agent will track this list in code, not in your memory.
+For each sub-item, after you take a fresh `snapshot()` and verify the expected state change on the page, call `mark_subtask_done(id, snapshot_signature)` where `snapshot_signature` is the value the snapshot tool returns in its result message (it looks like `len:0123abcd`). You cannot mark a subtask done without a fresh snapshot — the tool will reject any signature that doesn't match the most recent on-screen snapshot.
+If you cannot complete a sub-item, call `mark_subtask_skipped(id, reason)` (deliberately out of scope) or `mark_subtask_failed(id, reason)` (attempted but could not verify). Both are accepted as terminal states.
+Calling `finish()` while any subtask is still pending is intercepted: the agent will force a fresh snapshot and re-prompt you to either mark each pending item done/skipped/failed or explicitly justify it. The gate is not a suggestion.";
 
         let messages = vec![
             json!({
@@ -88,6 +137,16 @@ When you are completely done and have the final answer or outcome, call finish()
             force_snapshot: false,
             session,
             bus: Some(MessageBus::new()),
+            completeness: CompletenessTracker::new(),
+            finish_calls_this_gate: 0,
+            pending_finish_result: None,
+            summary_written: false,
+            // Phase 17.1: build the pacing guard from the
+            // `agent.pacing` block in config.yaml. When the block
+            // is absent or `enabled: false`, the guard is a no-op
+            // for the lifetime of the agent — no dispatch site has
+            // to special-case it.
+            pacing: PacingGuard::new(pacing_config),
         }
     }
 
@@ -161,6 +220,78 @@ When you are completely done and have the final answer or outcome, call finish()
     /// to find the transcript file path on disk.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Phase 15.1: test helper. Build a minimal `Agent` without
+    /// writing a transcript file or loading a real provider config.
+    /// Used by `examples/test_completeness.rs` to drive the
+    /// completeness surface in isolation — no Chrome, no LLM, no
+    /// transcript side-effects. The real CLI never calls this.
+    #[doc(hidden)]
+    pub fn new_for_test(task: &str) -> Self {
+        let dummy_config = ProviderConfig {
+            opencode_zen: crate::OpencodeZenConfig {
+                base_url: "http://test/".into(),
+                api_key: "test".into(),
+                default_model: "test".into(),
+                max_iterations: 1,
+                max_tokens: None,
+                max_cost: None,
+            },
+            browser: None,
+            agent: crate::AgentConfig::default(),
+        };
+        let mut s = Self::new(dummy_config, task);
+        // Drop the on-disk transcript so the test doesn't leave
+        // artifacts behind. The test calls `write_summary` against a
+        // temp file it owns.
+        s.transcript_file = None;
+        // Phase 17.1: also force the pacing guard to disabled. The
+        // default `AgentConfig::default()` leaves `pacing.enabled`
+        // as false, but we replace the guard with the explicit
+        // `disabled()` constructor so tests that incidentally call
+        // into the pacing path can't be affected by a future change
+        // to the default.
+        s.pacing = PacingGuard::disabled();
+        s
+    }
+
+    /// Phase 15.1: test helper. Mutable accessor for the
+    /// `CompletenessTracker` so the example tests can drive the
+    /// `record_snapshot` / `mark_done` / `write_summary` paths the
+    /// real loop drives. Real callers go through the tool handlers.
+    #[doc(hidden)]
+    pub fn completeness_mut(&mut self) -> &mut CompletenessTracker {
+        &mut self.completeness
+    }
+
+    /// Phase 15.1: test helper. Read-only accessor for the
+    /// completeness tracker. Some test paths only need to read.
+    #[doc(hidden)]
+    pub fn completeness(&self) -> &CompletenessTracker {
+        &self.completeness
+    }
+
+    /// Phase 15.1: test helper. Read-only accessor for the
+    /// session id string. The test uses it as the
+    /// `write_summary` session_id argument. (Distinct from
+    /// `session_id()` which returns `&str` from `&self`; the
+    /// test wants the same thing but it's renamed here for
+    /// clarity in the test file.)
+    #[doc(hidden)]
+    pub fn session_id_for_test(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Phase 17.1: test helper. Mutable accessor for the
+    /// `PacingGuard` so the example test (`test_pacing.rs`)
+    /// can swap the default-disabled guard for an enabled one
+    /// with custom range / threshold settings. The CLI never
+    /// calls this — pacing config comes from `config.yaml`'s
+    /// `agent.pacing` block.
+    #[doc(hidden)]
+    pub fn pacing_mut_for_test(&mut self) -> &mut PacingGuard {
+        &mut self.pacing
     }
 
     /// Phase 13.1: test/integration helper. Trigger the same
@@ -354,13 +485,82 @@ When you are completely done and have the final answer or outcome, call finish()
                 "type": "function",
                 "function": {
                     "name": "finish",
-                    "description": "Complete the task with a final result",
+                    "description": "Complete the task with a final result. Subject to the completeness gate: if you previously called declare_subtasks, every subtask must be in a terminal state (done/skipped/failed) before this call will be honored. The first finish() call while any subtask is still pending is intercepted: the agent will force a fresh snapshot and re-prompt you to resolve each pending item.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "result": { "type": "string" }
                         },
                         "required": ["result"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "declare_subtasks",
+                    "description": "Declare the list of sub-items this task contains. Call this once at the start of a multi-item task with one entry per sub-item. The agent will track this list in code and require each item to be marked done (with a fresh snapshot as evidence), skipped, or failed before finish() is honored. If the task is a single undifferentiated unit, you do not need to call this tool.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string", "description": "Short identifier for this sub-item, e.g. an underscore-or-hyphen name like msg_to_alice" },
+                                        "description": { "type": "string", "description": "One-line description of the sub-item" }
+                                    },
+                                    "required": ["id", "description"]
+                                }
+                            }
+                        },
+                        "required": ["items"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "mark_subtask_done",
+                    "description": "Mark a previously-declared subtask as done. Requires a fresh snapshot to have been taken since the last mark; the call will be rejected with a stale-evidence error if not. Pass the `snapshot_signature` returned by the most recent snapshot.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "The subtask id (as declared in declare_subtasks)" },
+                            "snapshot_signature": { "type": "string", "description": "The page-state signature from the most recent snapshot" }
+                        },
+                        "required": ["id", "snapshot_signature"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "mark_subtask_skipped",
+                    "description": "Mark a subtask as deliberately skipped (out of scope, not applicable, or the user already handled it). Provide a short reason. Skipped is a terminal status and counts as resolved for the finish() gate.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "reason": { "type": "string" }
+                        },
+                        "required": ["id", "reason"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "mark_subtask_failed",
+                    "description": "Mark a subtask as failed (attempted but could not verify success on screen). Provide a short reason describing what was tried and what went wrong. Failed is a terminal status and counts as resolved for the finish() gate, but will be reported in the per-subtask end-of-session summary.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "reason": { "type": "string" }
+                        },
+                        "required": ["id", "reason"]
                     }
                 }
             }
@@ -432,6 +632,40 @@ When you are completely done and have the final answer or outcome, call finish()
         // exited. Even if `loop { ... }` is broken out of unexpectedly, we
         // mark Done/Failed based on the result and log the transition.
         let run_result = self.run_inner(page).await;
+
+        // Phase 15.1: the per-subtask end-of-session summary is
+        // written for *every* exit path — success (finish() via
+        // pending_finish_result), error (iteration limit, LLM
+        // failure, hard crash), and external stop(). The success path
+        // already wrote one inside the finish() handler before
+        // returning; skip it there to avoid double-writing. The
+        // `summary_written` flag is the canonical "have we already
+        // emitted the summary?" signal. We previously used
+        // `pending_finish_result.is_none()` but `take()` in the post-
+        // match block nukes that field, so the check fired twice.
+        if !self.summary_written {
+            // Build a short task summary from the original task line
+            // in `self.messages`. Same shape the finish() handler
+            // uses; we duplicate the lookup so this branch doesn't
+            // need a different field to be set.
+            let task_summary = self
+                .messages
+                .iter()
+                .find_map(|m| {
+                    m.get("role")
+                        .and_then(|r| r.as_str())
+                        .filter(|r| *r == "user")
+                        .and_then(|_| m.get("content").and_then(|c| c.as_str()))
+                })
+                .unwrap_or("(no task recorded)")
+                .to_string();
+            self.completeness.write_summary(
+                self.transcript_file.as_ref(),
+                &self.session_id,
+                &task_summary,
+            );
+            self.summary_written = true;
+        }
 
         // Transition to terminal state based on how we exited, and log it.
         let terminal = match &run_result {
@@ -512,6 +746,14 @@ When you are completely done and have the final answer or outcome, call finish()
                 // Phase 13.1: preserve any pending user-typed steering notes
                 // across the navigation reset, per the "no state wipe" rule.
                 self.truncate_preserving_user_notes(2); // Keep system (0) and task (1) plus any user notes
+                // Phase 17.1: also reset the pacing streak. A streak
+                // of clicks from the previous page is meaningless
+                // on the new page — the new page might be a
+                // different site with totally different cadence
+                // expectations, and we don't want a navigation to
+                // *not* reset and then have the very first click
+                // on the new page get paced.
+                self.pacing.reset();
             } else {
                 // Justify K=5: 5 recent actions provide enough short-term memory (e.g. opened dropdown, scrolled down, typed input)
                 // to continue the task without hallucinating or losing the immediate thread of action, while dropping older stale results.
@@ -583,6 +825,28 @@ When you are completely done and have the final answer or outcome, call finish()
                 self.force_snapshot = false;
 
                 state.save_tree(&self.session_id, tree);
+                // Phase 15.1: while we still hold the lock and have
+                // `obs_text` in scope, compute the cheap page-state
+                // signature and record the snapshot against the
+                // completeness tracker. The signature is a short
+                // stable hash of the obs text so the per-subtask
+                // summary can say "evidence: iter N, sig=X" without
+                // us re-snapshotting at the end.
+                let snapshot_signature = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    obs_text.len().hash(&mut h);
+                    if obs_text.len() > 200 {
+                        obs_text[..200].hash(&mut h);
+                        obs_text[obs_text.len() - 200..].hash(&mut h);
+                    } else {
+                        obs_text.hash(&mut h);
+                    }
+                    format!("len:{:08x}", h.finish())
+                };
+                self.completeness
+                    .record_snapshot(self.iterations, snapshot_signature);
                 (obs_text, ref_map, is_full_replace)
             };
 
@@ -739,6 +1003,43 @@ When you are completely done and have the final answer or outcome, call finish()
                 let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
                 let mut tool_result = String::new();
 
+                // Phase 17.1: pacing guard. Decide *before* dispatch
+                // whether the next action should be preceded by a
+                // sleep. The guard is a no-op when the config block
+                // is absent or `enabled: false`, so this is free in
+                // the common case. When pacing *does* fire, we log
+                // the decision to the transcript (so reviewers can
+                // see it) and then sleep.
+                //
+                // Why here, not in each match arm: pacing is a
+                // single decision per tool call, not per tool — we
+                // want exactly one sleep per paced action, and
+                // exactly one transcript line. Putting it at the
+                // dispatch boundary (one call site) makes that
+                // structural rather than convention-based.
+                let pacing_decision = self.pacing.before_action(name);
+                match &pacing_decision {
+                    PacingDecision::NoPacing => {
+                        // No log line, no sleep. (17.1 spec: log
+                        // *when pacing is applied*, not every
+                        // no-op — that would be spam on every
+                        // iteration.)
+                    }
+                    PacingDecision::Pace { delay, .. } => {
+                        // Log via the shared helper so the format
+                        // matches the other transcript lines.
+                        if let Some(action) = crate::pacing::PacedAction::from_tool_name(name) {
+                            crate::pacing::log_pacing_decision(
+                                self.transcript_file.as_ref(),
+                                &self.session_id,
+                                action,
+                                &pacing_decision,
+                            );
+                        }
+                        tokio::time::sleep(*delay).await;
+                    }
+                }
+
                 let normalize_ref = |r: &str| -> String {
                     if !r.starts_with('@') { format!("@{}", r) } else { r.to_string() }
                 };
@@ -746,15 +1047,59 @@ When you are completely done and have the final answer or outcome, call finish()
                 match name {
                     "navigate" => {
                         let url = args["url"].as_str().unwrap_or("");
-                        
+
                         if url.contains("force-crash") {
                             anyhow::bail!("Deliberately forced crash mid-task!");
                         }
-                        
-                        // Domain allowlist check
+
+                        // Phase 14.1: URL resolution layer. The LLM may have
+                        // said `navigate("instagram")` (just a bare name) —
+                        // we don't trust its guess, we resolve it ourselves.
+                        // The resolver picks one of three paths:
+                        //   - map-hit: known site, instant
+                        //   - direct-guess: tried `https://{x}.com` and it
+                        //     loaded inside a 4s probe timeout
+                        //   - search-fallback: gave up, sent to Google
+                        // The path taken is logged to the transcript and
+                        // surfaced in the tool result so the next LLM
+                        // iteration knows the URL it ended up on.
+                        let resolution = mew_nav::resolve_with_probe(page, url).await;
+                        let resolved_url = &resolution.url;
+
+                        // Log the resolution decision to the transcript.
+                        // This is the "transparent in the transcript" line
+                        // 14.1 requires — when reviewing a transcript you
+                        // can see *why* a site did what it did.
+                        if let Some(mut file) = self.transcript_file.as_ref() {
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let line = format!(
+                                "[{}] [{}] NAV-RESOLVE: input=\"{}\" path={} resolved_url={}\n\n",
+                                ts,
+                                self.session_id,
+                                resolution.original_input,
+                                resolution.path.as_str(),
+                                resolved_url
+                            );
+                            let _ = file.write_all(line.as_bytes());
+                        }
+                        println!(
+                            "[nav-resolve] \"{}\" -> {} (via {})",
+                            resolution.original_input,
+                            resolved_url,
+                            resolution.path.as_str()
+                        );
+
+                        // Domain allowlist check — runs against the
+                        // *resolved* URL, not the LLM's raw input. If the
+                        // resolver sent us to a search-engine results
+                        // page, the check still runs against google.com,
+                        // which is already in the default allowlist.
                         let mut allowed = true;
                         if let Some(ref allowed_domains) = self.config.agent.allowed_domains {
-                            if let Ok(parsed_url) = url::Url::parse(url) {
+                            if let Ok(parsed_url) = url::Url::parse(resolved_url) {
                                 if let Some(domain) = parsed_url.domain() {
                                     if !allowed_domains.iter().any(|d| domain == d || domain.ends_with(&format!(".{}", d))) {
                                         allowed = false;
@@ -764,24 +1109,35 @@ When you are completely done and have the final answer or outcome, call finish()
                         }
 
                         if !allowed {
-                            tool_result = format!("ERROR: Action failed (Navigation). Domain for URL '{}' is not in the allowlist. Do not attempt this domain.", url);
+                            tool_result = format!("ERROR: Action failed (Navigation). Domain for URL '{}' (resolved from '{}' via {}) is not in the allowlist. Do not attempt this domain.", resolved_url, resolution.original_input, resolution.path.as_str());
                         } else {
                             let mut success = false;
                             let mut backoff = 1;
                             for attempt in 1..=3 {
-                                match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::navigate(page, url)).await {
+                                match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::navigate(page, resolved_url)).await {
                                     Ok(Ok(_)) => {
                                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                                        tool_result = "Navigated successfully".to_string();
+                                        // Tell the LLM (and the user reading
+                                        // logs) which path got us here. If
+                                        // the LLM asked for "instagram" and
+                                        // we ended up on a Google results
+                                        // page, the next turn can see that
+                                        // and adjust.
+                                        tool_result = format!(
+                                            "Navigated successfully (resolved \"{}\" -> \"{}\" via {})",
+                                            resolution.original_input,
+                                            resolved_url,
+                                            resolution.path.as_str()
+                                        );
                                         success = true;
                                         break;
                                     },
                                     Ok(Err(e)) => tool_result = format!("ERROR: Action failed (Navigation). {}. Do not assume success.", e),
                                     Err(_) => tool_result = "ERROR: Action failed (Timeout while navigating). The navigation timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
                                 }
-                                if attempt < 3 && !success { 
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await; 
-                                    backoff *= 2; 
+                                if attempt < 3 && !success {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                                    backoff *= 2;
                                 }
                             }
                         }
@@ -790,11 +1146,53 @@ When you are completely done and have the final answer or outcome, call finish()
                         let r = args["ref"].as_str().unwrap_or("");
                         let r_norm = normalize_ref(r);
                         if let Some(backend_id) = ref_map.get(&r_norm) {
+                            // Phase 16.1: pre-compute the element's center and slide
+                            // the visible ghost cursor there before the real click.
+                            // This is the *only* place we read `visible_cursor` from
+                            // config at click time — keep it scoped to the click
+                            // branch so other tools (type, scroll, navigate) are
+                            // completely unaffected.
+                            let cursor_enabled = self
+                                .config
+                                .browser
+                                .as_ref()
+                                .map(|b| b.visible_cursor)
+                                .unwrap_or(false);
+                            if cursor_enabled {
+                                if let Ok(Some((cx, cy))) =
+                                    mew_cdp::compute_element_center(page, backend_id.clone()).await
+                                {
+                                    // Slide cursor toward the target first. The CSS
+                                    // transition (180ms) on the cursor div handles
+                                    // the visible motion, so this moveTo starts the
+                                    // slide immediately.
+                                    mew_cdp::move_cursor(page, cx, cy).await;
+                                    // Sleep a touch longer than the transition so the
+                                    // slide is fully complete before the click
+                                    // fires. Spec: 100-200ms.
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(200))
+                                        .await;
+                                }
+                            }
+
                             let mut success = false;
                             let mut backoff = 1;
                             for attempt in 1..=3 {
                                 match tokio::time::timeout(tokio::time::Duration::from_secs(1), mew_cdp::click_ref(page, backend_id.clone())).await {
                                     Ok(Ok(_)) => {
+                                        // Fire the click ripple exactly once, on the
+                                        // successful attempt. We re-compute the
+                                        // center here rather than caching the cx/cy
+                                        // outside the loop because the element may
+                                        // have moved between attempts; the ripple
+                                        // should land on the actual final target.
+                                        if cursor_enabled {
+                                            if let Ok(Some((cx, cy))) =
+                                                mew_cdp::compute_element_center(page, backend_id.clone()).await
+                                            {
+                                                mew_cdp::move_cursor_and_ripple(page, cx, cy).await;
+                                            }
+                                        }
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         tool_result = "Clicked successfully".to_string();
                                         success = true;
@@ -812,9 +1210,9 @@ When you are completely done and have the final answer or outcome, call finish()
                                     },
                                     Err(_) => tool_result = "ERROR: Action failed (Timeout while clicking). The click action timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
                                 }
-                                if attempt < 3 && !success { 
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await; 
-                                    backoff *= 2; 
+                                if attempt < 3 && !success {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                                    backoff *= 2;
                                 }
                             }
                         } else {
@@ -882,7 +1280,27 @@ When you are completely done and have the final answer or outcome, call finish()
                         }
                     },
                     "snapshot" => {
-                        tool_result = "Snapshot taken. Observe the new page state in the next user message.".to_string();
+                        // Phase 15.1: the snapshot tool MUST return the
+                        // current page-state signature so the model can
+                        // pass it to `mark_subtask_done` as evidence.
+                        // Without surfacing the signature here, the
+                        // model is forced to guess one, and any guess
+                        // will be rejected by the tracker's evidence
+                        // rule — making the gate look broken when it
+                        // is actually working correctly. The signature
+                        // is recorded in the perception block *after*
+                        // the snapshot, so by the time this tool
+                        // handler runs (next iteration), it's the
+                        // freshest one available.
+                        let sig = self
+                            .completeness
+                            .last_snapshot_signature
+                            .clone()
+                            .unwrap_or_else(|| "(none yet — perception block has not recorded a snapshot for this session)".to_string());
+                        tool_result = format!(
+                            "Snapshot taken. Observe the new page state in the next user message. Current snapshot_signature: {}",
+                            sig
+                        );
                     },
                     "vision_inspect" => {
                         let r = args["ref"].as_str().unwrap_or("");
@@ -934,15 +1352,348 @@ When you are completely done and have the final answer or outcome, call finish()
                         }
                     },
                     "finish" => {
+                        // Phase 15.1: the finish() tool is gated by the
+                        // completeness tracker. If subtasks were declared
+                        // and any are still pending, this first call is
+                        // intercepted — we do NOT return Ok(res). Instead
+                        // we set `tool_result` to a re-prompt the LLM sees
+                        // on the next iteration, log the gate-trigger
+                        // event, and continue the loop.
+                        //
+                        // The 15.1 spec is explicit: "force one more
+                        // snapshot() and require the model to explicitly
+                        // justify each incomplete item." We do both: the
+                        // re-prompt is injected as a tool-result error
+                        // (so the LLM is told to act on it next turn)
+                        // AND we set force_snapshot so the next iteration
+                        // gets a fresh tree, not a stale diff.
                         let res = args["result"].as_str().unwrap_or("").to_string();
-                        println!("Task finished with result: {}", res);
-                        // Log to transcript
-                        if let Some(mut file) = self.transcript_file.as_ref() {
-                            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                            let log_entry = format!("[{}] [{}] TOOL CALL: {} (args: {})\nRESULT: Task finished: {}\n\n", timestamp, obs_summary, name, args_str, res);
-                            let _ = file.write_all(log_entry.as_bytes());
+                        self.completeness.record_finish_attempt();
+                        self.finish_calls_this_gate += 1;
+
+                        if self.completeness.gate_open() {
+                            // Gate clear — let finish() through. Write the
+                            // per-subtask summary to the transcript first
+                            // (the spec requires it be logged at the end of
+                            // every session), then return.
+                            let task_summary = self
+                                .messages
+                                .iter()
+                                .find_map(|m| {
+                                    m.get("role").and_then(|r| r.as_str())
+                                        .filter(|r| *r == "user")
+                                        .and_then(|_| m.get("content").and_then(|c| c.as_str()))
+                                })
+                                .unwrap_or("(no task recorded)")
+                                .to_string();
+                            self.completeness.write_summary(
+                                self.transcript_file.as_ref(),
+                                &self.session_id,
+                                &task_summary,
+                            );
+                            self.summary_written = true;
+                            println!("Task finished with result: {}", res);
+                            if let Some(mut file) = self.transcript_file.as_ref() {
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let log_entry = format!(
+                                    "[{}] [{}] TOOL CALL: {} (args: {})\nRESULT: Task finished: {}\n\n",
+                                    timestamp, obs_summary, name, args_str, res
+                                );
+                                let _ = file.write_all(log_entry.as_bytes());
+                            }
+                            // Stash the result so the post-match block
+                            // can return it. We use a small String
+                            // captured via `pending_finish_result` so
+                            // the existing match-arm exit path is reused.
+                            self.pending_finish_result = Some(res);
+                            // Use a non-error tool_result to satisfy the
+                            // match's fallthrough; the real Ok return
+                            // happens after the match.
+                            tool_result = "(gate open — finish accepted; will return on next iteration)".to_string();
+                        } else {
+                            // Gate closed — first call is a re-prompt.
+                            // Don't return. Mark gate triggered, force a
+                            // fresh snapshot next iteration, and tell the
+                            // LLM exactly what to do.
+                            self.completeness.note_gate_triggered();
+                            self.force_snapshot = true;
+                            let pending_ids: Vec<String> = self
+                                .completeness
+                                .subtasks
+                                .iter()
+                                .filter(|s| !matches!(s.status, SubTaskStatus::Done | SubTaskStatus::Skipped { .. } | SubTaskStatus::Failed { .. }))
+                                .map(|s| s.id.clone())
+                                .collect();
+                            let pending_descs: Vec<String> = self
+                                .completeness
+                                .subtasks
+                                .iter()
+                                .filter(|s| !matches!(s.status, SubTaskStatus::Done | SubTaskStatus::Skipped { .. } | SubTaskStatus::Failed { .. }))
+                                .map(|s| format!("  - id={}: {}", s.id, s.description))
+                                .collect();
+                            let reason = format!(
+                                "GATE BLOCKED: finish() called while {} subtask(s) are still pending. The agent is now forcing a fresh snapshot and re-prompting you. You must, on the next turn, do one of the following for each pending item:\n  - Call mark_subtask_done(id, snapshot_signature) if the most recent snapshot confirms the sub-item is complete on screen. The signature will be in the next observation.\n  - Call mark_subtask_skipped(id, reason) if the sub-item is genuinely out of scope.\n  - Call mark_subtask_failed(id, reason) if you tried and could not verify success.\nPending items:\n{}\nA blanket finish() is not accepted. The next iteration will start with a fresh snapshot so you have on-screen evidence to mark each item done.",
+                                pending_ids.len(),
+                                pending_descs.join("\n")
+                            );
+                            println!("[completeness-gate] finish() blocked: {}", reason.replace("\n", " | "));
+                            if let Some(mut file) = self.transcript_file.as_ref() {
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let log_entry = format!(
+                                    "[{}] [{}] GATE: finish() intercepted, pending={}, reason={}\n\n",
+                                    timestamp,
+                                    self.session_id,
+                                    pending_ids.len(),
+                                    reason.replace("\n", " | ")
+                                );
+                                let _ = file.write_all(log_entry.as_bytes());
+                            }
+                            tool_result = reason;
+                            // Reset the per-gate counter so the LLM
+                            // gets exactly one more chance after the
+                            // forced re-prompt — if it calls finish()
+                            // again with pending items still open, the
+                            // same gate fires again (not a permanent
+                            // block, just a per-attempt re-prompt).
+                            self.finish_calls_this_gate = 0;
                         }
-                        return Ok(res);
+                    },
+                    "declare_subtasks" => {
+                        // Phase 15.1: the LLM populates the canonical
+                        // sub-item list. We accept JSON shape
+                        // `{ items: [{ id, description }, ...] }`.
+                        let items_raw = args.get("items").and_then(|v| v.as_array());
+                        let mut declared: Vec<DeclareItem> = Vec::new();
+                        if let Some(arr) = items_raw {
+                            for it in arr {
+                                let id = it.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let desc = it.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                if id.is_empty() {
+                                    tool_result = format!("ERROR: declare_subtasks item missing 'id': {}", it);
+                                    break;
+                                }
+                                if desc.is_empty() {
+                                    tool_result = format!("ERROR: declare_subtasks item '{}' missing 'description'", id);
+                                    break;
+                                }
+                                declared.push(DeclareItem { id, description: desc });
+                            }
+                        }
+                        if tool_result.is_empty() {
+                            match self.completeness.declare(declared.clone()) {
+                                Ok(n) => {
+                                    println!(
+                                        "[completeness] declared {} subtask(s); tracker now: {}",
+                                        n,
+                                        self.completeness.inline_status()
+                                    );
+                                    if let Some(mut file) = self.transcript_file.as_ref() {
+                                        let timestamp = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        let ids: Vec<String> = declared.iter().map(|d| d.id.clone()).collect();
+                                        let log_entry = format!(
+                                            "[{}] [{}] DECLARE: subtasks={} ids={:?}\n\n",
+                                            timestamp,
+                                            self.session_id,
+                                            n,
+                                            ids
+                                        );
+                                        let _ = file.write_all(log_entry.as_bytes());
+                                    }
+                                    let list: Vec<String> = declared
+                                        .iter()
+                                        .map(|d| format!("  - id={} desc=\"{}\"", d.id, d.description))
+                                        .collect();
+                                    tool_result = format!(
+                                        "Declared {} subtask(s). For each, take a snapshot and call mark_subtask_done(id, snapshot_signature) when you see the expected state change. Skipped/failed are also terminal.\n{}",
+                                        n,
+                                        list.join("\n")
+                                    );
+                                }
+                                Err(e) => {
+                                    tool_result = format!("ERROR: declare_subtasks rejected: {}", e);
+                                }
+                            }
+                        }
+                    },
+                    "mark_subtask_done" => {
+                        // Phase 15.1: the LLM marks a subtask complete.
+                        // The tracker rejects the call if the supplied
+                        // signature doesn't match the most recent
+                        // snapshot, forcing the model to actually look
+                        // at the page (or call snapshot() first).
+                        let id = args["id"].as_str().unwrap_or("").to_string();
+                        let sig = args["snapshot_signature"].as_str().unwrap_or("").to_string();
+                        if id.is_empty() {
+                            tool_result = "ERROR: mark_subtask_done requires 'id'".to_string();
+                        } else {
+                            match self.completeness.mark_done(&id, &sig) {
+                                MarkOutcome::MarkedDone { evidence_iteration, evidence_signature } => {
+                                    println!(
+                                        "[completeness] subtask '{}' marked done (evidence: iter {}, sig {})",
+                                        id, evidence_iteration, evidence_signature
+                                    );
+                                    if let Some(mut file) = self.transcript_file.as_ref() {
+                                        let timestamp = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        let log_entry = format!(
+                                            "[{}] [{}] MARK DONE: id={} evidence_iter={} evidence_sig={}\n\n",
+                                            timestamp, self.session_id, id, evidence_iteration, evidence_signature
+                                        );
+                                        let _ = file.write_all(log_entry.as_bytes());
+                                    }
+                                    tool_result = format!(
+                                        "Subtask '{}' marked done with fresh-snapshot evidence (iter {}, sig {}). Tracker: {}",
+                                        id,
+                                        evidence_iteration,
+                                        evidence_signature,
+                                        self.completeness.inline_status()
+                                    );
+                                }
+                                MarkOutcome::StaleEvidence { last_snapshot_iteration, current_iteration } => {
+                                    println!(
+                                        "[completeness] mark_done '{}' REJECTED: stale evidence (last snapshot at iter {}, current iter {})",
+                                        id, last_snapshot_iteration, current_iteration
+                                    );
+                                    tool_result = format!(
+                                        "ERROR: mark_subtask_done for '{}' rejected — your snapshot_signature does not match the most recent on-screen snapshot. Take a fresh snapshot() first, observe the page, and retry with that signature. The agent has recorded snapshot signatures as the perception block runs.",
+                                        id
+                                    );
+                                }
+                                MarkOutcome::UnknownId => {
+                                    tool_result = format!(
+                                        "ERROR: no subtask with id '{}' is currently declared. Call declare_subtasks first or check the id spelling.",
+                                        id
+                                    );
+                                }
+                                MarkOutcome::AlreadyTerminal { current } => {
+                                    tool_result = format!(
+                                        "ERROR: subtask '{}' is already in terminal status '{}' and cannot be marked done again.",
+                                        id,
+                                        current.as_str()
+                                    );
+                                }
+                                MarkOutcome::MarkedSkipped { .. } => {
+                                    // unreachable on mark_done
+                                    unreachable!()
+                                }
+                            }
+                        }
+                    },
+                    "mark_subtask_skipped" => {
+                        let id = args["id"].as_str().unwrap_or("").to_string();
+                        let reason = args["reason"].as_str().unwrap_or("").to_string();
+                        if id.is_empty() {
+                            tool_result = "ERROR: mark_subtask_skipped requires 'id'".to_string();
+                        } else if reason.is_empty() {
+                            tool_result = format!("ERROR: mark_subtask_skipped for '{}' requires a non-empty 'reason'", id);
+                        } else {
+                            match self.completeness.mark_skipped(&id, reason.clone()) {
+                                MarkOutcome::MarkedSkipped { reason: r } => {
+                                    println!(
+                                        "[completeness] subtask '{}' marked skipped: {}",
+                                        id, r
+                                    );
+                                    if let Some(mut file) = self.transcript_file.as_ref() {
+                                        let timestamp = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        let log_entry = format!(
+                                            "[{}] [{}] MARK SKIPPED: id={} reason={}\n\n",
+                                            timestamp, self.session_id, id, r
+                                        );
+                                        let _ = file.write_all(log_entry.as_bytes());
+                                    }
+                                    tool_result = format!(
+                                        "Subtask '{}' marked skipped (reason: {}). Tracker: {}",
+                                        id,
+                                        r,
+                                        self.completeness.inline_status()
+                                    );
+                                }
+                                MarkOutcome::UnknownId => {
+                                    tool_result = format!(
+                                        "ERROR: no subtask with id '{}' is currently declared.",
+                                        id
+                                    );
+                                }
+                                MarkOutcome::AlreadyTerminal { current } => {
+                                    tool_result = format!(
+                                        "ERROR: subtask '{}' is already in terminal status '{}'.",
+                                        id,
+                                        current.as_str()
+                                    );
+                                }
+                                MarkOutcome::StaleEvidence { .. } => unreachable!(),
+                                MarkOutcome::MarkedDone { .. } => unreachable!(),
+                            }
+                        }
+                    },
+                    "mark_subtask_failed" => {
+                        let id = args["id"].as_str().unwrap_or("").to_string();
+                        let reason = args["reason"].as_str().unwrap_or("").to_string();
+                        if id.is_empty() {
+                            tool_result = "ERROR: mark_subtask_failed requires 'id'".to_string();
+                        } else if reason.is_empty() {
+                            tool_result = format!("ERROR: mark_subtask_failed for '{}' requires a non-empty 'reason'", id);
+                        } else {
+                            match self.completeness.mark_failed(&id, reason.clone()) {
+                                MarkOutcome::MarkedSkipped { reason: r } => {
+                                    // mark_failed reuses the MarkedSkipped
+                                    // variant in the enum because they
+                                    // share "terminal + reason" semantics
+                                    // for the dispatcher. The tracker
+                                    // itself records Failed.
+                                    println!(
+                                        "[completeness] subtask '{}' marked failed: {}",
+                                        id, r
+                                    );
+                                    if let Some(mut file) = self.transcript_file.as_ref() {
+                                        let timestamp = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        let log_entry = format!(
+                                            "[{}] [{}] MARK FAILED: id={} reason={}\n\n",
+                                            timestamp, self.session_id, id, r
+                                        );
+                                        let _ = file.write_all(log_entry.as_bytes());
+                                    }
+                                    tool_result = format!(
+                                        "Subtask '{}' marked failed (reason: {}). Tracker: {}",
+                                        id,
+                                        r,
+                                        self.completeness.inline_status()
+                                    );
+                                }
+                                MarkOutcome::UnknownId => {
+                                    tool_result = format!(
+                                        "ERROR: no subtask with id '{}' is currently declared.",
+                                        id
+                                    );
+                                }
+                                MarkOutcome::AlreadyTerminal { current } => {
+                                    tool_result = format!(
+                                        "ERROR: subtask '{}' is already in terminal status '{}'.",
+                                        id,
+                                        current.as_str()
+                                    );
+                                }
+                                MarkOutcome::StaleEvidence { .. } => unreachable!(),
+                                MarkOutcome::MarkedDone { .. } => unreachable!(),
+                            }
+                        }
                     },
                     _ => {
                         tool_result = format!("Unknown tool '{}'", name);
@@ -962,6 +1713,15 @@ When you are completely done and have the final answer or outcome, call finish()
                     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                     let log_entry = format!("[{}] [{}] TOOL CALL: {} (args: {})\nRESULT: {}\n\n", timestamp, obs_summary, name, args_str, tool_result);
                     let _ = file.write_all(log_entry.as_bytes());
+                }
+
+                // Phase 15.1: if the finish() tool handler stashed a
+                // result (gate open), exit the loop now with that
+                // result. The transcript logging above is the same
+                // shape every other tool uses, so the per-tool log
+                // line still records the finish() call.
+                if let Some(result) = self.pending_finish_result.take() {
+                    return Ok(result);
                 }
             } else {
                 let content = message["content"].as_str().unwrap_or("");

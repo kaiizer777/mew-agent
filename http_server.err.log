@@ -1,0 +1,8 @@
+::1 - - [29/Jul/2026 18:22:40] "GET /test_15_2_messages.html HTTP/1.1" 200 -
+::1 - - [29/Jul/2026 18:22:49] "GET /test_15_2_messages.html HTTP/1.1" 304 -
+::1 - - [29/Jul/2026 18:22:49] code 404, message File not found
+::1 - - [29/Jul/2026 18:22:49] "GET /favicon.ico HTTP/1.1" 404 -
+::1 - - [29/Jul/2026 18:24:40] "GET /test_15_2_full.html HTTP/1.1" 200 -
+::1 - - [29/Jul/2026 18:24:48] "GET /test_15_2_full.html HTTP/1.1" 200 -
+::1 - - [29/Jul/2026 18:24:48] code 404, message File not found
+::1 - - [29/Jul/2026 18:24:48] "GET /favicon.ico HTTP/1.1" 404 -

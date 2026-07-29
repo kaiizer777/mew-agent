@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "mew-cdp",
     "mew-perception",
+    "mew-nav",
     "mew-agent",
     "mew-cli",
 ]
@@ -10,6 +11,7 @@ members = [
 [workspace.dependencies]
 mew-cdp = { path = "mew-cdp" }
 mew-perception = { path = "mew-perception" }
+mew-nav = { path = "mew-nav" }
 mew-agent = { path = "mew-agent" }
 
 chromiumoxide = { version = "0.9.1" }

@@ -12,16 +12,218 @@ use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotParams, Captur
 pub enum StaleRefError {
     #[error("Stale ref: Node with BackendNodeId {0:?} could not be found or resolved.")]
     NotFound(BackendNodeId),
-    
+
     #[error("Stale ref: Failed to interact with BackendNodeId {0:?}: {1}")]
     InteractionFailed(BackendNodeId, String),
 }
 
 pub const DEFAULT_PORT: u16 = 9222;
 
+// ---------------------------------------------------------------------------
+// Phase 16.1: visible cursor overlay — runtime API
+// ---------------------------------------------------------------------------
+// These functions are the agent-facing side of the cursor feature. They are
+// always safe to call: if the script wasn't injected (`visible_cursor: false`
+// in config), `window.__mewCursor` won't exist, and the evaluate call returns
+// an error we swallow. The click path itself is never blocked on these calls.
+
+/// Compute the viewport-space center (cx, cy) of the element identified by
+/// `backend_id`. Mirrors the box-model path used by [`screenshot_region`].
+/// Returns `None` if the element is stale / has no box / has zero area.
+pub async fn compute_element_center(
+    page: &Page,
+    backend_id: BackendNodeId,
+) -> Result<Option<(f64, f64)>, StaleRefError> {
+    let box_model_params = GetBoxModelParams::builder()
+        .backend_node_id(backend_id.clone())
+        .build();
+    let box_model_res = match page.execute(box_model_params).await {
+        Ok(r) => r,
+        Err(_) => return Ok(None), // stale / detached
+    };
+    let quad: Vec<f64> = serde_json::from_value(
+        serde_json::to_value(&box_model_res.model.border).unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    if quad.len() != 8 {
+        return Ok(None);
+    }
+    let x_coords = [quad[0], quad[2], quad[4], quad[6]];
+    let y_coords = [quad[1], quad[3], quad[5], quad[7]];
+    let min_x = x_coords.iter().cloned().fold(f64::INFINITY, f64::min);
+    let min_y = y_coords.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_x = x_coords.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max_y = y_coords.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let w = max_x - min_x;
+    let h = max_y - min_y;
+    if w <= 0.0 || h <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some((min_x + w / 2.0, min_y + h / 2.0)))
+}
+
+/// Move the ghost cursor to (x, y). No-op if the cursor script wasn't
+/// injected — the evaluate simply returns "undefined" and we ignore it.
+pub async fn move_cursor(page: &Page, x: f64, y: f64) {
+    let expr = format!(
+        "(window.__mewCursor && window.__mewCursor.moveTo) ? window.__mewCursor.moveTo({x}, {y}) : null"
+    );
+    if let Err(e) = page.evaluate(expr).await {
+        tracing::debug!("move_cursor: no-op ({e})");
+    }
+}
+
+/// Move the ghost cursor to (x, y) and fire a click ripple. No-op if the
+/// cursor script wasn't injected.
+pub async fn move_cursor_and_ripple(page: &Page, x: f64, y: f64) {
+    let expr = format!(
+        "(function(){{ \
+            if (!(window.__mewCursor && window.__mewCursor.click)) return null; \
+            window.__mewCursor.moveTo({x}, {y}); \
+            window.__mewCursor.click({x}, {y}); \
+            return true; \
+        }})()"
+    );
+    if let Err(e) = page.evaluate(expr).await {
+        tracing::debug!("move_cursor_and_ripple: no-op ({e})");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 16.1: visible cursor overlay
+// ---------------------------------------------------------------------------
+// Injected on every navigation via `Page.addScriptToEvaluateOnNewDocument`
+// (chromiumoxide's direct equivalent of Playwright's `addInitScript`). The
+// script creates a `position: fixed` ghost cursor + a click ripple element,
+// both with `pointer-events: none` so real page interaction is never blocked,
+// and exposes a small imperative API on `window.__mewCursor`.
+//
+// Adaptation note vs. the spec text: the spec mentions intercepting
+// `Input.dispatchMouseEvent` calls, but in this codebase the real click path
+// is `click_ref` -> `Runtime.callFunctionOn` -> `el.click()` (synthetic JS
+// click), which never dispatches a mouse event at real coordinates. We
+// therefore drive `__mewCursor` from the agent side using the element's
+// pre-computed center (same `GetBoxModel` path `screenshot_region` already
+// uses), which is what makes the cursor visibly slide to each click target
+// in the actual session. The script itself is unchanged from the spec — it
+// re-injects on every navigation and is a CSS-only overlay with no
+// `navigator.*` property touches, so it doesn't trip any bot-detection.
+const VISIBLE_CURSOR_SCRIPT: &str = r#"
+(function () {
+    // Idempotency guard: if a previous page already installed the cursor,
+    // do nothing. This protects against double-injection if a re-navigation
+    // fires before the previous document is torn down.
+    if (window.__mewCursor && window.__mewCursor.__installed) return;
+    window.__mewCursor = { __installed: true };
+
+    // The cursor element: a small filled circle with a thin outer ring,
+    // fixed to the viewport, never interactive.
+    var cursor = document.createElement('div');
+    cursor.id = '__mew-cursor';
+    cursor.style.cssText = [
+        'position: fixed',
+        'left: 0',
+        'top: 0',
+        'width: 18px',
+        'height: 18px',
+        'margin-left: -9px',
+        'margin-top: -9px',
+        'border-radius: 50%',
+        'background: rgba(37, 99, 235, 0.95)',     // matches the project's ink-blue accent #2563EB
+        'border: 2px solid rgba(255, 255, 255, 0.9)',
+        'box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25)',
+        'pointer-events: none',                    // never blocks real clicks
+        'z-index: 2147483647',                     // max int — top of any stacking context
+        'transform: translate3d(-100px, -100px, 0)',
+        'transition: transform 180ms ease-out',    // visible slide, not teleport
+        'will-change: transform'
+    ].join(';');
+
+    // The click ripple: a short-lived expanding ring that flashes at the
+    // click point. Distinguishes real clicks from plain hovers/moves.
+    var ripple = document.createElement('div');
+    ripple.id = '__mew-cursor-ripple';
+    ripple.style.cssText = [
+        'position: fixed',
+        'left: 0',
+        'top: 0',
+        'width: 8px',
+        'height: 8px',
+        'margin-left: -4px',
+        'margin-top: -4px',
+        'border-radius: 50%',
+        'background: rgba(37, 99, 235, 0.0)',
+        'border: 2px solid rgba(37, 99, 235, 0.85)',
+        'pointer-events: none',
+        'z-index: 2147483646',
+        'transform: translate3d(-100px, -100px, 0) scale(1)',
+        'opacity: 1',
+        'will-change: transform, opacity'
+    ].join(';');
+
+    // Append as late as possible — at document-start the body may not exist
+    // yet, so wait until it does.
+    function attach() {
+        var parent = document.body || document.documentElement;
+        if (!parent) return false;
+        if (cursor.parentNode !== parent) parent.appendChild(cursor);
+        if (ripple.parentNode !== parent) parent.appendChild(ripple);
+        return true;
+    }
+    if (!attach()) {
+        var obs = new MutationObserver(function () {
+            if (attach()) obs.disconnect();
+        });
+        obs.observe(document.documentElement || document, { childList: true, subtree: true });
+    }
+
+    // Track the last set position so a `click()` without a prior moveTo
+    // (race / typo) still ripples at a sane spot instead of (-100, -100).
+    var lastX = 0;
+    var lastY = 0;
+
+    window.__mewCursor.moveTo = function (x, y) {
+        if (typeof x !== 'number' || typeof y !== 'number') return;
+        lastX = x; lastY = y;
+        // Re-attach in case the body was replaced by an SPA route change.
+        if (cursor.parentNode !== document.body && cursor.parentNode !== document.documentElement) {
+            attach();
+        }
+        cursor.style.transform = 'translate3d(' + x + 'px, ' + y + 'px, 0)';
+    };
+
+    window.__mewCursor.click = function (x, y) {
+        if (typeof x === 'number' && typeof y === 'number') {
+            lastX = x; lastY = y;
+            cursor.style.transform = 'translate3d(' + x + 'px, ' + y + 'px, 0)';
+        }
+        if (ripple.parentNode !== document.body && ripple.parentNode !== document.documentElement) {
+            attach();
+        }
+        // Reset ripple to a known starting transform, then force a reflow so
+        // the next style write triggers the CSS transition cleanly.
+        ripple.style.transition = 'none';
+        ripple.style.transform = 'translate3d(' + lastX + 'px, ' + lastY + 'px, 0) scale(1)';
+        ripple.style.opacity = '1';
+        // eslint-disable-next-line no-unused-expressions
+        ripple.getBoundingClientRect();
+        // Animate: expand and fade out over ~450ms.
+        ripple.style.transition = 'transform 450ms ease-out, opacity 450ms ease-out';
+        ripple.style.transform = 'translate3d(' + lastX + 'px, ' + lastY + 'px, 0) scale(6)';
+        ripple.style.opacity = '0';
+    };
+})();
+"#;
+
 /// Launches a headed Chrome instance via CDP using chromiumoxide.
 /// Configured with a fixed remote debugging port (9222) and persistent user data directory (`./profile`).
-pub async fn launch(binary_path: Option<String>) -> Result<(Browser, Page, tokio::task::JoinHandle<()>)> {
+///
+/// `visible_cursor` (Phase 16.1) — when true, the page-level script in
+/// [`VISIBLE_CURSOR_SCRIPT`] is registered on every navigation so a
+/// ghost cursor + click ripple overlay is available to the agent. Default
+/// false: when off, the script is not registered, the API calls are no-ops
+/// via the `__mewCursor` guard, and the click path adds zero latency.
+pub async fn launch(binary_path: Option<String>, visible_cursor: bool) -> Result<(Browser, Page, tokio::task::JoinHandle<()>)> {
     let profile_dir = std::env::current_dir()?.join("profile");
 
     let mut config_builder = BrowserConfig::builder()
@@ -29,11 +231,11 @@ pub async fn launch(binary_path: Option<String>) -> Result<(Browser, Page, tokio
         .port(9222)
         .window_size(1280, 800)
         .user_data_dir(profile_dir);
-        
+
     if let Some(path) = binary_path {
         config_builder = config_builder.chrome_executable(path);
     }
-        
+
     let config = config_builder.build()
         .map_err(|e| anyhow::anyhow!("Failed to build BrowserConfig: {e}"))?;
 
@@ -50,19 +252,33 @@ pub async fn launch(binary_path: Option<String>) -> Result<(Browser, Page, tokio
     });
 
     let page = browser.new_page("about:blank").await?;
-    
+
     // Inject defense-in-depth stealth patches
     let js_patch = r#"
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         if (window.chrome && window.chrome.runtime) delete window.chrome.runtime;
     "#;
-    
+
     page.execute(
         chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::builder()
             .source(js_patch)
             .build()
             .unwrap()
     ).await?;
+
+    // Phase 16.1: register the visible-cursor overlay script. It runs at
+    // document start on every navigation, so the cursor survives SPA route
+    // changes and full reloads alike.
+    if visible_cursor {
+        tracing::info!("Visible cursor overlay ENABLED (Phase 16.1)");
+        page.execute(
+            chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::builder()
+                .source(VISIBLE_CURSOR_SCRIPT)
+                .build()
+                .unwrap()
+        ).await?;
+    }
+
     Ok((browser, page, handle))
 }
 

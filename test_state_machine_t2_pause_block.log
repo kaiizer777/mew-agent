@@ -1,15 +1,15 @@
-[1785271078] [t2_pause_block] LOOP: iter 1: about to checkpoint
-[1785271078] [t2_pause_block] LOOP: iter 1: pre-checkpoint
-[1785271078] [t2_pause_block] LOOP: iter 1: post-checkpoint
-[1785271078] [t2_pause_block] LOOP: iter 2: about to checkpoint
-[1785271078] [t2_pause_block] LOOP: iter 2: pre-checkpoint
-[1785271078] [t2_pause_block] LOOP: iter 2: post-checkpoint
-[1785271079] [t2_pause_block] LOOP: iter 3: about to checkpoint
-[1785271079] [t2_pause_block] LOOP: iter 3: pre-checkpoint
-[1785271080] [t2_pause_block] LOOP: iter 3: post-checkpoint
-[1785271080] [t2_pause_block] LOOP: iter 4: about to checkpoint
-[1785271080] [t2_pause_block] LOOP: iter 4: pre-checkpoint
-[1785271080] [t2_pause_block] LOOP: iter 4: post-checkpoint
-[1785271080] [t2_pause_block] LOOP: iter 5: about to checkpoint
-[1785271080] [t2_pause_block] LOOP: iter 5: pre-checkpoint
-[1785271080] [t2_pause_block] LOOP: iter 5: post-checkpoint
+[1785326228] [t2_pause_block] LOOP: iter 1: about to checkpoint
+[1785326228] [t2_pause_block] LOOP: iter 1: pre-checkpoint
+[1785326228] [t2_pause_block] LOOP: iter 1: post-checkpoint
+[1785326228] [t2_pause_block] LOOP: iter 2: about to checkpoint
+[1785326228] [t2_pause_block] LOOP: iter 2: pre-checkpoint
+[1785326228] [t2_pause_block] LOOP: iter 2: post-checkpoint
+[1785326228] [t2_pause_block] LOOP: iter 3: about to checkpoint
+[1785326228] [t2_pause_block] LOOP: iter 3: pre-checkpoint
+[1785326230] [t2_pause_block] LOOP: iter 3: post-checkpoint
+[1785326230] [t2_pause_block] LOOP: iter 4: about to checkpoint
+[1785326230] [t2_pause_block] LOOP: iter 4: pre-checkpoint
+[1785326230] [t2_pause_block] LOOP: iter 4: post-checkpoint
+[1785326230] [t2_pause_block] LOOP: iter 5: about to checkpoint
+[1785326230] [t2_pause_block] LOOP: iter 5: pre-checkpoint
+[1785326230] [t2_pause_block] LOOP: iter 5: post-checkpoint

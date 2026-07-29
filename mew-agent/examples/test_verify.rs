@@ -17,7 +17,10 @@ async fn main() -> anyhow::Result<()> {
     };
     
     println!("Launching browser...");
-    let (browser, page, handler) = mew_cdp::launch(config.browser.as_ref().and_then(|b| b.binary_path.clone())).await?;
+    let (browser, page, handler) = mew_cdp::launch(
+        config.browser.as_ref().and_then(|b| b.binary_path.clone()),
+        false,
+    ).await?;
     
     println!("Initial navigation to: {}", url);
     let _ = page.goto(&url).await?.wait_for_navigation().await;
