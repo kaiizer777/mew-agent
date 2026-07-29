@@ -101,10 +101,25 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
         ];
 
         let session_id = format!("session_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+        // Phase 17.1+ tidy: write transcripts to a dedicated
+        // /transcripts/ subfolder instead of the project root.
+        // Rationale: every mew run used to drop a
+        // `transcript_<session_id>.log` next to the source, which
+        // polluted the project root and made it easy to miss
+        // genuine files. The folder is gitignored (see
+        // .gitignore's `/transcripts/` rule) so the noise never
+        // reaches git. We `create_dir_all` here so the first run
+        // on a fresh checkout just works — no setup step needed.
+        // If the directory can't be created (read-only fs, etc.)
+        // we fall back to the in-memory path (transcript_file =
+        // None) and keep running; nothing else in the agent
+        // depends on the file being on disk.
+        let transcript_dir = std::path::PathBuf::from("transcripts");
+        let _ = std::fs::create_dir_all(&transcript_dir);
         let transcript_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("transcript_{}.log", session_id))
+            .open(transcript_dir.join(format!("transcript_{}.log", session_id)))
             .ok();
 
         let session = SessionHandle::new(session_id.clone());

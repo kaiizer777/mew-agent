@@ -1,5 +1,6 @@
 /target
 config.yaml
+/transcripts/
 
 # OS & IDE Junk
 .DS_Store
