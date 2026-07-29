@@ -40,11 +40,5 @@ visible_cursor: true
 ```
 *(Note: Never commit your `config.yaml`!)*
 
-## 📚 Development Status
-
-This project is built iteratively following a strict "Implementation -> Review & Testing" checklist format (detailed in `work.md` and `v2.md`). 
-
-Core capabilities including CDP navigation, reference targeting, snapshot diffing, ReAct loop, vision fallback, live steering, and evidence-based completion have been successfully implemented and verified against real-world scenarios.
-
 ---
 *Built with `chromiumoxide`, `tokio`, and standard Rust async plumbing.*
