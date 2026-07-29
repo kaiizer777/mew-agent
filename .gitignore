@@ -2,6 +2,16 @@
 config.yaml
 /transcripts/
 
+# External Chrome distribution and bundled archive.
+# These are 100+ MB each, so GitHub rejects them outright, AND
+# they're regenerated/reinstalled per-machine anyway (see
+# config.yaml: binary_path points at stealth-browser/chrome.exe
+# at runtime, so as long as that folder exists locally the
+# agent works). Keeping them in git would also bloat every
+# clone of the repo by ~800 MB with no benefit.
+stealth-browser/
+cloakbrowser.zip
+
 # OS & IDE Junk
 .DS_Store
 Thumbs.db
