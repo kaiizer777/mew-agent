@@ -28,7 +28,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mew_agent::pacing::{PacedAction, PacingConfig, PacingGuard};
 
-const TRANSCRIPT: &str = "review_pacing_17_2.log";
+// Transcript lives under tests-output/review_pacing_17_2/ so the
+// project root stays clean. The folder is gitignored.
+const TRANSCRIPT: &str = "tests-output/review_pacing_17_2/review_pacing_17_2.log";
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -92,6 +94,9 @@ fn dispatch(guard: &mut PacingGuard, name: &str) -> Duration {
 }
 
 fn truncate_transcript() {
+    if let Some(parent) = std::path::Path::new(TRANSCRIPT).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let _ = std::fs::write(TRANSCRIPT, "");
 }
 
@@ -276,7 +281,7 @@ fn scenario_c_zero_range_still_logs() {
 //   their own grep.
 // ----------------------------------------------------------------------------
 fn print_transcript_summary() {
-    println!("\n=== Transcript summary (review_pacing_17_2.log) ===");
+    println!("\n=== Transcript summary ({TRANSCRIPT}) ===");
     let content = std::fs::read_to_string(TRANSCRIPT).expect("read transcript");
     let pacing_lines: Vec<&str> = content
         .lines()

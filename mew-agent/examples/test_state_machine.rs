@@ -27,7 +27,13 @@ struct TestHarness {
 
 impl TestHarness {
     fn new(session_id: &str) -> Self {
-        let transcript_path = format!("test_state_machine_{}.log", session_id);
+        // Transcripts live under tests-output/test_state_machine/ so the
+        // project root stays clean. The folder is gitignored.
+        let _ = std::fs::create_dir_all("tests-output/test_state_machine");
+        let transcript_path = format!(
+            "tests-output/test_state_machine/test_state_machine_{}.log",
+            session_id
+        );
         // Truncate any previous run so we always read a clean transcript.
         let _ = std::fs::write(&transcript_path, "");
         Self {

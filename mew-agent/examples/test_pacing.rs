@@ -47,7 +47,10 @@ struct LoopDriver {
 
 impl LoopDriver {
     fn new(name: &str) -> Self {
-        let path = format!("test_pacing_{}.log", name);
+        // Transcripts live under tests-output/test_pacing/ so the
+        // project root stays clean. The folder is gitignored.
+        let _ = std::fs::create_dir_all("tests-output/test_pacing");
+        let path = format!("tests-output/test_pacing/test_pacing_{}.log", name);
         // Truncate any previous run.
         let _ = std::fs::write(&path, "");
         Self {

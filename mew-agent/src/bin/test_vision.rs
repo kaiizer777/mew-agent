@@ -9,7 +9,13 @@ async fn main() -> anyhow::Result<()> {
     
     let config = load_config()?;
     let cwd = env::current_dir().unwrap();
-    let file_url = format!("file:///{}/test_vision.html", cwd.display().to_string().replace("\\", "/"));
+    // Read the test HTML from tests-output/test_vision/ where it now
+    // lives (project root is kept clean).
+    let html_dir = cwd.join("tests-output").join("test_vision");
+    let file_url = format!(
+        "file:///{}/test_vision.html",
+        html_dir.display().to_string().replace("\\", "/")
+    );
     
     let (browser, page, handler) = mew_cdp::launch(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),

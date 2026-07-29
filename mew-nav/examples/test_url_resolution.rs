@@ -31,7 +31,9 @@ use std::time::Instant;
 
 use mew_nav::{resolve_with_probe, ResolutionPath, DIRECT_GUESS_PROBE_TIMEOUT};
 
-const TRANSCRIPT_PATH: &str = "mew_nav_test_transcript.log";
+// Transcript lives under tests-output/test_url_resolution/ so the
+// project root stays clean. The folder is gitignored.
+const TRANSCRIPT_PATH: &str = "tests-output/test_url_resolution/mew_nav_test_transcript.log";
 
 #[derive(Debug)]
 struct Case {
@@ -50,6 +52,9 @@ struct Case {
 async fn main() -> anyhow::Result<()> {
     // Set up the transcript file the same way the live `mew-agent` does:
     // create-or-append, write a banner, then per-case NAV-RESOLVE lines.
+    if let Some(parent) = std::path::Path::new(TRANSCRIPT_PATH).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let transcript = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

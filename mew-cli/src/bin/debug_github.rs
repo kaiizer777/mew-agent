@@ -13,7 +13,12 @@ async fn main() -> anyhow::Result<()> {
         
     let config = load_config()?;
     let binary_path = config.browser.as_ref().and_then(|b| b.binary_path.clone());
-    
+
+    // All debug artifacts land in tests-output/debug_github/ so the
+    // project root stays clean. The folder is gitignored.
+    let out_dir = std::path::PathBuf::from("tests-output").join("debug_github");
+    let _ = std::fs::create_dir_all(&out_dir);
+
     let (browser, page, handle) = launch(binary_path, false).await?;
     
     println!("Navigating to https://github.com...");
@@ -28,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Taking screenshot...");
     let screenshot_data = page.pdf(chromiumoxide::cdp::browser_protocol::page::PrintToPdfParams::default()).await;
     if let Ok(data) = screenshot_data {
-        std::fs::write("github_screenshot.pdf", data).unwrap_or_default();
+        let _ = std::fs::write(out_dir.join("github_screenshot.pdf"), data);
     }
     
     println!("Executing GetFullAxTreeParams...");
@@ -74,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     
     let mut tree_str = String::new();
     tree_to_string(&tree, 0, &mut tree_str);
-    std::fs::write("tree_dashboard.txt", &tree_str)?;
+    std::fs::write(out_dir.join("tree_dashboard.txt"), &tree_str)?;
     
     println!("--- GREP RESULTS FOR SNAPSHOT 1 ---");
     for line in tree_str.lines() {
@@ -119,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
                 let (tree2, _ref_map2) = mew_perception::build_tree(res2.nodes.clone(), false).unwrap();
                 let mut tree_str2 = String::new();
                 tree_to_string(&tree2, 0, &mut tree_str2);
-                std::fs::write("tree_after_click.txt", &tree_str2)?;
+                std::fs::write(out_dir.join("tree_after_click.txt"), &tree_str2)?;
                 println!("--- GREP RESULTS FOR SNAPSHOT 2 ---");
                 for line in tree_str2.lines() {
                     let l = line.to_lowercase();

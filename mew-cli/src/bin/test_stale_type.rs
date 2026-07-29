@@ -18,7 +18,9 @@ async fn main() -> anyhow::Result<()> {
 </html>
     "#;
     
-    let html_path = std::env::current_dir()?.join("test_type.html");
+    let out_dir = std::path::PathBuf::from("tests-output").join("test_stale_type");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let html_path = out_dir.join("test_type.html");
     std::fs::write(&html_path, html)?;
     let file_url = format!("file:///{}", html_path.to_string_lossy().replace('\\', "/"));
     

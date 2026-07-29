@@ -103,7 +103,9 @@ async fn main() -> Result<()> {
     // Navigate to the local test page served by the user from cwd. Use
     // file:// for portability — no need to spin up an HTTP server.
     let cwd = std::env::current_dir()?;
-    let html_path = cwd.join("test_15_2_full.html");
+    // Read the fixture from tests-output/fixtures/ where it now lives
+    // (project root is kept clean).
+    let html_path = cwd.join("tests-output").join("fixtures").join("test_15_2_full.html");
     let url = format!("file://{}", html_path.display());
     page.goto(&url).await?.wait_for_navigation().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
