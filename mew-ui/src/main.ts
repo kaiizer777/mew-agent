@@ -17,7 +17,7 @@ const chatInput = document.querySelector<HTMLInputElement>('#chat-input')!;
 
 function appendMessage(text: string, sender: 'user' | 'agent') {
   const msgEl = document.createElement('div');
-  msgEl.className = \`message \${sender}\`;
+  msgEl.className = `message ${sender}`;
   msgEl.textContent = text;
   chatList.appendChild(msgEl);
   chatList.scrollTop = chatList.scrollHeight;
@@ -35,6 +35,6 @@ chatForm.addEventListener('submit', async (e) => {
     const response = await invoke<string>('send_message', { text });
     appendMessage(response, 'agent');
   } catch (error) {
-    appendMessage(\`Error: \${error}\`, 'agent');
+    appendMessage(`Error: ${error}`, 'agent');
   }
 });
