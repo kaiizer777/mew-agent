@@ -1,0 +1,16 @@
+# Phase 4 (Bug 3 fix): explicit watcher ignore file for the Tauri
+# dev-mode file watcher. See `tauri-cli/src/interface/rust.rs::build_ignore_matcher`
+# for the consumer — it loads `.taurignore` from the tauri dir
+# (`src-tauri/`) via `add_custom_ignore_filename(".taurignore")`, and
+# also loads the default ignore list (`tauri-cli/tauri-dev-watcher.gitignore`:
+# node_modules/, target/, gen/, Cargo.lock, .DS_Store).
+#
+# The primary fix is to write transcripts OUTSIDE `src-tauri/`
+# (see `mew-ui/src-tauri/src/lib.rs::run_browser_task` — transcripts
+# now go to `app_data_dir()/transcripts/`). This file is a second
+# layer of defense in case a future caller accidentally writes a
+# transcript under `src-tauri/transcripts/` again: the watcher
+# should ignore that path and not rebuild the app.
+
+# mew-agent on-disk transcript logs
+transcripts/

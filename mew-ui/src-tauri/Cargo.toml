@@ -25,3 +25,5 @@ tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 mew-agent = { workspace = true }
 mew-cdp = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
