@@ -1,0 +1,8 @@
+body { margin: 0; padding: 0; }
+#chat-container { display: flex; flex-direction: column; height: 100vh; padding: 1rem; box-sizing: border-box; font-family: sans-serif; }
+#chat-list { flex: 1; overflow-y: auto; margin-bottom: 1rem; display: flex; flex-direction: column; gap: 0.5rem; }
+.message { padding: 0.5rem 1rem; border-radius: 4px; max-width: 80%; }
+.message.user { align-self: flex-end; background-color: #007bff; color: white; }
+.message.agent { align-self: flex-start; background-color: #e9ecef; color: black; }
+#chat-form { display: flex; gap: 0.5rem; }
+#chat-input { flex: 1; padding: 0.5rem; }

@@ -6,6 +6,7 @@ members = [
     "mew-nav",
     "mew-agent",
     "mew-cli",
+    "mew-ui/src-tauri",
 ]
 
 [workspace.dependencies]
