@@ -5,20 +5,22 @@ import './style.css';
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <div id="split-layout">
     <div class="panel" id="chat-container">
-      <div class="header">Onyx Chat</div>
+      <div class="header">
+        <div class="title">Mew Agent</div>
+        <div class="header-controls">
+          <div id="status-indicator" class="status-indicator status-idle">Idle</div>
+          <button id="pause-btn" class="ctrl-btn" disabled>Pause</button>
+          <button id="resume-btn" class="ctrl-btn" disabled>Resume</button>
+        </div>
+      </div>
       <div id="chat-list">
         <div class="message agent">Welcome to mew-agent. Type a request to begin.</div>
       </div>
-      <form id="chat-form">
-        <input id="chat-input" type="text" placeholder="Type a message..." autocomplete="off" />
-        <button type="submit" id="send-btn">Send</button>
-      </form>
-      <div class="controls">
-        <button id="pause-btn" disabled>Pause</button>
-        <button id="resume-btn" disabled>Resume</button>
-      </div>
-      <div style="margin-top: 1rem; display: flex; justify-content: center;">
-        <div id="status-indicator" class="status-indicator status-idle">Idle</div>
+      <div class="input-area">
+        <form id="chat-form">
+          <input id="chat-input" type="text" placeholder="Type a message..." autocomplete="off" />
+          <button type="submit" id="send-btn">Send</button>
+        </form>
       </div>
     </div>
     <div class="panel" id="transcript-container">
@@ -27,8 +29,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <button id="tab-preview" class="tab">Live Preview</button>
       </div>
       <div id="transcript-list"></div>
-      <div id="preview-container" style="display: none; flex: 1; align-items: center; justify-content: center; overflow: hidden; background: #000; border-radius: 8px;">
-        <img id="live-preview-img" style="max-width: 100%; max-height: 100%; object-fit: contain;" />
+      <div id="preview-container" class="preview-container" style="display: none;">
+        <img id="live-preview-img" class="live-preview-img" />
       </div>
     </div>
   </div>
@@ -180,6 +182,18 @@ listen<string>('agent-state', (event) => {
   updateStatus(event.payload);
 });
 
+let pendingFrame: string | null = null;
+let frameRequested = false;
+
 listen<string>('agent-screencast-frame', (event) => {
-  livePreviewImg.src = "data:image/jpeg;base64," + event.payload;
+  pendingFrame = event.payload;
+  if (!frameRequested) {
+    frameRequested = true;
+    requestAnimationFrame(() => {
+      if (pendingFrame) {
+        livePreviewImg.src = "data:image/jpeg;base64," + pendingFrame;
+      }
+      frameRequested = false;
+    });
+  }
 });
