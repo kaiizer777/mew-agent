@@ -33,6 +33,7 @@ struct ActiveSession {
     #[allow(dead_code)] // Will be used in Phase 6 for pause/resume via UI buttons
     handle: SessionHandle,
     tx: tokio::sync::mpsc::Sender<UserMessage>,
+    bounds_tx: tokio::sync::mpsc::UnboundedSender<mew_cdp::WindowRect>,
 }
 
 #[derive(Default)]
@@ -44,6 +45,7 @@ struct AppState {
 async fn send_message(
     text: String, 
     history: Vec<FrontendMessage>,
+    on_event: tauri::ipc::Channel<mew_agent::agent::AgentEvent>,
     app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
@@ -89,7 +91,7 @@ async fn send_message(
             let task_clone = task.clone();
             
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = run_browser_task(task_clone, cfg_clone, state_clone, app_clone).await {
+                if let Err(e) = run_browser_task(task_clone, cfg_clone, state_clone, app_clone, on_event).await {
                     eprintln!("Browser task failed: {}", e);
                 }
             });
@@ -105,14 +107,39 @@ async fn run_browser_task(
     config: ProviderConfig,
     state: Arc<Mutex<Option<ActiveSession>>>,
     app_handle: AppHandle,
+    on_event: tauri::ipc::Channel<mew_agent::agent::AgentEvent>,
 ) -> anyhow::Result<()> {
     // Surface minimal status ping
     let _ = app_handle.emit("agent-state", "Started");
 
-    let (browser, page, handler_task, job) = mew_cdp::launch(
+    let (browser, page, handler_task, job) = mew_cdp::launch_headless(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
         config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
     ).await.map_err(|e| anyhow::anyhow!("Failed to launch Chrome: {e}"))?;
+
+    let (bounds_tx, mut bounds_rx) = tokio::sync::mpsc::unbounded_channel::<mew_cdp::WindowRect>();
+    
+    // Set screencast size based on the window or just a default size.
+    // Start screencast
+    let (screencast_tx, mut screencast_rx) = tokio::sync::mpsc::unbounded_channel::<(String, i32)>();
+    if let Err(e) = mew_cdp::start_screencast(&page, screencast_tx).await {
+        eprintln!("Failed to start screencast: {}", e);
+    }
+    
+    let app_clone_screencast = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some((frame_data, width)) = screencast_rx.recv().await {
+            // Rate limiting or dropping frames can be done here if needed.
+            let _ = app_clone_screencast.emit("agent-screencast-frame", frame_data);
+        }
+    });
+
+    tauri::async_runtime::spawn(async move {
+        while let Some(rect) = bounds_rx.recv().await {
+            // For headless, we don't necessarily need to move the window, but we might want to resize the viewport.
+            // But we can just consume these messages so the channel doesn't fill up.
+        }
+    });
 
     // Phase 4 (Bug 3 fix): resolve a transcript directory that lives
     // OUTSIDE the Tauri source tree. Tauri's dev-mode file watcher
@@ -157,7 +184,15 @@ async fn run_browser_task(
         }
     };
 
-    let mut agent = mew_agent::agent::Agent::new(config, &task_desc, transcript_dir);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let _ = on_event.send(event);
+        }
+    });
+
+    let mut agent = mew_agent::agent::Agent::new(config, &task_desc, transcript_dir).with_event_sender(tx);
     let chat_tx = agent.take_message_sender();
     let session_handle = agent.session_handle();
 
@@ -166,6 +201,7 @@ async fn run_browser_task(
         *lock = Some(ActiveSession {
             handle: session_handle,
             tx: chat_tx,
+            bounds_tx,
         });
     }
 
@@ -188,12 +224,62 @@ async fn run_browser_task(
     Ok(())
 }
 
+#[tauri::command]
+async fn pause_session(state: State<'_, AppState>) -> Result<String, String> {
+    let lock = state.active_session.lock().await;
+    if let Some(session) = lock.as_ref() {
+        if let Err(e) = session.handle.pause(None).await {
+            return Err(format!("Failed to pause: {}", e));
+        }
+        return Ok("Paused".to_string());
+    }
+    Err("No active session".to_string())
+}
+
+#[tauri::command]
+async fn resume_session(state: State<'_, AppState>) -> Result<String, String> {
+    let lock = state.active_session.lock().await;
+    if let Some(session) = lock.as_ref() {
+        if let Err(e) = session.handle.resume(None).await {
+            return Err(format!("Failed to resume: {}", e));
+        }
+        return Ok("Resumed".to_string());
+    }
+    Err("No active session".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
     .manage(AppState::default())
-    .invoke_handler(tauri::generate_handler![send_message, get_config_summary])
+    .invoke_handler(tauri::generate_handler![send_message, get_config_summary, pause_session, resume_session])
     .setup(|app| {
+        let app_handle = app.handle().clone();
+        if let Some(window) = app.get_webview_window("main") {
+            window.on_window_event(move |event| {
+                if matches!(event, tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_)) {
+                    let app_handle_clone = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app_handle_clone.state::<AppState>();
+                        let session_lock = state.active_session.lock().await;
+                        if let Some(session) = session_lock.as_ref() {
+                            if let Some(w) = app_handle_clone.get_webview_window("main") {
+                                if let (Ok(pos), Ok(size)) = (w.outer_position(), w.outer_size()) {
+                                    let rect = mew_cdp::WindowRect {
+                                        left: pos.x + size.width as i32,
+                                        top: pos.y,
+                                        width: 1280,
+                                        height: size.height as i32,
+                                    };
+                                    let _ = session.bounds_tx.send(rect);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
       if cfg!(debug_assertions) {
         app.handle().plugin(
           tauri_plugin_log::Builder::default()
