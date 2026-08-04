@@ -1,0 +1,29 @@
+# Backup created before 15% chat-shrink / preview-grow experiment.
+# To revert: copy this file over style.css (or apply the block manually).
+
+#app-shell {
+  display: grid;
+  /* Two-column split. Left is the chat, with a min and
+     `1fr` so it absorbs any leftover viewport. Right is
+     the live preview, fixed at 760px so the frame sits
+     at a comfortable, near-source aspect size. The inner
+     `.live-preview-img` is sized to 90% of this column
+     (≈ 684px visible), so the live preview's on-screen
+     size stays effectively unchanged from the prior
+     full-bleed layout, while the empty right-side
+     gutter that used to consume the rest of the
+     viewport is gone — that space now flows into the
+     chat column. */
+  grid-template-columns: minmax(380px, 1fr) 760px;
+  height: 100vh;
+  width: 100vw;
+  background: var(--surface-base);
+  overflow: hidden;
+}
+
+@media (max-width: 720px) {
+  #app-shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) 320px;
+  }
+}

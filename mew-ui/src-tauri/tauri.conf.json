@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "mew-ui",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.mew.ui",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "mew-ui",
-        "width": 600,
-        "height": 1000,
-        "x": 100,
-        "y": 100,
+        "width": 1280,
+        "height": 860,
+        "x": 80,
+        "y": 40,
         "resizable": true,
         "fullscreen": false
       }
@@ -27,7 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["msi", "nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

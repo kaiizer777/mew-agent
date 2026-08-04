@@ -27,3 +27,11 @@ mew-agent = { workspace = true }
 mew-cdp = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# Phase 1: structured tracing spans around the UI -> agent handoff
+# boundary. The actual log writer lives in `mew-agent::tracing_layer`;
+# this dep is just the `tracing` macros and the `Subscriber` trait.
+tracing = { workspace = true }
+# Phase 10.3: env-filter + fmt layer so the tracing events the
+# agent emits are quiet in release (`warn`-and-up) and detailed
+# in debug (`info`-and-up). Override at runtime with RUST_LOG.
+tracing-subscriber = { workspace = true }
