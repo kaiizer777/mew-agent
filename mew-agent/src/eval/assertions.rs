@@ -29,12 +29,77 @@
 
 use crate::handoff::{BrowserResult, BrowserStatus, Handoff};
 use crate::planner::plan;
+use crate::todo::{Evidence, Todo, TodoStatus};
 
 /// What went wrong (or didn't) for an individual
 /// assertion. The `Ok(())` case means the assertion held;
 /// the `Err(String)` case carries a one-line explanation
 /// for the report.
 pub type AssertionResult = Result<(), String>;
+
+/// Assert a `Todo` is in `Done` status and has matching worker and planner evidence signatures.
+/// Checks `status == Done ∧ evidence.is_some() ∧ evidence.worker == evidence.planner`.
+pub fn assert_todo_done(todo: &Todo, evidence: Option<&Evidence>) -> AssertionResult {
+    if todo.status != TodoStatus::Done {
+        return Err(format!(
+            "todo {} status is {:?}, expected Done",
+            todo.id, todo.status
+        ));
+    }
+    let ev = match evidence.or(todo.evidence.as_ref()) {
+        Some(e) => e,
+        None => {
+            return Err(format!(
+                "todo {} status is Done but evidence is None",
+                todo.id
+            ));
+        }
+    };
+    if ev.worker_signature.is_empty() || ev.planner_signature.is_empty() {
+        return Err(format!(
+            "todo {} has empty signature: worker={:?}, planner={:?}",
+            todo.id, ev.worker_signature, ev.planner_signature
+        ));
+    }
+    if ev.worker_signature != ev.planner_signature {
+        return Err(format!(
+            "todo {} evidence mismatch: worker_signature={:?}, planner_signature={:?}",
+            todo.id, ev.worker_signature, ev.planner_signature
+        ));
+    }
+    Ok(())
+}
+
+/// Assert a `Todo` was rejected / non-Done with attempts >= 1 and optional rejection reason.
+/// Checks `status != Done ∧ attempts >= 1 ∧ rejected_reason.is_some()`.
+pub fn assert_todo_rejected(todo: &Todo, reason: Option<&str>) -> AssertionResult {
+    if todo.status == TodoStatus::Done {
+        return Err(format!(
+            "todo {} status is Done, expected non-Done (rejected)",
+            todo.id
+        ));
+    }
+    if todo.attempts < 1 {
+        return Err(format!(
+            "todo {} attempts is {}, expected >= 1",
+            todo.id, todo.attempts
+        ));
+    }
+    if let Some(expected_reason) = reason {
+        let actual_reason = match &todo.status {
+            TodoStatus::Failed { reason: r } => r.clone(),
+            other => format!("{:?}", other),
+        };
+        if !actual_reason.contains(expected_reason) {
+            return Err(format!(
+                "todo {} rejected reason {:?} does not contain expected fragment {:?}",
+                todo.id, actual_reason, expected_reason
+            ));
+        }
+    }
+    Ok(())
+}
+
 
 /// Assert the orchestrator dispatched the right task.
 /// `expected` is the user message the test passed to

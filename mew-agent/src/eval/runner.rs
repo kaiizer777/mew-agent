@@ -43,8 +43,11 @@ use crate::handoff::BrowserStatus;
 use crate::ProviderConfig;
 
 use super::assertions::{assert_handoff_contract, AssertionResult};
-use super::harness::{default_scenarios, FailureMode, Scenario, ScenarioOutcome};
+use super::harness::{Scenario, ScenarioOutcome};
 use super::report::{EvalReport, RunMetrics};
+
+
+
 
 /// Run a single scenario. Returns the outcome; the
 /// caller decides whether a failed outcome is a test
@@ -160,6 +163,37 @@ pub fn run_scenarios(
     report
 }
 
+/// Run all Phase 17 planner-worker contract scenarios and return an EvalReport.
+pub fn run_planner_scenarios() -> EvalReport {
+    let scenarios = super::scenarios::all_planner_shortcut_scenarios();
+    let mut report = EvalReport::new(unix_secs());
+    for s in &scenarios {
+        let started = Instant::now();
+        let res = s.run();
+        let elapsed = started.elapsed();
+        let passed = res.is_ok();
+        let failure_reason = match res {
+            Ok(_) => String::new(),
+            Err(e) => e,
+        };
+        let m = RunMetrics {
+            scenario_id: s.id.to_string(),
+            passed,
+            status: if passed { BrowserStatus::Done } else { BrowserStatus::Failed },
+            subtask_count: 1,
+            step_count: 1,
+            elapsed,
+            failure_modes_hit: Vec::new(),
+            failure_reason,
+            chat_reply: s.description.to_string(),
+        };
+
+        report.push(m);
+    }
+    report
+}
+
+
 /// Build a default `ChatAgent` for the runner. Uses a
 /// minimal `ProviderConfig` (the synthesizer is
 /// deterministic, so no API call is made). Useful for
@@ -219,6 +253,8 @@ pub fn report_from_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::harness::FailureMode;
+
 
     #[test]
     fn runner_passes_all_default_scenarios() {
@@ -349,4 +385,18 @@ mod tests {
         let s = find_scenario("nonexistent");
         assert!(s.is_none());
     }
+
+    #[test]
+    fn runner_passes_all_planner_shortcut_scenarios() {
+        let report = run_planner_scenarios();
+        assert_eq!(report.rows.len(), 3, "expected 3 planner shortcut scenarios");
+        for row in &report.rows {
+            assert!(
+                row.passed,
+                "planner scenario {} failed: failure_reason={:?}",
+                row.scenario_id, row.failure_reason
+            );
+        }
+    }
 }
+

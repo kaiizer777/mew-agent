@@ -167,9 +167,12 @@ The `browser_task_result_delivered` event is the positive tripwire that replaced
 
 #### 2.5.9 Evaluation harness
 
-`mew_agent::eval` is the Phase 9 module — a pure-Rust mock-page scenario runner. No live Chrome, no LLM calls, no network. Scenarios are typed values that carry the user task, the page state the agent would see, the expected terminal state, and which of the six Phase 6 failure modes the scenario is *known* to trip. The runner calls `ChatAgent::synthesize_reply` and asserts the handoff contract: right task dispatched, result reflected in chat reply, failure paths still produce a user-facing message. Reusable assertions live in `eval::assertions`.
+`mew_agent::eval` is the Phase 9 & Phase 17 module — a pure-Rust mock-page scenario runner. No live Chrome, no LLM calls, no network. Scenarios are typed values that carry the user task, the page state the agent would see, the expected terminal state, and which of the six Phase 6 failure modes the scenario is *known* to trip. The runner calls `ChatAgent::synthesize_reply` and asserts the handoff contract: right task dispatched, result reflected in chat reply, failure paths still produce a user-facing message. Reusable assertions live in `eval::assertions`.
+
+Phase 17 extends the harness with planner-worker contract evaluation (`eval/scenarios/planner_worker_shortcut.rs`), covering three MUST-HAVE scenarios: (1) Happy path (worker signature matches planner, transitions to Done with evidence and attempts == 1), (2) Worker shortcut (fake worker signature rejected as StaleEvidence, remains Pending, retries up to attempt cap and transitions to Failed), and (3) Stale evidence (worker reuses signature from past iteration, rejected as StaleEvidence, todo remains Pending). Dedicated helper binary `mew-cli/src/bin/phase17_planner_eval.rs` provides standalone execution.
 
 Wired into CI as `cargo test --features eval -p mew-agent`. Pass-rate over time is logged in `docs/eval-history.md`.
+
 
 #### 2.5.10 CAPTCHA / challenge handling
 

@@ -728,25 +728,26 @@ are the regression net for the "no shortcut" claim.
    todo. Assert: rejected as `StaleEvidence`, todo `Pending`.
 
 **Checklist:**
-- [ ] `eval/scenarios/planner_worker_shortcut.rs` with the three
+- [x] `eval/scenarios/planner_worker_shortcut.rs` with the three
       scenarios above
-- [ ] `eval/assertions.rs::assert_todo_done` checks
+- [x] `eval/assertions.rs::assert_todo_done` checks
       `status == Done ∧ evidence.is_some() ∧ evidence.worker ==
       evidence.planner`
-- [ ] `eval/assertions.rs::assert_todo_rejected` checks
+- [x] `eval/assertions.rs::assert_todo_rejected` checks
       `status != Done ∧ attempts > 1 ∧ rejected_reason.is_some()`
-- [ ] `eval/harness.rs` runs the new scenarios and reports
+- [x] `eval/harness.rs` runs the new scenarios and reports
       per-scenario pass/fail
-- [ ] `docs/eval-history.md` has a Phase 17 row: `phase 17: 3/3
+- [x] `docs/eval-history.md` has a Phase 17 row: `phase 17: 3/3
       passing` (or a regression table if anything's red)
-- [ ] CI: `cargo test --features eval -p mew-agent` is the same
+- [x] CI: `cargo test --features eval -p mew-agent` is the same
       single command that catches Phase 9 regressions *and* Phase
       17 regressions
-- [ ] Add `mew-cli/src/bin/phase17_planner_eval.rs` example so a
+- [x] Add `mew-cli/src/bin/phase17_planner_eval.rs` example so a
       developer can run just the planner scenarios without the
       full eval gate
-- [ ] Document the eval scenarios in `proj.md` §2.5.9 ("Evaluation
+- [x] Document the eval scenarios in `proj.md` §2.5.9 ("Evaluation
       harness") — add a Phase 17 paragraph
+
 
 **Acceptance:**
 - `cargo test --features eval -p mew-agent` includes the 3 new
@@ -931,5 +932,5 @@ hatch so the planner is safe to leave on by default.
 | 14 | Tauri command surface for the planner | shipped |
 | 15 | Per-todo UI checklist surface | shipped |
 | 16 | Planner outer loop, opt-in via config | shipped |
-| **17** | **Evaluation harness for the planner-worker contract** | **not started** |
+| **17** | **Evaluation harness for the planner-worker contract** | **shipped** |
 | **18** | **Production hardening for the planner** | **not started** |

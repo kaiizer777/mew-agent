@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 mew-cdp = { workspace = true }
 mew-perception = { workspace = true }
-mew-agent = { workspace = true }
+mew-agent = { workspace = true, features = ["eval"] }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }
