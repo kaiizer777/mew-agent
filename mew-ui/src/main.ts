@@ -18,13 +18,30 @@ import './style.css';
 // adding a `listen()` call that funnels into `pushMessage`.
 // ===========================================================================
 
+type TodoStatus = 'pending' | 'done' | 'skipped' | 'failed' | 'exhausted';
+
+interface TodoRow {
+  id: string; // todo_id
+  intent: string;
+  status: TodoStatus;
+  attempts: number;
+  evidence?: any;
+  rejected_reason?: string;
+  is_running?: boolean;
+}
+
+const todoStore = new Map<string, TodoRow>(); // key: `${task_id}::${todo_id}`
+const taskTodos = new Map<string, string[]>(); // key: task_id, value: array of todo_ids
+
 type MessageKind =
   | 'user'
   | 'chat_reply'
   | 'task_started'
   | 'task_progress'
   | 'task_completed'
-  | 'task_failed';
+  | 'task_failed'
+  | 'todo_list'
+  | 'todo_rejected';
 
 interface ChatMessage {
   /** Stable id, used as the DOM key and as the parent linkage for
@@ -326,7 +343,12 @@ function kindClass(kind: MessageKind): string {
       return 'task_completed';
     case 'task_failed':
       return 'task_failed';
+    case 'todo_list':
+      return 'todo_list';
+    case 'todo_rejected':
+      return 'todo_rejected';
   }
+  return '';
 }
 
 function appendToTaskDetails(taskId: string, row: { label: string; value: string }): void {
@@ -366,17 +388,33 @@ function updateTaskMeta(taskId: string): void {
   if (!taskEl) return;
   const meta = taskEl.querySelector<HTMLDivElement>('.message-meta');
   if (!meta) return;
+
+  const todos = taskTodos.get(taskId) || [];
+  const N = todos.length;
+  let T = 0;
+  for (const tid of todos) {
+    const status = todoStore.get(`${taskId}::${tid}`)?.status;
+    if (status && ['done', 'skipped', 'failed', 'exhausted'].includes(status)) {
+      T++;
+    }
+  }
+
   if (task.kind === 'task_started') {
-    // Prefer the live progress total (more accurate — counts
-    // the templated progress lines, not the agent's iteration
-    // counter) when present.
-    const total = task.liveLineTotal ?? activeTaskSteps;
-    meta.textContent = total > 0
-      ? `Agent is working · ${total} step${total === 1 ? '' : 's'} so far.`
-      : 'Agent is working on this.';
+    if (N > 0) {
+      meta.textContent = `Working · ${T} of ${N} todos`;
+    } else {
+      const total = task.liveLineTotal ?? activeTaskSteps;
+      meta.textContent = total > 0
+        ? `Agent is working · ${total} step${total === 1 ? '' : 's'} so far.`
+        : 'Agent is working on this.';
+    }
   } else if (task.kind === 'task_completed') {
-    const total = task.liveLineTotal ?? activeTaskSteps;
-    meta.textContent = `Completed in ${total} step${total === 1 ? '' : 's'}.`;
+    if (N > 0) {
+      meta.textContent = `Completed · ${T} of ${N} todos`;
+    } else {
+      const total = task.liveLineTotal ?? activeTaskSteps;
+      meta.textContent = `Completed in ${total} step${total === 1 ? '' : 's'}.`;
+    }
   }
 }
 
@@ -442,13 +480,34 @@ function updateStatus(state: string): void {
 
 function startWorkingPill(): void {
   activeTaskSteps = 0;
+  if (activeTaskId) {
+    const todos = taskTodos.get(activeTaskId) || [];
+    const N = todos.length;
+    if (N > 0) {
+      updateStatus(`Working · 0 of ${N} todos`);
+      return;
+    }
+  }
   updateStatus('Working · 0 steps');
 }
 
 function bumpWorkingPill(): void {
   activeTaskSteps += 1;
   if (activeTaskId) {
-    updateStatus(`Working · ${activeTaskSteps} step${activeTaskSteps === 1 ? '' : 's'}`);
+    const todos = taskTodos.get(activeTaskId) || [];
+    const N = todos.length;
+    if (N > 0) {
+      let T = 0;
+      for (const tid of todos) {
+        const status = todoStore.get(`${activeTaskId}::${tid}`)?.status;
+        if (status && ['done', 'skipped', 'failed', 'exhausted'].includes(status)) {
+          T++;
+        }
+      }
+      updateStatus(`Working · ${T} of ${N} todos`);
+    } else {
+      updateStatus(`Working · ${activeTaskSteps} step${activeTaskSteps === 1 ? '' : 's'}`);
+    }
     updateTaskMeta(activeTaskId);
   }
 }
@@ -464,6 +523,169 @@ function finishWorkingPill(kind: 'done' | 'failed'): void {
     activeTaskId = null;
     activeTaskSteps = 0;
   }, 1800);
+}
+
+function updateTodoRow(taskId: string, eventTodo: any, rejectedReason?: string) {
+  const key = `${taskId}::${eventTodo.id}`;
+  let row = todoStore.get(key);
+  if (!row) {
+    row = {
+      id: eventTodo.id,
+      intent: eventTodo.intent,
+      status: 'pending',
+      attempts: 0,
+    };
+    todoStore.set(key, row);
+    
+    let list = taskTodos.get(taskId);
+    if (!list) {
+      list = [];
+      taskTodos.set(taskId, list);
+    }
+    if (!list.includes(eventTodo.id)) {
+      list.push(eventTodo.id);
+    }
+  }
+  
+  row.status = eventTodo.status ?? row.status;
+  row.attempts = eventTodo.attempts ?? row.attempts;
+  row.evidence = eventTodo.evidence ?? row.evidence;
+  
+  if (rejectedReason) {
+    row.rejected_reason = rejectedReason;
+  }
+  
+  // Auto-advance Running flag
+  const todos = (taskTodos.get(taskId) || []).map(id => todoStore.get(`${taskId}::${id}`)!);
+  let foundRunning = false;
+  for (const t of todos) {
+    const isTerminal = ['done', 'skipped', 'failed', 'exhausted'].includes(t.status);
+    if (!isTerminal && !foundRunning) {
+      t.is_running = true;
+      foundRunning = true;
+    } else {
+      t.is_running = false;
+    }
+  }
+
+  // If status became Exhausted or Failed, auto-open details
+  if (row.status === 'failed' || row.status === 'exhausted') {
+    const taskEl = chatList.querySelector<HTMLDivElement>(`[data-id="${taskId}"]`);
+    if (taskEl) {
+      const details = taskEl.querySelector<HTMLDetailsElement>('.message-details');
+      if (details) {
+        details.open = true;
+      }
+    }
+  }
+
+  const el = document.getElementById(`todo-${key}`);
+  if (el) {
+    el.setAttribute('data-just-changed', 'true');
+    setTimeout(() => el.removeAttribute('data-just-changed'), 240);
+  }
+
+  renderTodoListForTask(taskId);
+  updateTaskMeta(taskId);
+}
+
+function renderTodoListForTask(taskId: string) {
+  const taskEl = chatList.querySelector<HTMLDivElement>(`[data-id="${taskId}"]`);
+  if (!taskEl) return;
+  
+  let listWrap = taskEl.querySelector<HTMLDivElement>('.todo-list-wrap');
+  if (!listWrap) {
+    listWrap = document.createElement('div');
+    listWrap.className = 'todo-list-wrap';
+    // Insert after message body, before details and live progress
+    const body = taskEl.querySelector('.message-body');
+    if (body && body.nextSibling) {
+      taskEl.insertBefore(listWrap, body.nextSibling);
+    } else {
+      taskEl.appendChild(listWrap);
+    }
+    
+    // Keyboard navigation
+    listWrap.addEventListener('keydown', (e) => {
+      const rows = Array.from(listWrap!.querySelectorAll('.todo-row')) as HTMLElement[];
+      const idx = rows.indexOf(document.activeElement as HTMLElement);
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (idx < rows.length - 1) rows[idx + 1].focus();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (idx > 0) rows[idx - 1].focus();
+      }
+    });
+  }
+  
+  listWrap.innerHTML = '';
+  const todos = taskTodos.get(taskId) || [];
+  for (const tid of todos) {
+    const row = todoStore.get(`${taskId}::${tid}`);
+    if (row) {
+      listWrap.appendChild(renderTodoRow(taskId, row));
+    }
+  }
+}
+
+function renderTodoRow(taskId: string, row: TodoRow): HTMLElement {
+  const el = document.createElement('div');
+  el.className = 'todo-row';
+  el.id = `todo-${taskId}::${row.id}`;
+  el.tabIndex = 0; // Focusable
+  el.dataset.status = row.status;
+  
+  if (row.is_running) {
+    el.dataset.running = 'true';
+  }
+
+  const statusCol = document.createElement('div');
+  statusCol.className = 'todo-row-status';
+  let icon = '○';
+  if (row.is_running) icon = '◐';
+  if (row.status === 'done') icon = '●';
+  if (['skipped', 'failed', 'exhausted'].includes(row.status)) icon = '□';
+  statusCol.textContent = icon;
+
+  const intentCol = document.createElement('div');
+  intentCol.className = 'todo-row-intent';
+  
+  const intentText = document.createElement('div');
+  intentText.className = 'todo-row-intent-text';
+  intentText.textContent = row.intent;
+  intentCol.appendChild(intentText);
+
+  if (row.status === 'done' && row.evidence) {
+    const ev = document.createElement('div');
+    ev.className = 'todo-row-evidence';
+    ev.textContent = 'Evidence matched';
+    intentCol.appendChild(ev);
+  }
+
+  if (['failed', 'exhausted'].includes(row.status) && row.rejected_reason) {
+    const reason = document.createElement('div');
+    reason.className = 'todo-row-reason';
+    reason.textContent = row.rejected_reason;
+    intentCol.appendChild(reason);
+  }
+
+  el.appendChild(statusCol);
+  el.appendChild(intentCol);
+
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const taskEl = chatList.querySelector<HTMLDivElement>(`[data-id="${taskId}"]`);
+      if (taskEl) {
+        const details = taskEl.querySelector<HTMLDetailsElement>('.message-details');
+        if (details) {
+          details.open = !details.open;
+        }
+      }
+    }
+  });
+
+  return el;
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +891,17 @@ chatForm.addEventListener('submit', async (e) => {
 // ---------------------------------------------------------------------------
 // Backend event listeners
 // ---------------------------------------------------------------------------
+
+listen<{ task_id: string; todo: any }>('todo-state-changed', (event) => {
+  updateTodoRow(event.payload.task_id, event.payload.todo);
+  if (activeTaskId === event.payload.task_id) {
+    bumpWorkingPill();
+  }
+});
+
+listen<{ task_id: string; todo_id: string; reason: string }>('todo-rejected', (event) => {
+  updateTodoRow(event.payload.task_id, { id: event.payload.todo_id }, event.payload.reason);
+});
 
 listen<string>('agent-state', (event) => {
   updateStatus(event.payload);

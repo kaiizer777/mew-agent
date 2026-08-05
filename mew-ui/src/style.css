@@ -755,3 +755,82 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   padding-left: 0.85rem;
   margin-top: 0.1rem;
 }
+
+/* Todo List UI */
+.todo-list-wrap {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  background: var(--surface-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.35rem;
+}
+
+.todo-row {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  font-size: 0.82rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-xs);
+  transition: background-color 0.24s ease, color 0.15s ease;
+  outline: none;
+}
+
+.todo-row:focus {
+  background: var(--surface-raised);
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
+
+.todo-row[data-just-changed="true"] {
+  background: var(--surface-raised);
+}
+
+.todo-row-status {
+  width: 28px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+}
+
+.todo-row-intent {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.todo-row[data-status="pending"] {
+  color: var(--text-muted);
+}
+.todo-row[data-running="true"] {
+  color: var(--accent);
+}
+.todo-row[data-status="done"] {
+  color: var(--state-done);
+}
+.todo-row[data-status="failed"], .todo-row[data-status="exhausted"] {
+  color: var(--state-failed);
+}
+.todo-row[data-status="skipped"] {
+  color: var(--text-muted);
+}
+
+.todo-row-evidence {
+  font-size: 0.7rem;
+  color: var(--state-done);
+  opacity: 0.8;
+  margin-top: -0.1rem;
+}
+
+.todo-row-reason {
+  font-size: 0.7rem;
+  color: var(--state-failed);
+  opacity: 0.8;
+  margin-top: -0.1rem;
+}
+
