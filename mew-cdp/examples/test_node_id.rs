@@ -1,13 +1,13 @@
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::dom::Node;
+// use chromiumoxide::cdp::browser_protocol::dom::Node;
 use futures::StreamExt;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE) // enable trace to see CDP messages
-        .init();
+    // tracing_subscriber::fmt()
+    //     .with_max_level(tracing::Level::TRACE)
+    //     .init();
 
     // Use stock chrome by not specifying binary_path
     let config = BrowserConfig::builder()
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Find the search input
         if let Ok(node) = page.find_element("input[name='search']").await {
             // Get the backend node id
-            if let Ok(dom_node) = node.get_description().await {
+            if let Ok(dom_node) = node.description().await {
                 println!("Iteration {}: Search box BackendNodeId: {:?}", i, dom_node.backend_node_id);
             }
         }

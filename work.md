@@ -1,438 +1,935 @@
-# mew v3 — desktop UI, live chat routing, docked browser
+# mew — work plan (phases 11–18)
 
-**Context:** `mew` v1 (core agent: CDP driving, accessibility-tree perception, ref-based
-actions, LLM ReAct loop, stealth, error recovery) and v2 (state machine, live mid-task
-steering channel, URL resolution, task-completeness gating, visible cursor, pacing guard)
-are both done. `mew-agent`, `mew-cdp`, `mew-perception` are working, tested Rust crates.
-What's missing is a UI: a chat panel next to a real, visible, docked Chromium window,
-where plain chat gets answered directly and browser-intent messages get routed into the
-existing agent loop — including messages sent *while* the agent is mid-task, using the
-live-chat channel v2 already built and verified.
+The "main agent plans, browser agent executes" outer loop, on top of the
+shipped two-agent split. The shipped `ChatAgent` / `BrowserAgent` modules
+become the inner loop. A new outer **Planner** in the Tauri shell decomposes
+the user message into typed `Todo`s, dispatches them to a long-lived,
+supervised **Browser Agent** worker, and only accepts "done" on per-todo
+evidence — not on the LLM's self-report.
 
-This file does not re-litigate anything v1/v2 already solved. It only covers what's new:
-the desktop shell, the routing layer, and the window-docking mechanism.
+Goal: the worker cannot shortcut by emitting a single `done` and walking
+away. Every `Todo` must (a) execute its declared actions, (b) capture a
+fresh snapshot, and (c) have its `evidence_signature` cross-checked
+against the snapshot the planner captured independently.
 
-**Format is unchanged from v1/v2:** N.1 = implementation session, N.2 = review/testing
-session, done separately, by you, with your own eyes. Don't move to N+1.1 until N.2 is
-genuinely checked off. Each step is scoped to one sitting.
-
-**Phases in this file, 1 through 6:**
-
-| Phase | Covers |
-|---|---|
-| 1 | Tauri shell + workspace wiring (window on screen, IPC round-trip, structured-output check) |
-| 2 | Intent routing (chat vs. browser-task classification) |
-| 3 | Agent session lifecycle from the UI (launch, mid-task steering, clean session-end) |
-| 4 | Live transcript streaming via Channels |
-| 5 | Chromium window docking via CDP |
-| 6 | UI polish & real-use pass |
+Eight phases, each 1–2 focused PRs. The new flow is **additive** —
+the existing `ChatAgent → BrowserAgent` round trip in `orchestrator.rs`
+keeps working under a `planner_enabled` config flag.
 
 ---
 
-## Guide for the coding agent working this file
+## Conventions
 
-Hand this whole section to your coding agent before it touches Step 1.1.
-
-1. **One step per session, in order.** Implement exactly the checklist items in the
-   current N.1 — nothing from a later step, nothing "while I'm in here." If you notice
-   something later steps will need, note it in a comment, don't build it early.
-2. **Never assume a library/API behaves a certain way — check the actual crate docs,
-   the actual CDP response, or the actual current Tauri docs before writing code
-   against it.** This file already flags the specific unverified assumptions (Step
-   1.2's structured-output check, Step 4's Channel API shape); treat any other gap you
-   hit the same way — verify, don't guess.
-3. **Don't mark a checklist item `[x]` on your own judgment.** Implementation items
-   get checked off by you after building them; review items only get checked off by
-   the human actually running the thing and looking at real output. If you're not sure
-   something is genuinely done, say so plainly instead of checking the box.
-4. **No silent fallbacks.** If a planned approach doesn't work (a tool call fails
-   validation, a window call errors, an IPC call doesn't fire), stop and report it —
-   don't quietly swap in a workaround (e.g. reparenting, polling instead of events,
-   free-text intent parsing) that this file already ruled out for a reason.
-5. **Reuse existing v1/v2 code paths instead of rebuilding them.** The state machine,
-   the live-chat channel, the transcript logging, the URL resolution — all already
-   exist and are tested. This file's job is wiring a UI to them, not reimplementing
-   them. If you find yourself writing agent-loop logic from scratch, stop and check
-   whether it already exists in `mew-agent`.
-6. **Keep the diff small and legible per session.** A session that touches every crate
-   in the workspace for a one-line feature is a sign of scope creep — the whole point
-   of the N.1/N.2 split is that a human can actually review what changed.
-7. **When a step's own file text names a real gotcha (the CDP bounds/state exclusivity
-   note, the `emit()` ordering warning), treat it as a hard constraint, not a
-   suggestion** — it was put there because it broke something in research, not as
-   color commentary.
+- **Files to touch** is non-exhaustive; it lists the ones expected to
+  change, not every `.rs`/`.ts`.
+- Every phase ends with **Acceptance** — a concrete thing you can
+  verify in CI or in a 5-minute manual test.
+- Every phase has a **Reuses** note pointing at the existing code
+  the new code should build on, not duplicate.
+- Phases ship in order. Skipping a phase breaks the next one.
 
 ---
 
-## Decisions this file assumes (researched, not guessed — read once before starting)
+## Phase 11 — Todo schema and decomposition contract
 
-- **Stack: Tauri 2, not Electron.** `mew-agent`/`mew-cdp`/`mew-perception` are existing
-  Rust crates — Tauri's backend *is* Rust, so the UI layer calls them directly as a
-  library dependency. Electron would force a sidecar/IPC bridge to a separate Rust
-  process for no benefit.
-- **Chromium is a sibling OS window, docked via CDP `Browser.setWindowBounds` —
-  never reparented, never screencast.** Two alternatives were investigated and ruled
-  out:
-  - *Reparenting the Chrome HWND into the Tauri window* (`SetParent`/`SetWindowLongPtr`)
-    broke upstream in Chrome 139 (2025) due to `WS_EX_NOREDIRECTIONBITMAP`/
-    DirectComposition changes. Even the documented workaround (`WS_EX_LAYERED` +
-    `SetLayeredWindowAttributes`) is described by Chromium's own team as fragile,
-    undocumented "tribal knowledge." Not a foundation to build on.
-  - *CDP screencast streamed into an `<img>`/canvas* (the Browserbase / AWS AgentCore /
-    Mastra Studio pattern) exists because those products drive *headless/cloud*
-    browsers with no real window to show. `mew` already has a real, visible, locally
-    interactive Chromium — screencasting it away would add latency and throw away
-    native scrolling/selection/zoom for no reason.
-  - What's left, and what this file uses: `chromiumoxide` exposes
-    `Browser.setWindowBounds` / `Browser.getWindowForTarget` as typed CDP bindings
-    (`chromiumoxide::cdp::browser_protocol::browser::{SetWindowBoundsParams,
-    GetWindowBoundsParams}`). This is real CDP, cross-platform (CDP delegates the
-    actual OS window call internally), and needs zero `windows`-crate / raw Win32
-    code, so it never touches the broken reparenting path at all.
-- **Intent routing: one LLM call per message, structured output via a
-  `classify_intent` tool call — not free-text parsing, not a second model.**
-  Structured-output/enum classification is the documented 2026 best practice for
-  small (2-label) routing decisions: cheaper and more consistent than a fine-tuned
-  classifier for this label count, and avoids a second model/provider dependency.
-  **However:** whether OpenCode Zen's raw `/chat/completions` proxy supports
-  `response_format: {type: "json_schema"}` is *not confirmed* — that capability is
-  documented for the OpenCode SDK/TUI product, not verified for the bare REST
-  endpoint `mew-agent` calls with `reqwest`. Step 6 of v1 already proved tool-calling
-  works against this exact provider/model. So: route intent through a
-  `classify_intent(intent, reply)` **tool call** (schema-guaranteed via the mechanism
-  already proven to work), not through `response_format`. Verify this assumption
-  in 18.2 before building anything downstream on it — same discipline v2 used for
-  the caching-support question in its own Step 7.
-- **Rust → frontend streaming: Channels for the transcript/status feed, plain
-  `emit()` events only for one-shot notifications.** Tauri's own docs flag that
-  `app.emit()` under rapid, high-frequency emission can deliver out of order if
-  listeners are async — explicitly recommending the Channel API for ordered,
-  high-throughput data. The live agent transcript (state transitions, tool calls,
-  streamed status) is exactly that case; a single "task finished" ping is not.
-  Mixing these up is the most likely subtle bug in this phase — keep them separate
-  from the start.
+**Goal:** Define the typed `Todo` schema, the planner's job-to-todos
+decomposition contract, and the per-todo evidence model. Pure data +
+contract. No Tauri, no LLM, no network.
 
----
+**Reuses:**
+- `mew_agent::planner::Plan` and the deterministic decomposition pass.
+- `mew_agent::completeness::SubTask` / `SubTaskStatus` — Todo is a
+  superset; existing subtask states (`Pending | Done | Skipped | Failed |
+  Exhausted`) become todo states unchanged.
 
-## Step 1.1 — Tauri shell + workspace wiring: implementation
+**Files to touch:**
+- `mew-agent/src/todo.rs` (new) — `Todo`, `TodoId`, `TodoStatus`,
+  `Evidence`, `AcceptanceCriterion`, `TodoBudget`.
+- `mew-agent/src/lib.rs` — re-export.
+- `mew-agent/src/planner.rs` — `decompose_to_todos(&Handoff) -> Vec<Todo>`.
+- `mew-agent/src/completeness.rs` — alias `TodoStatus = SubTaskStatus`
+  (or a thin newtype, depending on taste). Do not extend the enum;
+  todo-level outcomes (Done, Skipped, Failed, Exhausted) are
+  identical to subtask outcomes.
 
-Get a Tauri window on screen that can call into the existing `mew-agent` crate, before
-any routing or docking logic exists.
+**Schema sketch (for shared understanding, not literal code):**
+```rust
+pub struct Todo {
+    // ID format MUST match `mew_agent::planner::slugify` output:
+    // e.g. "navigate-instagram-1", "send-hi-2". The existing
+    // `mark_subtask_done` tool looks ids up by exact-match string,
+    // so reusing the same slug format lets the worker re-use the
+    // tool for per-todo evidence calls without an id-translation
+    // shim. Newtype wrapper so the compiler catches accidental
+    // mixing of todo ids with subtask ids.
+    pub id: TodoId,                          // e.g. "navigate-instagram-1"
+    pub intent: String,                      // human description
+    pub acceptance: Option<AcceptanceCriterion>, // what "done" means (single, optional)
+    pub depends_on: Vec<TodoId>,             // ordering
+    pub status: TodoStatus,                  // reuses SubTaskStatus
+    pub evidence: Option<Evidence>,          // filled when terminal
+    pub attempts: u8,                        // bounded retries, default 3
+    pub budget: TodoBudget,                  // step / time caps
+}
 
-- [x] Scaffold a Tauri 2 project (`cargo create-tauri-app` or manual) as a new workspace
-  member, e.g. `mew-ui`, alongside the existing `mew-cdp` / `mew-perception` /
-  `mew-agent` / `mew-cli` members — not a separate repo. Add `mew-agent` (and whatever
-  of `mew-cdp` it needs) as a path dependency in `mew-ui/src-tauri/Cargo.toml`.
-- [x] Pick a frontend stack for the chat UI (plain HTML/JS, or a framework if you
-  already have a preference — this file doesn't mandate one). Build a minimal chat
-  list + text input, no styling polish yet.
-- [x] Wire one real Tauri command end to end: `send_message(text: String) -> String`
-  that, for now, just echoes the text back — proves the JS ↔ Rust IPC round-trip
-  works before any LLM or agent logic is added.
-- [x] Confirm `mew-agent`'s existing code compiles as a dependency inside the Tauri
-  binary (native deps like `chromiumoxide` sometimes need feature-flag adjustments
-  when pulled into a new binary target — surface and fix any of that now, not later).
-- [x] Set the main Tauri window's default size/position to occupy the left half of a
-  typical screen (a fixed reasonable default is fine — dynamic multi-monitor handling
-  is out of scope for this step).
+pub enum AcceptanceKind {
+    UrlAt,           // planner expects page URL to equal `value`
+    TextInSnapshot,  // planner expects AX-tree text to contain `value`
+    ElementPresent,  // planner expects an interactive element with `value` as label
+    AnySnapshot,     // planner only requires a fresh snapshot, no semantic check
+}
 
-## Step 1.2 — Tauri shell + workspace wiring: review & testing
+pub struct AcceptanceCriterion {
+    pub kind: AcceptanceKind,
+    pub value: String,
+}
 
-- [ ] Run the Tauri app yourself (`cargo tauri dev` or equivalent) and watch a real
-  window open on screen — confirm it's genuinely the left-half-of-screen size/position
-  you configured, not a default centered window that the config silently didn't apply
-  to.
-- [ ] Type into the chat input, send it, and confirm the echoed response actually comes
-  back through real IPC — check the browser devtools network/console yourself (Tauri
-  apps can be inspected like any webview) to see the real `invoke` call and its
-  response, not just trust the UI showing *something*.
-- [ ] Confirm `mew-agent` really compiled in as a dependency: temporarily call one
-  trivial function from it (e.g. a config loader) from a Tauri command and confirm it
-  executes for real — read actual output, don't just trust a clean `cargo build`.
-- [ ] **Resolve the structured-output assumption now, before Step 2 depends on it.**
-  Write a tiny standalone test that sends one `reqwest` call to OpenCode Zen with a
-  single tool defined (`classify_intent(intent: enum["chat","browser_task"], reply:
-  string)`) and a forced tool choice, and read the raw JSON response yourself. Confirm
-  the model actually returns a well-formed `tool_calls` entry matching the schema, not
-  free text, not a malformed call, not silent refusal. If this fails, decide now
-  whether to retry with a different `tool_choice` setting or fall back to a different
-  approach — don't carry an unverified assumption into Step 2.
-- [ ] Close the app and confirm no orphaned processes (the underlying webview host,
-  any dev-server process) are left running — same zombie-process discipline as v1
-  Step 1.2, now applied to the new binary.
+pub struct Evidence {
+    pub todo_id: TodoId,
+    pub worker_signature: String,            // the worker's reported signature
+    pub planner_signature: String,           // the planner's independently re-computed signature
+    pub verified_at_secs: u64,
+}
+```
 
-**Done when:** you've watched a real Tauri window open at the size/position you set,
-confirmed a real IPC round-trip with your own eyes in devtools, confirmed `mew-agent`
-genuinely compiles and runs inside this new binary, and confirmed — with a real raw API
-response you read yourself — whether tool-call-based structured output actually works
-against OpenCode Zen.
+**Why `worker_signature` AND `planner_signature` both live in `Evidence`:**
+The worker's `mark_subtask_done` already records the signature it
+observed. The new rule is the *planner* must independently re-hash
+the AX-tree (or a typed summary of it) that the worker hands back
+as part of `TodoResult`, and the two must match. Storing both lets
+a reviewer diff "what the worker said" vs "what the planner saw"
+without re-running the task. Both signatures use the existing
+`len:{:08x}` format from `agent.rs::run_inner` — the
+`DefaultHasher` over the obs text — so the wire format is
+unchanged.
 
----
+**Checklist:**
+- [x] Define `Todo`, `TodoId` (newtype, `Deref<Target=str>`),
+      `TodoStatus` (= `SubTaskStatus`), `AcceptanceCriterion`,
+      `AcceptanceKind`, `Evidence`, `TodoBudget` in
+      `mew-agent/src/todo.rs`
+- [x] Derive `Debug, Clone, Serialize, Deserialize` on every public
+      type; add `#[serde(tag = "type")]` on `AcceptanceKind` so the
+      wire format survives a future variant addition
+- [x] `TodoId::from_slug(&str, index: usize) -> TodoId` —
+      thin wrapper over the existing `mew_agent::planner::slugify`
+      so a todo id is byte-identical to the corresponding subtask id
+      for the same description+index
+- [x] Extend `mew_agent::planner::plan()` with
+      `decompose_to_todos(&Handoff) -> Vec<Todo>` — reuses the
+      existing deterministic `and` / `then` / `,` split and seeds
+      each piece with a `Todo` whose `id` matches the corresponding
+      `DeclareItem.id`
+- [x] Add `acceptance` heuristic: for a todo whose description
+      starts with "navigate", seed `Some(UrlAt(value=resolved_url))`;
+      for "type"/"send", seed `Some(ElementPresent(value=expected_text))`;
+      for everything else, seed `Some(AnySnapshot)` — never `None`,
+      because a planner-side acceptance rule is the whole point of
+      Phase 12
+- [x] Add `tests/todo_schema.rs`: JSON round-trip,
+      `TodoId::from_slug` produces the same string as
+      `planner::slugify` for the same input, slug idempotency
+      (`"a b c" -> "a-b-c" -> "a-b-c"`)
+- [x] Doc comment on `Todo` explaining the invariant: `status ==
+      Done ⇒ evidence.is_some() ∧ evidence.planner_signature ==
+      evidence.worker_signature`
+- [x] Update `mew-agent/src/lib.rs` to re-export the new module
 
-## Step 2.1 — Intent routing: implementation
-
-Every chat message needs to become either a direct reply or a routed agent task, using
-whichever mechanism Step 1.2 just confirmed actually works.
-
-- [ ] In `mew-agent` (or a new small `mew-router` module — your call), implement a
-  `classify(message: &str, conversation_context: &[Message]) -> Intent` function where
-  `Intent` is an enum `{ Chat(String), BrowserTask(String) }` — the classification call
-  returns both the routing decision *and* the direct reply/rephrased task in one round
-  trip, not two separate calls.
-- [ ] Pass recent conversation history into the classification call, not just the
-  single latest message — "open it" only makes sense as a browser-task if the prior
-  turn named a site. Scope how much history you pass (last few turns is plenty; don't
-  send the whole growing transcript into every classification call).
-- [ ] Wire the `send_message` Tauri command from Step 1 to actually call `classify()`:
-  on `Intent::Chat(reply)`, return the reply directly to the frontend. On
-  `Intent::BrowserTask(task)`, hand off to Step 3's agent-session logic (stub this
-  hand-off for now if Step 3 isn't built yet — just log that a browser task was
-  detected and what task string was extracted).
-- [ ] Handle the classification call itself failing (network error, malformed
-  response) with a clear typed error surfaced to the frontend — don't let a
-  classification failure silently swallow the user's message.
-
-## Step 2.2 — Intent routing: review & testing
-
-- [ ] Send 10+ varied real messages you'd actually type — plain small talk, clear
-  browser tasks, and deliberately ambiguous ones ("check that for me", "open it",
-  "what about the other one") — and read the actual classification decision for each
-  one against what you'd expect. This is the step most likely to look "basically fine"
-  on obvious cases while quietly getting the ambiguous ones wrong — don't skip the
-  ambiguous set.
-- [ ] Confirm conversation context is genuinely being used: have a two-turn exchange
-  where turn 1 names a site and turn 2 says only "open it" — confirm it correctly
-  routes as a browser task referencing the right site, not misclassified as plain chat
-  for lack of context.
-- [ ] Confirm a normal chat message never accidentally triggers Chromium to launch —
-  send several genuinely conversational messages in a row and watch that no browser
-  window opens, no agent session starts, nothing happens beyond a chat reply.
-- [ ] Deliberately break the network (or point `base_url` at something invalid) mid-
-  session and confirm the classification failure surfaces as a real visible error in
-  the chat UI, not a silently dropped message or a frozen input box.
-- [ ] Read the raw request/response for a few of these classification calls yourself
-  (log them if not already) — confirm the reply text returned alongside `Intent::Chat`
-  is a genuine, sensible reply and not a placeholder or the model's confused attempt
-  to also call the classify tool when it shouldn't have.
-
-**Done when:** you've read real classification outcomes across obvious and ambiguous
-real messages, confirmed context from prior turns is actually used, confirmed plain
-chat never triggers the browser, and confirmed classification failures are visible, not
-silent.
+**Acceptance:**
+- `cargo test -p mew-agent` passes with the new tests.
+- `decompose_to_todos` on the existing `phase2_instagram_regression`
+  input ("go to instagram and text my friend hi") produces a
+  `Vec<Todo>` of length 2 with ids of the form
+  `["go-to-instagram-0", "text-my-friend-hi-1"]` (or whatever the
+  existing `slugify` produces for those clauses — the test pins
+  the exact strings, not a hand-waved format).
+- No existing public API in `mew-agent` changes shape.
 
 ---
 
-## Step 3.1 — Agent session lifecycle from the UI: implementation
+## Phase 12 — Per-todo evidence gate (the no-shortcut rule)
 
-Connect a classified browser task to a real running `mew-agent` session, reusing v2's
-state machine and live-chat channel rather than rebuilding either.
+**Goal:** Make it impossible for a worker to claim `Done` without
+planner-verifiable evidence. The worker hands back its
+`last_snapshot_signature` *and* the AX-tree text it observed; the
+planner re-hashes the AX-tree text with the same `len:{:08x}`
+function `agent.rs::run_inner` uses and only accepts `Done` when
+the two signatures match.
 
-- [ ] On the first `Intent::BrowserTask` in a chat, spin up a real `mew-agent` session
-  in a background Tokio task (via `tauri::async_runtime::spawn` or equivalent), exactly
-  as `mew-cli` already does — same `SessionHandle`, same `checkpoint()`/state-machine
-  machinery from v2 Step 12, same `mpsc::channel<UserMessage>` from v2 Step 13. This
-  step is wiring, not new agent logic — resist rewriting anything `mew-agent` already
-  does.
-- [ ] Store the running session's `SessionHandle` and the channel's `Sender` half in
-  Tauri's managed state (`app.manage(...)`), keyed by a session/chat id, so subsequent
-  Tauri commands in the same chat can reach the same running session.
-- [ ] Route every *subsequent* message in the same chat, while a session is active,
-  straight to that session's existing `Sender` — bypassing Step 2's classifier
-  entirely while a task is running. This is the actual point of v2 Step 13: the user
-  should be able to say anything mid-task and have it steer the running agent, not get
-  reclassified as idle chat.
-- [ ] Decide and implement the exact "session is done" transition: when the agent
-  reaches `Done`/`Failed`/`Stopped` (v2's `SessionState`), clear it from managed state
-  so the *next* message goes back through Step 2's classifier instead of trying to
-  steer a dead session.
-- [ ] Surface a minimal but real status signal to the frontend for now (even just one
-  `emit()` on state transitions is fine here — the proper Channel-based transcript
-  stream is Step 4). The goal of this step is a correct, working session lifecycle;
-  polished streaming comes next.
+**Reuses:**
+- `mew_agent::completeness::MarkOutcome::StaleEvidence` — the
+  evidence-rejection pattern is already there for subtasks; lift it
+  to todos.
+- `mew_agent::agent::run_inner`'s `len:{:08x}` signature function
+  (the same `DefaultHasher` over the obs text at
+  `mew-agent/src/agent.rs:1826-1838`). The worker and the planner
+  use *the same* function, so equal inputs always produce equal
+  signatures.
+- `mew_perception::TreeNode` and the AX-tree text the worker
+  already produces per snapshot.
 
-## Step 3.2 — Agent session lifecycle from the UI: review & testing
+**Why the planner doesn't run its own CDP snapshot:**
+The planner lives in the Tauri shell, not next to the browser. To
+capture an independent snapshot it would need its own CDP
+connection — a second browser instance, doubling the resource cost
+and tripping the anti-bot profile-sharing detector. Instead, the
+worker hands the *raw* AX-tree text (not just a hash) as part of
+`TodoResult`, and the planner hashes it locally. The worker can lie
+about the tree only by also lying about the hash, which the
+planner's local re-hash catches.
 
-- [ ] Send a real multi-step browser task from the chat UI and confirm a real, visible
-  Chromium window actually launches (position/docking isn't wired yet — that's Step
-  22, a floating window is fine for now) and the task actually runs to completion,
-  driven entirely from the UI, not the CLI.
-- [ ] While that task is running, send a follow-up message from the same chat input
-  ("also check the weather" or similar) and confirm — by reading the transcript file
-  v2 already produces — that it was genuinely appended to the running session's
-  conversation, not reclassified as a fresh chat message and not silently dropped.
-  This is the actual UI-level proof of the thing you originally asked for.
-- [ ] Let a task finish, confirm the session is genuinely cleared from managed state
-  (not just that the UI *looks* idle) by sending a new plain-chat message afterward and
-  confirming it goes through Step 2's classifier again rather than trying to steer a
-  finished session — check logs for which path it took.
-- [ ] Kill the Tauri app mid-task (force-quit, not graceful) and confirm no orphaned
-  Chromium process is left running afterward — check your process list yourself, same
-  standard as every prior zombie-process check in v1/v2.
-- [ ] Start two separate chat sessions back-to-back (not simultaneously — sequentially)
-  and confirm the second one starts clean, with no state bleeding over from the first
-  session's managed-state entry.
+**Files to touch:**
+- `mew-agent/src/todo.rs` — add
+      `planner_signature(obs_text: &str) -> String` (the same
+      `len:{:08x}` function, lifted to a public util so the worker
+      and planner can't drift) and
+      `verify_evidence(worker_sig: &str, obs_text: &str) -> Result<String, EvidenceMismatch>`.
+- `mew-agent/src/agent.rs` — when the worker's `BrowserResult`
+      arrives, the orchestrator calls `verify_evidence` per `Todo`
+      before marking it `Done`.
+- `mew-agent/tests/evidence_gate.rs` (new) — golden scenarios.
+- `mew-agent/src/handoff.rs` (or a new `TodoResult` struct) — the
+      `TodoResult` carries both `last_snapshot_signature: String`
+      and `last_obs_text: String` so the planner has the raw input
+      to re-hash.
 
-**Done when:** you've driven a full real multi-step task from the UI, personally
-interrupted it mid-task from the same chat input and confirmed via transcript that it
-was incorporated (not dropped or restarted), confirmed clean session-end transitions
-back to the classifier, and confirmed no orphaned processes after a hard kill.
+**The rule (in code, not prose):**
+```rust
+fn mark_done(todo: &mut Todo, worker_sig: &str, obs_text: &str)
+            -> MarkOutcome {
+    if todo.evidence.is_some() {
+        return MarkOutcome::AlreadyTerminal;
+    }
+    let planner_sig = planner_signature(obs_text);
+    if worker_sig != planner_sig {
+        return MarkOutcome::StaleEvidence {
+            worker: worker_sig.to_string(),
+            planner: planner_sig,
+        };
+    }
+    todo.evidence = Some(Evidence {
+        todo_id: todo.id.clone(),
+        worker_signature: worker_sig.to_string(),
+        planner_signature: planner_sig,
+        verified_at_secs: now_secs(),
+    });
+    todo.status = SubTaskStatus::Done;
+    MarkOutcome::MarkedDone { /* ... */ }
+}
+```
 
----
+**Checklist:**
+- [x] Add `verify_evidence` in `todo.rs` — pure function, no IO, no LLM
+- [x] Wire `verify_evidence` into `mark_done` path in `mew-agent/src/todo.rs` / orchestrator — call happens *before* the `Done` transition
+- [x] On `EvidenceMismatch`, emit a typed `OrchestratorEvent::TodoRejected { todo_id, worker_signature, planner_signature }`
+- [x] Bound retries: `attempts` field, default 3
+- [x] Add a golden test: worker emits `done` with signature `abc`, planner signature `xyz` → outcome `StaleEvidence`, todo stays `Pending`, retry counter increments
+- [x] Add a positive test: matching signatures → `MarkedDone`, todo transitions, `evidence` field populated
+- [x] Add a third test: same signature but `evidence_iteration` is older than the last `mark_done` call → reject as `StaleEvidence` (the "model re-uses old evidence" shortcut)
 
-## Step 4.1 — Live transcript streaming via Channels: implementation
-
-Replace Step 3's placeholder status ping with the real ordered, high-throughput stream
-the UI needs to feel alive — using Tauri's Channel API, not raw `emit()`, per the
-ordering-risk finding noted at the top of this file.
-
-- [ ] Add a Tauri Channel parameter to the session-start command (per Tauri's
-  documented pattern: `on_event: tauri::ipc::Channel<T>` passed in from the frontend
-  alongside the task text). Define a serializable event enum covering at minimum:
-  state transitions (from v2's `SessionState`), each tool call + result, and the final
-  per-subtask completion summary (from v2 Step 15).
-  - Note: the current constraint is that a Channel must be created and passed in by
-    the frontend at command-invocation time — confirm this against whatever Tauri
-    version you land on when you get here, since IPC APIs are actively evolving; don't
-    assume the exact call shape without checking current docs at implementation time.
-- [ ] Have the running agent session push every relevant event onto this channel as it
-  happens — reuse v2's existing transcript-logging call sites (state transitions are
-  already logged with timestamps per v2 Step 12; tool calls are already logged per v1
-  Step 10) as the trigger points, rather than inventing a second, separate
-  instrumentation pass.
-- [ ] On the frontend, render the incoming stream as a live-updating transcript/status
-  area distinct from the plain chat bubbles — this is "what the agent is doing right
-  now," not a chat message.
-- [ ] Keep the one-shot `emit()` from Step 3 only for things that are genuinely
-  one-off and don't need ordering guarantees (e.g. "a new session started") — don't
-  migrate everything to Channels reflexively if it doesn't need the ordering
-  guarantee, but don't leave the high-frequency transcript stream on `emit()` either.
-
-## Step 4.2 — Live transcript streaming via Channels: review & testing
-
-- [ ] Run a genuinely long, many-step real task and watch the live transcript area
-  update in real time on screen — confirm events appear in the correct order start to
-  finish, with no visible out-of-order jumps (this is the exact failure mode Tauri's
-  own docs warn `emit()` is prone to under rapid emission — confirm the Channel switch
-  actually avoids it, don't just assume it does because you used the "right" API).
-- [ ] Deliberately compare: temporarily route the same event stream through plain
-  `emit()` instead of the Channel, fire a burst of rapid events, and observe whether
-  you can reproduce out-of-order delivery — then switch back and confirm the Channel
-  version doesn't exhibit it. This is the one claim in this whole step worth actually
-  falsifying rather than trusting the docs' word for it.
-- [ ] Confirm the transcript stream shown in the UI genuinely matches the on-disk
-  transcript file from v2/v1 for the same session — spot-check several entries side by
-  side, don't just eyeball that "something is streaming."
-- [ ] Trigger a mid-task steering message (as in Step 3.2) again, this time watching
-  the live transcript — confirm the injected user message and the agent's next action
-  both appear in the live stream in the correct order relative to what was already
-  running, not just correctly logged to disk after the fact.
-- [ ] Close and reopen the chat mid-task (if your UI allows navigating away) and
-  confirm reattaching to the live stream doesn't duplicate, drop, or reorder events —
-  or, if reattachment isn't supported yet, confirm that's a clean known limitation
-  rather than a silent corruption of the stream.
-
-**Done when:** you've watched a long real session stream live in correct order,
-actually reproduced the `emit()` ordering problem once for comparison and confirmed the
-Channel-based version doesn't have it, and confirmed the live stream matches the
-on-disk transcript for the same session.
+**Acceptance:**
+- `cargo test -p mew-agent` includes 3 new passing tests covering
+  accept, reject, and stale-iteration cases.
+- The "worker emits one `done` and walks away" shortcut now requires
+  the worker to also fabricate the AX-tree text that hashes to the
+  planner's signature — which means fabricating evidence. The
+  transcript shows the fabricated text in the worker's
+  `TodoResult.last_obs_text`; a reviewer can read the text and see
+  the lie.
+- A test asserts that a worker which hands back
+  `last_obs_text: ""` (empty string) is rejected as
+  `StaleEvidence` — the empty-string shortcut fails closed.
 
 ---
 
-## Step 5.1 — Chromium window docking via CDP: implementation
+## Phase 13 — Browser Agent as a long-lived supervised worker
 
-Position the agent's Chromium window against the Tauri window using
-`Browser.setWindowBounds`, per the researched decision at the top of this file — no
-Win32, no reparenting.
+**Goal:** Promote the current `agent::Agent` (ReAct loop) from
+"spawned once per session, dies with the session" to "a long-lived
+worker that accepts one todo at a time and is supervised by a planner."
 
-- [ ] In `mew-cdp`, add a function that computes the target Chromium window rect from
-  the Tauri window's current outer position/size (query via Tauri's window API) plus
-  your chosen split (e.g. Chromium occupies the region to the right of the Tauri
-  window, full screen height). This is pure arithmetic — no OS calls yet.
-- [ ] Call `Browser.getWindowForTarget` to get the browser's `WindowID`, then
-  `Browser.setWindowBounds` with the computed rect, right after a session's Chromium
-  instance launches (this can reuse or extend v1's existing launch path in `mew-cdp` —
-  don't duplicate the launch logic).
-  - Gotcha confirmed in CDP's own protocol definition: `windowState`
-    (minimized/maximized/fullscreen) and `left`/`top`/`width`/`height` cannot be set
-    in the same `setWindowBounds` call — sending both errors out. Your bounds-only
-    calls in this step are fine as long as you never also pass a state field; keep
-    that in mind if a later step adds a "maximize"/"restore" affordance.
-- [ ] In the Tauri app, listen for the main window's resize/move events
-  (`tauri::WindowEvent::Resized` / `Moved`) and, when a Chromium session is active,
-  recompute the target rect and re-call `set_window_bounds` so the two stay docked
-  live rather than only aligning once at launch.
-- [ ] Debounce the resize-triggered re-positioning (a raw per-pixel-event call to
-  `set_window_bounds` on every intermediate resize frame is wasteful and may visibly
-  lag) — a short debounce (e.g. reposition once movement pauses briefly, or throttle to
-  a few times a second) is enough; don't over-engineer this.
+**Reuses:**
+- `mew_agent::agent::Agent` — the ReAct loop body, refactored
+  but not re-implemented.
+- `mew_agent::session::SessionHandle` — state machine, unchanged.
+- `mew_agent::orchestrator::BrowserAgentFactory` — already abstracts
+  "build a browser agent" so the planner can compose with it.
 
-## Step 5.2 — Chromium window docking via CDP: review & testing
+**Files to touch:**
+- `mew-agent/src/worker.rs` (new) — `BrowserAgentWorker`:
+      long-lived, owns a `BrowserAgentFactory` output, exposes
+      `submit(Todo) -> oneshot::Receiver<TodoResult>` and
+      `signal(SupervisorSignal) -> ()`.
+- `mew-agent/src/supervisor.rs` (new) — `SupervisorSignal` enum:
+      `Pause | Resume | Cancel | Replan(Vec<Todo>)`. Steering is
+      *not* a supervisor signal — it goes through the existing
+      `mpsc::Sender<UserMessage>` path the legacy flow already uses.
+      (Two paths for the same concern invites drift; one path is
+      enough.)
+- `mew-agent/src/worker_pool.rs` (new) — `WorkerPool` with a single
+      worker for v1. The API takes a `Vec<BrowserAgentWorker>` so
+      Phase 18 can grow it without changing call sites; v1 calls
+      just pass a 1-element vec.
+- `mew-agent/src/agent.rs` — small refactor: extract the ReAct loop
+      body so it can be invoked by the worker without rebuilding
+      `SessionHandle` each time. The ReAct loop's
+      `tool_dispatch → snapshot → continue` shape must remain, but
+      the loop boundary itself must `tokio::select!` on the
+      supervisor signal so a `Cancel` can break it between tool
+      calls (not in the middle of one — a tool call is atomic by
+      contract).
 
-- [ ] Launch a real task and watch both windows on screen — confirm Chromium actually
-  lands docked against the Tauri window at launch, not overlapping it or appearing in
-  an unrelated default position.
-- [ ] Resize and move the Tauri window around the screen while a Chromium session is
-  active and watch Chromium visibly follow/resize to stay docked — confirm this is
-  actually live, not something that only worked once at launch and silently stopped
-  updating.
-- [ ] Confirm the debounce is real and reasonable: watch for visible lag or stutter
-  during a drag-resize, and confirm `set_window_bounds` isn't firing on every single
-  intermediate frame (check call frequency in logs if unsure) — but also confirm it's
-  not so heavily debounced that the docking feels broken/delayed.
-- [ ] Test at more than one screen size/resolution if you have access to one, or at
-  least at two different manually-set Tauri window sizes — confirm the rect math
-  genuinely adapts rather than being hardcoded to whatever size you tested first.
-- [ ] Confirm the agent's actual perception/action layer (accessibility tree, ref
-  clicks) still works correctly after the window has been resized/repositioned mid-
-  session — a real risk here is coordinate-dependent logic (if any survived from v1's
-  vision-fallback coordinate clicks) silently breaking after a bounds change that
-  perception-based actions wouldn't notice.
+**Architecture (one paragraph):**
+The Tauri shell holds an `Arc<WorkerPool>` in `AppState`. The
+planner calls `worker_pool.submit(todo)`, which returns a
+`oneshot::Receiver<TodoResult>`. The worker, in a `tokio::spawn`'d
+task, runs the ReAct loop scoped to that todo only. Inside the
+loop, between tool calls, the worker `tokio::select!`s on the
+supervisor signal so a `Cancel` can break out cleanly. The
+planner, in its own task, `tokio::select!`s on the receiver, the
+supervisor signal, and a per-todo deadline timer. On deadline,
+the planner sends `Cancel`; on user steering, the planner routes
+through the existing `mpsc::Sender<UserMessage>` (so the LLM sees
+the steering message in the next turn, same as the legacy path);
+on completion, the planner calls the Phase 12 evidence gate.
 
-**Done when:** you've watched Chromium dock against the Tauri window at launch and
-visibly follow it live through resize/move on screen, confirmed the debounce is neither
-laggy nor excessive, and confirmed the agent's real actions still land correctly after
-a mid-session repositioning.
+**Checklist:**
+- [x] Define `SupervisorSignal` in `mew-agent/src/supervisor.rs`:
+      `Pause | Resume | Cancel | Replan(Vec<Todo>)` with a
+      `signal_id: u64` monotonic counter so the worker can ignore
+      stale signals. The worker holds a `signal_id: u64` watermark
+      and discards any signal with `id <= watermark`
+- [x] Add `BrowserAgentWorker` in `mew-agent/src/worker.rs`:
+      `submit(Todo) -> oneshot::Receiver<TodoResult>` and
+      `signal(SupervisorSignal) -> ()`. The `submit` future
+      panics with `panic!("await the previous receiver first")` if the previous submit's
+      `Receiver` has not yet been awaited — caller bug, fail
+      loudly
+- [x] The worker runs a *scoped* ReAct loop: only the current todo
+      is in `CompletenessTracker`; pre-existing `Handoff.subtasks` are
+      filtered to just the active todo
+- [x] Inside the ReAct loop, the worker's `await self.tool_dispatch(...)`
+      call is wrapped in a `tokio::select!` against the supervisor
+      signal. `Cancel` causes the loop to return a
+      `TodoResult::Cancelled` *without* consuming the next tool
+      dispatch — the current tool's effect on the page is whatever
+      it was, but no further tool calls run
+- [x] Add `WorkerPool` in `mew-agent/src/worker_pool.rs` — the public
+      API is `submit` / `signal` / `shutdown`. Internally v1 holds
+      `Vec<BrowserAgentWorker>` of length 1; Phase 18 grows it
+- [x] `WorkerPool::submit` is the gate that enforces
+      `agent.todo.max_inflight` — if the pool is full, return
+      `Err(PoolError::Busy)` and the planner surfaces it as
+      `BrowserResult::failure("backpressure", ...)`. The single-
+      worker v1 implements this with an in-flight flag; multi-
+      worker v2 is a count comparison
+- [x] Refactor `mew-agent/src/agent.rs` so the ReAct loop body is
+      callable with a pre-built `SessionHandle` and a pre-filtered
+      `Handoff` (don't tear down and rebuild session per todo)
+- [x] Add `tests/worker_lifecycle.rs`:
+      `submit_then_complete`, `submit_then_cancel_mid_loop`,
+      `submit_then_deadline`, `submit_then_steering_via_existing_mpsc`,
+      `submit_twice_without_awaiting_first_receiver_panics`,
+      `submit_while_pool_shutting_down_returns_err`,
+      `cancel_signal_with_stale_id_is_ignored`
+- [x] Add `#[tracing::instrument(skip_all, fields(todo_id, signal_id))]`
+      on the worker's submit/signal/complete paths so the per-todo
+      trace is its own span. `skip_all` on the ReAct body to avoid
+      logging the entire prompt
+
+**Acceptance:**
+- A planner can submit, observe completion, and submit again on the
+  same `BrowserAgentWorker` without rebuilding it.
+- Cancelling a todo mid-ReAct does not corrupt the next todo's
+  `SessionHandle` (verifiable via `phase3_round_trip` style test).
+- A second `submit` while the first receiver is unawaited panics
+  with a message that says "await the previous receiver first" —
+  this is a programmer error and fail-loud is correct.
+- Existing `phase2_instagram_regression` still passes — the refactor
+  is internal.
 
 ---
 
-## Step 6.1 — UI polish & real-use pass: implementation
+## Phase 14 — Tauri command surface for the planner
 
-Same spirit as v1's Step 11 and v2's pacing/cursor steps — turn a working prototype
-into something pleasant to actually use daily.
+**Goal:** Expose the planner as a Tauri command, with the worker pool
+in `AppState`, and the per-todo evidence flow wired to the existing
+`TauriSink`. The frontend gets new commands without breaking the
+existing `send_message` path.
 
-- [ ] Add a visible, unambiguous state indicator in the UI (idle / classifying /
-  running / paused / done / failed) driven by the real `SessionState` values already
-  streaming in from Step 4 — not a separate, hand-maintained UI state that can drift
-  out of sync with the real agent state.
-- [ ] Add a clear affordance for the v2 `pause()`/`resume()` machinery — a real button
-  in the UI, not just a channel message typed as text — for the case where the user
-  wants to freeze the agent and take manual control of the browser rather than just
-  steer it.
-- [ ] Handle the empty/idle state, error states, and a genuinely long-running task
-  gracefully in the UI (loading affordance, no frozen-looking input box).
-- [ ] Do a final pass on window defaults (Tauri window size/position, Chromium's
-  initial docked size) so a cold start looks intentional, not like leftover dev
-  defaults.
+**Reuses:**
+- `mew-ui/src-tauri/src/lib.rs::AppState` and `ActiveSession` —
+      extended, not replaced.
+- `mew_agent::orchestrator::TauriSink` — extended with new event
+      mappings.
 
-## Step 6.2 — UI polish & real-use pass: review & testing
+**Files to touch:**
+- `mew-ui/src-tauri/src/lib.rs` — add `WorkerPool` to `AppState`,
+      add `start_task` / `pause_todo` / `resume_todo` /
+      `cancel_todo` / `replan` / `stop_task` commands.
+- `mew-agent/src/orchestrator.rs` — extend `OrchestratorEvent` with
+      `TodoStateChanged { task_id, todo }` and `TodoRejected {
+      task_id, todo_id, reason }` variants.
+- `mew-ui/src-tauri/src/lib.rs` (`TauriSink` impl) — map the new
+      events to `app.emit("todo-state-changed", ...)` and
+      `app.emit("todo-rejected", ...)`.
+- `mew-ui/src-tauri/Cargo.toml` — add `tokio-util` for
+      `CancellationToken`.
 
-- [ ] Use the finished app for several real tasks across a few real sessions, cold
-  start each time, the way you'd actually use it day to day — not through a special
-  dev harness.
-- [ ] Confirm the state indicator genuinely tracks reality: deliberately pause a
-  session via the new button and confirm the indicator reflects `Paused` correctly and
-  promptly, then resume and confirm it flips back.
-- [ ] Force a failure (bad task, broken network) and confirm the UI shows a real,
-  legible failed state rather than hanging on "running" forever or showing a raw
-  unhandled error.
-- [ ] Force-quit the app mid-task one more time, now against the fully wired system,
-  and re-confirm zero orphaned Chromium processes — this check earns re-verification
-  every time new lifecycle code is added, per the same standard as every earlier phase.
-- [ ] Live with it for a few real days of actual use before calling it done — per v1's
-  own closing note, the deepest bugs in a system like this surface under real, varied
-  use, not a single pass.
+**Architectural rule (no exceptions, call it out in code review):**
+No new Tauri command may call `chromiumoxide` directly. Every
+browser interaction goes through the `mew_cdp` crate, same as
+the legacy flow. The pinned `chromiumoxide = 0.9.1` in the
+workspace `Cargo.toml` is consumed by `mew-cdp` only; the
+Tauri shell must not add a transitive dep on it. The PR template
+should reject any change that violates this.
 
-**Done when:** you've used the finished app for real tasks across multiple real
-sessions, confirmed the state indicator and pause/resume affordance genuinely reflect
-the real agent state, confirmed graceful failure display, and re-confirmed clean
-shutdown under a forced kill on the fully integrated system.
+**Tauri command contract (in `lib.rs`):**
+```rust
+/// `task_id` is generated server-side and returned in `TaskHandle`.
+/// The frontend tracks it from then on; it is *not* derived from
+/// the todo id (one task has many todos).
+#[tauri::command]
+async fn start_task(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message: String,
+    history: Vec<FrontendMessage>,
+) -> Result<TaskHandle, String>;
+
+#[tauri::command]
+async fn pause_todo(state: State<'_, AppState>, task_id: String, todo_id: String)
+    -> Result<(), String>;
+#[tauri::command]
+async fn resume_todo(state: State<'_, AppState>, task_id: String, todo_id: String)
+    -> Result<(), String>;
+#[tauri::command]
+async fn cancel_todo(state: State<'_, AppState>, task_id: String, todo_id: String)
+    -> Result<(), String>;
+#[tauri::command]
+async fn replan(state: State<'_, AppState>, task_id: String) -> Result<(), String>;
+
+/// Phase 18 ships with this; Phase 14 declares the signature
+/// only and stubs the body so the frontend can wire the button.
+#[tauri::command]
+async fn stop_task(state: State<'_, AppState>, task_id: String) -> Result<(), String>;
+```
+
+**Why `task_id` is on every command (not just `start_task`):**
+A single Tauri session can have multiple in-flight tasks (the
+user opened two chat sessions, or sent a new message while the
+previous task is still running). The `WorkerPool` keys its
+internal state by `task_id`, not by `todo_id`, because two
+concurrent tasks could in principle have a todo with the same
+id (`navigate-instagram-1`) — ids are local to a task, not
+global. Frontend always carries the `task_id` it got from
+`start_task`'s return value.
+
+**The gotcha (call it out so it doesn't bite in code review):**
+Tauri 2 `State<'_, T>` is *not* `'static`. You cannot move it into a
+`tokio::spawn` future. The pattern is: capture the `AppHandle`, then
+inside the spawned task, re-fetch state via `app.state::<AppState>()`.
+The existing `mew-ui` code already does this in the steering path —
+extend the pattern, don't reinvent it.
+
+**Checklist:**
+- [x] Add `WorkerPool` to `AppState` as `Arc<WorkerPool>`; initialize
+      in the `setup` hook after config load. Initialization is
+      `tokio::spawn`-friendly: if it fails (e.g. config invalid),
+      `start_task` returns the error, not a panic
+- [x] Add `start_task` command: classifier → decompose to todos →
+      submit first todo → return `TaskHandle { task_id, todos }` so
+      the UI can render the list immediately. `task_id` is a UUIDv4
+      generated by `uuid::Uuid::new_v4()`, not a hash of the task
+- [x] Add `pause_todo`, `resume_todo`, `cancel_todo` commands — all
+      forward a `SupervisorSignal` to the worker pool, scoped by
+      `task_id`
+- [x] Add `replan` command: cancel the current todo, ask the
+      `planner::decompose_to_todos` to re-run with the original task
+      plus the failure context, re-submit. Replanning preserves
+      completed todos (their evidence is still valid) and only
+      re-derives the pending tail
+- [x] Add `stop_task` command with a stub body that just returns
+      `Err("not yet implemented")`; Phase 18 fills it in
+- [x] Extend `OrchestratorEvent` with `TodoStateChanged { task_id,
+      todo }` and `TodoRejected { task_id, todo_id, reason }` —
+      `#[serde(tag = "type")]` keeps wire compat with the legacy
+      frontend listeners
+- [x] Extend `TauriSink` impl: `TodoStateChanged → "todo-state-changed"`,
+      `TodoRejected → "todo-rejected"`. Both events also carry
+      `task_id` in the payload so the frontend reducer can
+      multi-task
+- [x] Wire `start_task` so the existing `ChatAgent → BrowserAgent`
+      flow is the **fallback** when `config.agent.planner_enabled`
+      is `false` (default during Phase 14; flip to `true` in Phase 16)
+- [x] Add `error_message::for_user` mapping for every new error path
+      (no `?` operator propagating raw `anyhow::Error` to the
+      frontend). Add a unit test that asserts every new `Result<_, String>`
+      Tauri command's error path is *not* a JSON dump
+
+**Acceptance:**
+- The 6 new commands are listed in the Tauri config and the
+  frontend can `invoke()` them.
+- With `planner_enabled: false`, the existing `send_message` flow
+  is byte-identical to before this phase. A `git diff` on the
+  legacy code path shows zero changes.
+- Cancelling a todo emits a `todo-rejected` event the frontend can
+  listen for, and the worker is immediately ready for the next todo.
+- Two parallel `start_task` calls produce two distinct `task_id`s
+  and the worker pool's per-task state is independent.
+
+---
+
+## Phase 15 — Per-todo UI checklist surface
+
+**Goal:** Replace the single "Working · N steps" pill with an
+explicit, live per-todo checklist rendered in the chat. Each todo
+gets a row with its id, intent, status icon, and an inline progress
+counter. The collapsible "view details" expands to show the per-todo
+trace.
+
+**Reuses:**
+- `mew-ui/src/main.ts::MessageKind` — extend with `todo_list`
+      variant.
+- The existing `<details>` collapsible in the task card.
+- The existing `liveLines` ring buffer on `ChatMessage` for the
+  per-todo sub-progress.
+
+**Files to touch:**
+- `mew-ui/src/main.ts` — new `TodoRow` interface, `todo_list`
+      MessageKind variant, new `listen("todo-state-changed", ...)` and
+      `listen("todo-rejected", ...)` handlers, `updateTodoRow()`
+      reducer.
+- `mew-ui/src/style.css` — `.todo-row` styles, status icons
+      (use Unicode glyphs; no icon font dep), `[data-status="done"]`
+      / `[data-status="rejected"]` color tokens.
+
+**The rendering rule (per row, derived from `TodoStatus`):**
+- `Pending` → empty circle `○`, dim text.
+- `Running` → half-filled circle `◐`, ink-blue accent, live line
+  counter. (`Running` is *not* a `TodoStatus`; it's a UI flag
+  derived from "is this todo currently the in-flight one for its
+  task?")
+- `Done` → filled circle `●`, green accent, single line of evidence
+  text.
+- `Skipped` / `Failed` / `Exhausted` → hollow square `□`, gray,
+  reason inline.
+
+**`Rejected` is not a `TodoStatus`.** It is a per-attempt
+annotation that lives in the `TodoRejected` event payload. When
+the planner exhausts `attempts` without matching evidence, the
+todo's *terminal* status becomes `Failed` (or `Exhausted` if the
+heuristic chose so). The UI row for a `Failed` todo shows the
+most recent rejection reason inline. This keeps the state
+machine clean: `TodoStatus` is the single source of truth for
+"is this todo done?", and rejection is a transient event
+annotation.
+
+**Checklist:**
+- [x] Define `TodoRow { id, intent, status: TodoStatus, attempts,
+      evidence?, rejected_reason? }` in `main.ts`. `TodoStatus` is
+      the strict subset
+      `'pending' | 'done' | 'skipped' | 'failed' | 'exhausted'` —
+      `Running` is a UI flag, not a status
+- [x] Extend `MessageKind` with `'todo_list' | 'todo_rejected'`
+- [x] The state store keys rows by `(task_id, todo_id)` so two
+      concurrent tasks don't trample each other's todo rows
+- [x] Add `listen('todo-state-changed', ...)` and route into
+      `updateTodoRow(state, event)` reducer (immutable update
+      keyed by `task_id + todo_id`)
+- [x] Add `listen('todo-rejected', ...)` and route into the same
+      reducer with `rejected_reason` populated; the *status* does
+      not change unless the rejection exhausts `attempts`, in
+      which case the matching `TodoStateChanged` event follows
+- [x] Add `renderTodoRow(row: TodoRow) -> HTMLElement` that
+      returns a single DOM node — no innerHTML strings, no
+      `dangerouslySetInnerHTML`, no eval
+- [x] CSS: `.todo-row` is a 28px-tall flex row with a fixed-width
+      status column (28px) and a 1fr intent column
+- [x] CSS: status colors use the existing `--ink-50 / --ink-300 /
+      --accent / --success / --danger` tokens — do not invent new
+      colors
+- [x] CSS: a `[data-just-changed]` attribute drives a 240ms
+      background flash on state change so the user sees the
+      transition, not the snapshot
+- [x] When a todo transitions to `Failed` / `Exhausted` (i.e.
+      attempts exhausted), auto-open the task card's `<details>`
+      so the user sees the trace
+- [x] The header pill ("Working · N steps") becomes "Working · T of
+      N todos" — N = total, T = terminal count (`done + skipped +
+      failed + exhausted`)
+- [x] Keyboard: arrow keys move focus between todo rows in the
+      currently focused task card; Enter toggles the inline
+      details
+- [x] `Running` row highlight auto-advances when one todo finishes
+      and the next one starts — implement by computing `Running`
+      in the reducer as "the in-flight todo for this task,
+      according to the most recent `TodoStateChanged` event"
+
+**Acceptance:**
+- A 3-todo task renders as 3 rows in the chat, all in `Pending`
+  initially.
+- Submitting the first todo animates the row to `Running`, then
+  `Done` on evidence match, and the header pill updates.
+- On rejection, the row shows the rejection reason inline but
+  *stays in `Pending`* until `attempts` is exhausted. The trace
+  `<details>` opens only on the final failure transition, not on
+  every intermediate rejection.
+- Two concurrent tasks in the chat show two separate todo lists
+  with independent progress.
+
+---
+
+## Phase 16 — Planner outer loop, opt-in via config
+
+**Goal:** Wire the planner end-to-end: classify → decompose →
+supervise → evidence-gate → synthesize. Behind a
+`config.agent.planner_enabled: true` flag, off by default, so the
+existing flow keeps working for a full release cycle.
+
+**Reuses:**
+- `mew_agent::chat_agent::ChatAgent::classify_intent` — entry point
+      for the outer loop.
+- `mew_agent::chat_agent::ChatAgent::synthesize_reply` — final
+      synthesis, unchanged.
+- The Phase 14 commands and the Phase 15 UI.
+
+**Files to touch:**
+- `mew-agent/src/planner.rs` — `Planner::run(task: Handoff, pool:
+      &WorkerPool, sink: &dyn TurnSink) -> BrowserResult`.
+- `mew-agent/src/orchestrator.rs` — in `run_turn`, branch on
+      `planner_enabled`: if true, hand off to `Planner::run`; else,
+      the existing path.
+- `mew-agent/src/lib.rs` — export `Planner`.
+- `config.yaml` — add `agent.planner_enabled: false` (default off).
+- `mew-ui/src-tauri/src/lib.rs::start_task` — read the config flag
+      and dispatch accordingly.
+
+**The outer loop, in plain English:**
+1. `classify_intent(user_message)` → `Intent::BrowserTask(task)`.
+2. `planner::decompose_to_todos(&Handoff)` → `Vec<Todo>`.
+3. For each `Todo` in topological order:
+   - `worker_pool.submit(todo.clone()).await` →
+     `oneshot::Receiver<TodoResult>`.
+   - `tokio::select!` on receiver, supervisor signal, and
+     per-todo deadline.
+   - On `Done`: call Phase 12 evidence gate; on match, advance;
+     on mismatch, retry up to `attempts`.
+   - On `Rejected`: surface as `TodoRejected` event, optionally
+     re-plan the remaining todos via `planner::decompose_to_todos`.
+   - On deadline: send `SupervisorSignal::Cancel`, mark
+     `Exhausted { reason: "deadline" }`, advance.
+4. After all todos terminal, build a `BrowserResult` from the
+   per-todo outcomes (Done / Partial / Failed mirrors the existing
+   per-subtask rollup).
+5. `synthesize_reply` produces the user-facing text — same path as
+  before.
+
+**Checklist:**
+- [x] Implement `Planner::run` in `planner.rs` per the algorithm
+      above — pure orchestrator, no LLM calls inside (LLM work is
+      scoped to the worker per todo)
+- [x] Branch in `orchestrator::run_turn` on
+      `planner_enabled`: existing path or `Planner::run`
+- [x] `config.yaml`: `agent.planner_enabled: false` by default with
+      an inline comment explaining the rollout
+- [x] `start_task` reads the flag at command entry, not per-todo,
+      so a long task doesn't switch modes mid-flight
+- [x] On per-todo failure, the planner's "replan" decision is
+      itself deterministic (heuristic, not LLM): if the failed
+      todo's `acceptance` was `AnySnapshot` and 3 retries failed,
+      mark `Exhausted` and move on; otherwise `Replan` once
+- [x] End-of-task `synthesize_reply` includes a per-todo
+      summary table in the chat, not just a one-liner — the user
+      should see "T1 done · T2 done · T3 skipped (deadline)"
+- [x] Update `phase2_instagram_regression` and `phase3_round_trip`
+      to be mode-agnostic: both must pass with
+      `planner_enabled: true` and `planner_enabled: false`
+- [x] Update `phase5_live_progress` so the per-todo `ProgressLine`
+      stream is the new mode-of-truth (and the old "N steps" pill
+      still works under the legacy mode)
+
+**Acceptance:**
+- Flip `planner_enabled: true` in `config.yaml`, restart the
+  Tauri app, run the three motivating scenarios from `proj.md`,
+  all three pass:
+  1. *"Visit instagram and text my friend hi"* — todos: `navigate
+     instagram`, `send hi`; both `Done` with evidence.
+  2. *"Any browser task"* — the chat summary shows per-todo status.
+  3. *"Multi-platform job search"* — the existing Phase 7
+     `ResearchPlanner` output is *itself* a todo, with one
+     sub-todo per platform. The per-platform sub-todos in turn
+     run on the worker; the `max_iterations: 100` cap from
+     `config.yaml` is checked per-worker-task, not per-task
+     (verify in the trace file — a 5-platform search hits ~500
+     iterations, not 100, with the per-worker cap reset between
+     platforms).
+- Flip back to `false`; the legacy `ChatAgent → BrowserAgent`
+  flow still passes all existing examples.
+
+**The iteration-cap gotcha (call it out before the PR):**
+The shipped `max_iterations: 100` is enforced inside
+`agent.rs::run_inner` *per ReAct loop*. In legacy mode, one
+user message = one ReAct loop = one cap. In planner mode, one
+user message = N todos, each with its own ReAct loop. If the
+cap is left as a global single value, a 5-todo research task
+trips it after 20 iterations per todo. The fix is to
+re-initialize the iteration counter per `Todo` (i.e. when the
+worker calls `submit` it passes a fresh `Handoff` whose
+`max_iterations` comes from the per-todo `TodoBudget`, not from
+the global config). The checklist item below is the regression
+test for this.
+
+**Additional checklist item (replaces the bullet above):**
+- [ ] Regression test: a 3-todo task that would have hit the
+      100-iteration cap in legacy mode completes cleanly in
+      planner mode because each todo's counter resets at submit
+      time. Assert: the trace shows three separate iteration
+      spans, each capped at `TodoBudget.max_iterations`, not one
+      shared counter
+
+---
+
+## Phase 17 — Evaluation harness for the planner-worker contract
+
+**Goal:** Extend `mew_agent::eval` with scenarios that *fail* the
+planner-worker contract if the worker shortcuts. The eval scenarios
+are the regression net for the "no shortcut" claim.
+
+**Reuses:**
+- `mew_agent::eval::assertions` — the existing reusable handoff
+      assertions.
+- `mew_resilience` mock-page fixtures — same as the Phase 6 unit
+      tests.
+
+**Files to touch:**
+- `mew-agent/src/eval/scenarios/planner_worker_shortcut.rs` (new) —
+      three scenarios: accept-on-match, reject-on-mismatch, retry-
+      on-stale-evidence.
+- `mew-agent/src/eval/assertions.rs` — new
+      `assert_todo_done(todo, evidence)` and
+      `assert_todo_rejected(todo, reason)` helpers.
+- `mew-agent/src/eval/harness.rs` — wire the new scenarios behind
+      the `eval` feature flag (already opt-in).
+- `mew-agent/src/eval/runner.rs` — run all planner scenarios in
+      sequence, report pass/fail per scenario.
+- `docs/eval-history.md` — append a Phase 17 section with the
+      pass-rate (should be 100% on first commit; future regressions
+      land here).
+
+**Three must-have scenarios:**
+1. **Happy path.** Worker reports `Done` with signature matching
+   planner's. Assert: todo transitions to `Done`, evidence
+   populated, `attempts == 1`.
+2. **Worker shortcut.** Worker reports `Done` with a *fake*
+   signature. Assert: todo stays `Pending`, `attempts == 2` after
+   retry, eventual `Rejected` on second mismatch.
+3. **Stale evidence.** Worker re-uses a signature from a previous
+   todo. Assert: rejected as `StaleEvidence`, todo `Pending`.
+
+**Checklist:**
+- [ ] `eval/scenarios/planner_worker_shortcut.rs` with the three
+      scenarios above
+- [ ] `eval/assertions.rs::assert_todo_done` checks
+      `status == Done ∧ evidence.is_some() ∧ evidence.worker ==
+      evidence.planner`
+- [ ] `eval/assertions.rs::assert_todo_rejected` checks
+      `status != Done ∧ attempts > 1 ∧ rejected_reason.is_some()`
+- [ ] `eval/harness.rs` runs the new scenarios and reports
+      per-scenario pass/fail
+- [ ] `docs/eval-history.md` has a Phase 17 row: `phase 17: 3/3
+      passing` (or a regression table if anything's red)
+- [ ] CI: `cargo test --features eval -p mew-agent` is the same
+      single command that catches Phase 9 regressions *and* Phase
+      17 regressions
+- [ ] Add `mew-cli/src/bin/phase17_planner_eval.rs` example so a
+      developer can run just the planner scenarios without the
+      full eval gate
+- [ ] Document the eval scenarios in `proj.md` §2.5.9 ("Evaluation
+      harness") — add a Phase 17 paragraph
+
+**Acceptance:**
+- `cargo test --features eval -p mew-agent` includes the 3 new
+  scenarios, all green.
+- A deliberate regression (comment out the evidence check in
+  Phase 12) causes exactly the 3 new scenarios to fail, and they
+  fail with messages that point at the right module.
+
+---
+
+## Phase 18 — Production hardening for the planner
+
+**Goal:** Trace logging, error paths, and a small ergonomic escape
+hatch so the planner is safe to leave on by default.
+
+**Reuses:**
+- The existing `mew_agent::tracing_layer` (JSONL, opt-in via
+      `MEW_TRACING_DIR`).
+- The existing `error_message::for_user` layer.
+- The existing `Config` schema doc in `proj.md` §5.
+
+**Files to touch:**
+- `mew-agent/src/tracing_layer.rs` — add
+      `trace_todo_lifecycle(todo_id, event)` spans; emit on submit,
+      on every `mark_todo_done` call, on every rejection.
+- `mew-agent/src/error_message.rs` (if not already there) — add
+      `todo_rejected(todo, reason)` and
+      `planner_disabled_fallback(reason)` mappings.
+- `mew-agent/src/budget.rs` — wire per-todo `TodoBudget` to the
+      existing `pacing` and `summarization.budget` configs.
+- `mew-ui/src-tauri/src/lib.rs` — surface the
+      `planner_disabled_fallback` warning as a one-time chat
+      message so the user knows which mode is active.
+- `proj.md` — update the config schema, the architecture diagram,
+      and the "Project status" section to reflect Phase 11-18.
+- `README.md` — flip `planner_enabled` to `true` in the example
+      config and document the per-todo UI.
+
+**The escape hatches (must-have, do not skip):**
+- **Kill switch:** a `stop_task(task_id)` Tauri command that
+  cancels the active todo, sends a final `TodoStateChanged` event
+  with `status: Failed { reason: "stopped by user" }`, and tears
+  down the per-task state in the pool. Wired to a red "Stop"
+  button next to the header pill.
+- **Per-todo timeout knob:** `agent.todo.default_budget_secs` in
+  `config.yaml`, default 120s, hard-clamped 5..=600.
+- **Backpressure (per-task, not per-worker):** the worker pool is
+  single-worker in v1, so worker-level backpressure is trivial
+  (one todo in flight per task at most). What actually needs
+  guarding is the number of *concurrent tasks* in the pool.
+  `agent.todo.max_concurrent_tasks` (default 4) caps how many
+  tasks the pool accepts; a 5th `start_task` returns
+  `BrowserResult::failure("backpressure", "Too many concurrent
+  tasks; wait for one to finish.", None)`. Phase 18's
+  multi-worker grow-up revisits this knob.
+
+**Out of scope for Phase 18 (deferred / explicit non-goals):**
+- **Mode-visible greeting:** the user just set
+  `planner_enabled` in `config.yaml`; they know which mode is
+  active. A system greeting that says "Planner mode: on" is
+  nice-to-have noise, not a safety property. The header pill's
+  "T of N todos" text already tells the user the planner is
+  supervising. Defer until a user actually asks for it.
+
+**Checklist:**
+- [ ] `tracing_layer.rs::trace_todo_lifecycle` is called on every
+      todo submit / mark / reject with `task_id`, `todo_id`, and
+      a `phase` tag (`submit | mark_done | mark_rejected |
+      mark_failed | mark_exhausted | cancel`); the JSONL line
+      is one per event
+- [ ] `error_message::todo_rejected` returns a plain-language
+      sentence, not a JSON dump. Add a unit test: a fixture
+      `EvidenceMismatch { worker: "len:0123abcd", planner:
+      "len:0123abce" }` produces a sentence containing the
+      planner's signature and the words "did not match" — no
+      JSON, no Rust path
+- [ ] `config.yaml` documents the `agent.todo` block:
+      `enabled` (default false), `default_budget_secs` (default
+      120, hard-clamp 5..=600), `max_attempts` (default 3),
+      `max_concurrent_tasks` (default 4),
+      `replan_max_per_task` (default 1)
+- [ ] `stop_task` Tauri command cancels the active todo,
+      sends a final `TodoStateChanged` event with
+      `status: Failed { reason: "stopped by user" }`, and
+      tears down the per-task state in the pool — no orphan
+      `tokio::spawn`s. A test fires `stop_task` mid-ReAct and
+      asserts the worker task is fully joined (not leaked)
+      before `stop_task` returns
+- [ ] Frontend: the header pill becomes a stop button while
+      a task is active; clicking it invokes `stop_task` and
+      the pill returns to `Idle`. Disabled (gray) when no task
+      is active so the user can't fire it accidentally
+- [ ] `proj.md` §5 (Configuration reference) and §2 (Crate
+      ecosystem) reflect the new module; the architecture
+      diagram in §3 shows the planner as a third box
+- [ ] `README.md` example config has `planner_enabled: true`
+      with a comment about the rollout status
+- [ ] `docs/phase17-planner-eval.md` (new) — the eval
+      scenarios and their golden outcomes
+- [ ] `docs/phase18-planner-hardening.md` (new) — the
+      trace format, the kill switch, the backpressure rule
+
+**Acceptance:**
+- A 5-minute manual test: enable planner mode, run a 3-todo
+  task, hit "Stop" mid-flight, see the chat show "task
+  cancelled", restart the app, and the legacy mode still
+  works.
+- `MEW_TRACING_DIR=./trace cargo run --bin phase17_planner_eval`
+  produces a JSONL file with one line per todo lifecycle event,
+  every line carrying both `task_id` and `todo_id`.
+- The three motivating scenarios from `proj.md` pass on the
+  first try in planner mode, the chat summary shows the
+  per-todo rollup, and the trace file lets a developer replay
+  the supervisor's decisions.
+
+---
+
+## Cross-phase invariants (verify before each PR merge)
+
+- [ ] `cargo test -p mew-agent` is green at every phase boundary.
+- [ ] `cargo test --features eval -p mew-agent` is green at
+      Phase 17+.
+- [ ] `mew-ui` builds with `npm run build` and produces a bundle.
+- [ ] `phase2_instagram_regression`, `phase3_round_trip`, and
+      `phase7_benchmarks` examples still pass in *both* planner
+      modes (off and on).
+- [ ] No new `unwrap()` in the supervisor or worker paths —
+      every error routes through `error_message::for_user`.
+- [ ] No `println!` or `eprintln!` in `mew-ui/src-tauri` —
+      every log goes through `tracing` or `tauri-plugin-log`.
+- [ ] No new `unsafe` block anywhere in `mew-agent`.
+- [ ] `git diff` of `mew-cdp`, `mew-perception`, `mew-nav`,
+      `mew-resilience` shows zero changes from this work plan.
+      (The four browser-perception crates are read-only from
+      this point forward; if a phase genuinely needs to touch
+      one, that's a sign the phase is too aggressive — split it.)
+
+## Deliberate non-goals (do not "improve" these in any phase)
+
+- **Multi-worker pool (N > 1).** v1 ships with one worker. The
+  API is shaped for growth, but no phase before Phase 18
+  *completes* multi-worker. Don't add it speculatively.
+- **Cryptographic signatures.** The `len:{:08x}` is a hash, not
+  a signature. The worker can collission-attack it if it
+  controls both the obs text and the signature; the defense is
+  the *AX-tree text in the result* (a reviewer can read the
+  text), not a stronger hash. Upgrading to BLAKE3 or HMAC
+  doesn't help because the attacker controls the input. If a
+  real audit threat model emerges, add a third-party
+  perception verifier — not a better hash.
+- **LLM-based replanning.** The "replan" path in Phase 16 is
+  deterministic. An LLM-driven replanner is a separate
+  project; don't bolt it on.
+- **Replacing the legacy `ChatAgent → BrowserAgent` flow.** The
+  legacy path stays supported indefinitely; the new path is
+  opt-in. A "delete the old path" PR will be rejected.
+- **Per-`Todo` LLMs.** Every todo in a task runs on the same
+  worker with the same LLM config. Per-todo model
+  specialization (small model for navigate, big model for
+  write) is a future optimization, not Phase 11–18 work.
+
+---
+
+## Phase status (append-only log)
+
+| Phase | Title | Status |
+| --- | --- | --- |
+| 1 | Core foundation (v1) | shipped |
+| 1.5 | Bug-2 wire fix | shipped |
+| 2 | Reliability & steering (v2) | shipped |
+| 3 | Desktop shell (v3) | shipped |
+| 4 | UI overhaul | shipped |
+| 5 | Live step summarization | shipped |
+| 6 | Resilience core | shipped |
+| 7 | Long-horizon research loop | shipped |
+| 8 | Obstacle & CAPTCHA handling | shipped |
+| 9 | Evaluation harness | shipped |
+| 10 | Production hardening | shipped |
+| 11 | Todo schema and decomposition contract | shipped |
+| 12 | Per-todo evidence gate | shipped |
+| 13 | Browser Agent as long-lived supervised worker | shipped |
+| **14** | **Tauri command surface for the planner** | **not started** |
+| **15** | **Per-todo UI checklist surface** | **not started** |
+| **16** | **Planner outer loop, opt-in via config** | **not started** |
+| **17** | **Evaluation harness for the planner-worker contract** | **not started** |
+| **18** | **Production hardening for the planner** | **not started** |

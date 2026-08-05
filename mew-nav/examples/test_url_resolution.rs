@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
     // Launch the real browser. We use the same `mew_cdp::launch` path the
     // CLI does, with a permissive (None) allowlist — this test isn't
     // exercising the allowlist, only the resolver.
-    let (browser, page, handler_task) = mew_cdp::launch(
+    let (browser, page, handler_task, job) = mew_cdp::launch(
         Some(
             "C:\\Users\\bari2\\Desktop\\mew-agent\\stealth-browser\\chrome.exe".to_string(),
         ),
@@ -350,7 +350,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Clean shutdown — we want to leave the system tidy, not leak chrome.
-    let _ = mew_cdp::shutdown(browser, handler_task).await;
+    let _ = mew_cdp::shutdown(browser, handler_task, job).await;
 
     // Final tally.
     println!();

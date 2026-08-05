@@ -1,0 +1,11 @@
+[package]
+name = "mew-resilience"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+mew-perception = { path = "../mew-perception" }

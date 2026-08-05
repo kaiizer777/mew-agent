@@ -1,0 +1,112 @@
+# mew — sensitive-platform routing table (Phase 2)
+#
+# Domains listed here are routed through a search-engine entry path
+# instead of being directly navigated to. The motivation is documented
+# in docs/bug-1-root-cause.md — platforms with aggressive bot-detection
+# layers (Instagram, Twitter/X, Facebook) trip their own anti-bot
+# classifier when the browser appears on their domain "from nowhere"
+# (no referrer, no prior in-tab history). Routing through
+# google.com/search?q=<site> gives the navigation a natural-looking
+# referrer chain and avoids the bare-direct-nav failure mode.
+#
+# Strategy values:
+#   * "direct"              — same as not being in the table. Listed
+#                             for explicitness (e.g. an audit-friendly
+#                             "we considered this and decided no
+#                             special routing" record).
+#   * "via_search"          — when the LLM says `navigate("instagram")`
+#                             or `navigate("https://www.instagram.com")`,
+#                             the resolver returns
+#                             `https://www.google.com/search?q=instagram.com`
+#                             (the bare canonical host — the previous
+#                             `q=site%3Ainstagram.com` form is no longer
+#                             emitted; see `mew-nav/src/lib.rs`'s
+#                             `build_via_search_url` for why). The LLM
+#                             then has to click the organic result to
+#                             actually land on instagram.com. This is the
+#                             cheap fix.
+#   * "via_search_confirm"  — like `via_search`, but the search query
+#                             is `instagram.com login` (bare host + the
+#                             `login` keyword). The extra keyword nudges
+#                             the search results toward the canonical
+#                             sign-in URL — useful when the LLM is
+#                             about to need an authenticated session
+#                             and you don't want it to land on the
+#                             marketing homepage first.
+#
+# Why we use a separate file instead of a `config.yaml` block:
+#   1. `mew-nav` is a pure-Rust crate; pulling `serde_yaml` (only used
+#      by `mew-agent`'s config) into it would be the wrong dependency
+#      direction. `toml` is a tiny zero-config dep.
+#   2. Operators can edit this list without touching `config.yaml`.
+#   3. It's the hand-off point for Phase 8 (CAPTCHA handling):
+#      `known_to_challenge_bots = true` flips a per-domain flag the
+#      agent uses to slow pacing before a navigation and to seed
+#      the local telemetry at the higher "expected" baseline.
+#      The flag defaults to `false` so pre-Phase-8 entries (with no
+#      field at all) parse unchanged.
+#
+# Matching rules:
+#   * The match key is the **bare host** the navigation is going to,
+#     lowercased and with any leading `www.` stripped.
+#   * `*.example.com` (with the leading `*.`) matches a single
+#     subdomain level. e.g. `*.twitter.com` matches
+#     `mobile.twitter.com` but not `evil.twitter.com.attacker.com`.
+#   * Exact-host entries take precedence over wildcard entries.
+
+# Social — these are the original Phase 2 failure cases.
+# All known to serve challenges; the agent's pre-navigate
+# pacing call uses `is_known_challenger` to inject an extra
+# "I'm a careful browser" delay before the navigation.
+[[entry]]
+domain = "instagram.com"
+strategy = "via_search"
+known_to_challenge_bots = true
+
+[[entry]]
+domain = "www.instagram.com"
+strategy = "via_search"
+known_to_challenge_bots = true
+
+[[entry]]
+domain = "twitter.com"
+strategy = "via_search"
+known_to_challenge_bots = true
+
+[[entry]]
+domain = "x.com"
+strategy = "via_search"
+known_to_challenge_bots = true
+
+[[entry]]
+domain = "facebook.com"
+strategy = "via_search"
+known_to_challenge_bots = true
+
+[[entry]]
+domain = "www.facebook.com"
+strategy = "via_search"
+known_to_challenge_bots = true
+
+# LinkedIn is a known-aggressive bot challenger; confirm-path
+# because the LLM usually needs the login surface immediately.
+[[entry]]
+domain = "linkedin.com"
+strategy = "via_search_confirm"
+known_to_challenge_bots = true
+
+[[entry]]
+domain = "www.linkedin.com"
+strategy = "via_search_confirm"
+known_to_challenge_bots = true
+
+# TikTok — same family.
+[[entry]]
+domain = "tiktok.com"
+strategy = "via_search"
+known_to_challenge_bots = true
+
+[[entry]]
+domain = "www.tiktok.com"
+strategy = "via_search"
+known_to_challenge_bots = true

@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     println!("=== Phase 16.2 runtime check (flag = {label}) ===");
     println!("[INFO] binary_path = {:?}", binary_path);
 
-    let (browser, page, handle) = launch(binary_path.clone(), on).await?;
+    let (browser, page, handle, job) = launch(binary_path.clone(), on).await?;
 
     // Use a data: URL with a unique-per-run fragment so we never hit a
     // cached page from a prior run sharing the same profile.
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
         if !webdriver_hidden { eprintln!("FAIL: stealth patch missing (off mode)"); pass = false; }
     }
 
-    let _ = shutdown(browser, handle).await;
+    let _ = shutdown(browser, handle, job).await;
 
     // ----------------------------------------------------------------------
     // Multi-page session (only when flag is on). This is the "watch the
@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
     // ----------------------------------------------------------------------
     if on {
         println!("\n--- Multi-page session (bullet 1+2) ---");
-        let (browser2, page2, handle2) = launch(binary_path.clone(), on).await?;
+        let (browser2, page2, handle2, job2) = launch(binary_path.clone(), on).await?;
 
         // Page 1: data URL.
         let nonce1 = std::time::SystemTime::now()
@@ -190,7 +190,7 @@ async fn main() -> Result<()> {
             pass = false;
         }
 
-        let _ = shutdown(browser2, handle2).await;
+        let _ = shutdown(browser2, handle2, job2).await;
     }
 
     if pass {

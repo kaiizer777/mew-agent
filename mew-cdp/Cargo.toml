@@ -12,3 +12,34 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror = "2.0.19"
+
+# Phase 3.3 (Bug 2): Windows Job Object support to ensure the
+# chromiumoxide-launched Chromium process is killed when this crate's
+# parent process exits — graceful or not. Without this, a Task
+# Manager "End task" / `Stop-Process -Force` / SIGKILL of the parent
+# leaves the chrome.exe children orphaned (the standard "18 chrome
+# processes after a hard-kill" symptom). Feature-gated to
+# `cfg(windows)`; Unix builds compile this out and use a Drop-based
+# SIGTERM stub (also kills gracefully but not on SIGKILL'd parent —
+# see the module docs in `src/process_lifetime.rs`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+# Phase 5.2 review harness: the `phase5_2_dock` example drives a real
+# agent task (sub-test E) and a real `mew_cdp::launch_headless` (A, B,
+# F). It needs `mew-agent` for the agent loop and for the config
+# loader. Workspace path dep, no separate crate published.
+[dev-dependencies]
+mew-agent = { path = "../mew-agent" }
+
+# Unix (macOS/Linux) stub: Drop-based SIGTERM+SIGKILL for graceful
+# shutdown. Does NOT cover a parent that is itself SIGKILL'd before
+# Drop runs — see the module docs for the limitation and the
+# `prctl(PR_SET_PDEATHSIG)` follow-up.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,153 @@
+# mew — research platform table (Phase 7)
+#
+# This file is the operator-editable list of platforms the
+# long-horizon research loop will fan out to. The motivating
+# case is "find remote SWE job openings and get a contact
+# email, or the URL if no email exists" — but the list is
+# generic: the same machinery works for "find every open
+# GitHub issue tagged good-first-issue in these repos" or
+# "compare pricing across these SaaS pages" by changing the
+# `domain` / `entry_hint` / `acceptance` fields and the goal
+# the user types.
+#
+# Each row is one platform the loop will visit. The agent's
+# budget guard enforces `step_budget` and `time_budget_secs`
+# per row; on overrun, the subtask is marked `Exhausted` and
+# the loop moves on to the next platform.
+#
+# Schema (per [[entry]]):
+#   id              — stable slug. Used as the subtask id and
+#                     for the FindingStore's per-platform filter.
+#                     ASCII alnum + dashes; recommended lowercase.
+#   platform        — human-readable name. Renders in the chat
+#                     list as "[platform]" tag on each finding.
+#   domain          — bare host (lowercased, no leading www.)
+#                     Phase 2's sensitive-platform routing uses
+#                     this to decide between direct navigation
+#                     and search-engine entry. Pre-seeded entries
+#                     are also in `sensitive_platforms.toml` —
+#                     keep them in sync.
+#   entry_hint      — short hint to the LLM about how to enter
+#                     the platform. Free text. Examples:
+#                     "search goal; filter Remote; click first 3".
+#   step_budget     — max tool calls on this platform. 0 means
+#                     "no per-platform cap; rely on the global
+#                     iteration limit." 10 is the default for
+#                     "visit + search + click first 3 results"
+#                     flows.
+#   time_budget_secs — max wall-clock seconds on this platform.
+#                     0 means "no per-platform time cap; rely on
+#                     the overall deadline." 60-90 is the default.
+#   default_query   — default search query if the goal doesn't
+#                     already contain a specific phrase. Empty
+#                     means "use the goal verbatim." The
+#                     orchestrator can override at runtime.
+#
+# Why a separate file (not config.yaml):
+#   1. The research list is a *data* table, not a config knob.
+#      Operators may want to add / remove platforms without
+#      touching the rest of the config.
+#   2. Phase 2's `sensitive_platforms.toml` already establishes
+#      the toml-table convention for "list of domains with
+#      per-row metadata" — same shape, same loader pattern.
+#   3. The research module is a pure-Rust library; the file
+#      lives outside the agent crate's `src/` so it ships
+#      with the workspace, not the binary.
+#
+# Editing this file:
+#   * To add a platform, copy a [[entry]] block and change the
+#     fields. Keep `id` unique and stable — the
+#     `CompletenessTracker` keys on it.
+#   * To remove a platform, delete the block. The agent will
+#     fan out to the remaining platforms. (Operators who want
+#     a platform to stay registered but never be used should
+#     set `step_budget = 0` instead — that signals
+#     "uncapped" to the budget guard, not "skip." A "skip"
+#     row would need a separate `disabled = true` flag; we
+#     don't have that today.)
+#   * To change a default budget, edit the numbers in place.
+#     The values are picked for the "search the goal; click
+#     first 3 results" flow; platforms that need more time
+#     (e.g. one with a slow JS-heavy page) should have a
+#     larger `time_budget_secs`.
+
+# Social / professional networks — these are the platforms
+# the motivating job-search case uses. The agent will visit
+# each, search the goal, and try to surface at least one
+# finding with an email or URL per the default acceptance.
+
+[[entry]]
+id = "linkedin"
+platform = "LinkedIn"
+domain = "linkedin.com"
+entry_hint = "Search the goal; filter Remote; click first 3 results"
+step_budget = 12
+time_budget_secs = 90
+default_query = ""
+
+[[entry]]
+id = "indeed"
+platform = "Indeed"
+domain = "indeed.com"
+entry_hint = "Search the goal; filter Remote"
+step_budget = 10
+time_budget_secs = 75
+default_query = ""
+
+[[entry]]
+id = "wellfound"
+platform = "Wellfound"
+domain = "wellfound.com"
+entry_hint = "Search the goal; click first 3 startup roles"
+step_budget = 10
+time_budget_secs = 75
+default_query = ""
+
+[[entry]]
+id = "weworkremotely"
+platform = "WeWorkRemotely"
+domain = "weworkremotely.com"
+entry_hint = "Search the goal; click first 3 results"
+step_budget = 10
+time_budget_secs = 75
+default_query = ""
+
+[[entry]]
+id = "remoteok"
+platform = "RemoteOK"
+domain = "remoteok.com"
+entry_hint = "Search the goal; click first 3 results"
+step_budget = 8
+time_budget_secs = 60
+default_query = ""
+
+# Aggregators / boards we don't want as a default but which
+# operators commonly enable. Commented out so the default
+# config stays small; uncomment to opt in.
+#
+# [[entry]]
+# id = "glassdoor"
+# platform = "Glassdoor"
+# domain = "glassdoor.com"
+# entry_hint = "Search the goal; filter Remote"
+# step_budget = 10
+# time_budget_secs = 75
+# default_query = ""
+#
+# [[entry]]
+# id = "monster"
+# platform = "Monster"
+# domain = "monster.com"
+# entry_hint = "Search the goal; filter Remote"
+# step_budget = 10
+# time_budget_secs = 75
+# default_query = ""
+#
+# [[entry]]
+# id = "yc"
+# platform = "Y Combinator Work at a Startup"
+# domain = "workatastartup.com"
+# entry_hint = "Search the goal; click first 3 results"
+# step_budget = 10
+# time_budget_secs = 75
+# default_query = ""

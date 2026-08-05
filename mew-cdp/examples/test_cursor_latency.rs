@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     let label = if on { "ON" } else { "OFF" };
     println!("=== Phase 16.2 latency check (flag = {label}) ===");
 
-    let (browser, page, handle) = launch(None, on).await?;
+    let (browser, page, handle, job) = launch(None, on).await?;
 
     let data_url = "data:text/html,<html><body><button id=b>Click</button><div id=o></div><script>document.getElementById('b').onclick=function(){document.getElementById('o').textContent='C';};</script></body></html>";
     page.goto(data_url).await?.wait_for_navigation().await?;
@@ -95,6 +95,6 @@ async fn main() -> Result<()> {
     println!("median cursor overhead:  {} ms", full_med as i128 - bare_med as i128);
     println!("(includes 200ms slide sleep + 1 box-model call + 1 ripple evaluate)");
 
-    let _ = shutdown(browser, handle).await;
+    let _ = shutdown(browser, handle, job).await;
     Ok(())
 }

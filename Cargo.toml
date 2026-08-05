@@ -4,6 +4,7 @@ members = [
     "mew-cdp",
     "mew-perception",
     "mew-nav",
+    "mew-resilience",
     "mew-agent",
     "mew-cli",
     "mew-ui/src-tauri",
@@ -25,5 +26,18 @@ reqwest = { version = "0.12", features = ["json"] }
 anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Default features are OFF on purpose. The `tracing-subscriber` 0.3 default
+# set pulls in `tracing-log`, which makes every `tracing_subscriber::registry()
+# .try_init()` call install a `LogTracer` and *claim the `log::Log` global*.
+# That collides head-first with `tauri-plugin-log`, which also tries to
+# claim that global inside its setup hook — and panics with
+# "attempted to set a logger after the logging system was already
+# initialized". The Tauri UI's job here is to forward `log::*` events
+# from deps (chromiumoxide, reqwest, etc.) into the webview console via
+# `tauri-plugin-log`, not to install a `tracing` global subscriber. The
+# per-session JSONL tracing side-channel in `mew-agent::tracing_layer`
+# is opt-in via `MEW_TRACING_DIR` and uses its own thread-local
+# override — it does NOT need a `tracing` global.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "registry", "std"] }
 url = "2.5"
+toml = "0.8"

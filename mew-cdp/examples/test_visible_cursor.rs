@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
 
     println!("=== Phase 16.1 — visible cursor overlay verification ===\n");
 
-    let (browser, page, handle) = launch(None, true).await?;
+    let (browser, page, handle, job) = launch(None, true).await?;
     let mut all_pass = true;
     let mut tag = |label: &str, ok: bool, detail: &str| {
         let mark = if ok { "PASS" } else { "FAIL" };
@@ -108,6 +108,6 @@ async fn main() -> Result<()> {
         println!("SOME CHECKS FAILED — see above.");
     }
 
-    let _ = shutdown(browser, handle).await;
+    let _ = shutdown(browser, handle, job).await;
     if all_pass { Ok(()) } else { anyhow::bail!("visible_cursor verification failed") }
 }

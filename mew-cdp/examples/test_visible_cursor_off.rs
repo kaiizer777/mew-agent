@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
     // truly pointer-events: none and does not block real clicks.
     // ----------------------------------------------------------------------
     println!("--- BULLET 3 (real click through click_ref) ---");
-    let (browser, page, handle) = launch(binary_path.clone(), true).await?;
+    let (browser, page, handle, job) = launch(binary_path.clone(), true).await?;
 
     // Navigate to the local test page served by the user from cwd. Use
     // file:// for portability — no need to spin up an HTTP server.
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
     let cursor_after = exists(&page, "!!document.getElementById('__mew-cursor')").await;
     println!("[{}] cursor overlay still present after real click", if cursor_after { "PASS" } else { "FAIL" });
 
-    let _ = shutdown(browser, handle).await;
+    let _ = shutdown(browser, handle, job).await;
 
     // ----------------------------------------------------------------------
     // BULLET 4 — turn the flag off, confirm:
@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
     //   d) no extra CDP calls / no measurable latency
     // ----------------------------------------------------------------------
     println!("\n--- BULLET 4 (flag off: true no-op) ---");
-    let (browser2, page2, handle2) = launch(binary_path.clone(), false).await?;
+    let (browser2, page2, handle2, job2) = launch(binary_path.clone(), false).await?;
     page2.goto(&url).await?.wait_for_navigation().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -173,7 +173,7 @@ async fn main() -> Result<()> {
     println!("[{}] real click still works with flag off ({}ms) — thread-bob .sent = {}",
         if sent_off { "PASS" } else { "FAIL" }, off_click_dur.as_millis(), sent_off);
 
-    let _ = shutdown(browser2, handle2).await;
+    let _ = shutdown(browser2, handle2, job2).await;
 
     // Latency comparison: with-flag-on click above ran the cursor
     // pre-move (compute_element_center + move_cursor_and_ripple) + the
@@ -194,7 +194,7 @@ async fn main() -> Result<()> {
     if binary_path.is_none() {
         println!("[SKIP] no stealth binary in config — cannot run bullet 5");
     } else {
-        let (browser3, page3, handle3) = launch(binary_path.clone(), true).await?;
+        let (browser3, page3, handle3, job3) = launch(binary_path.clone(), true).await?;
         page3.goto("data:text/html,<html><body>x</body></html>").await?.wait_for_navigation().await?;
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -206,7 +206,7 @@ async fn main() -> Result<()> {
         println!("[{}] stealth patch 2: window.chrome.runtime removed", if chrome_runtime_deleted { "PASS" } else { "FAIL" });
         println!("[{}] cursor script still injected alongside stealth", if cursor_present { "PASS" } else { "FAIL" });
 
-        let _ = shutdown(browser3, handle3).await;
+        let _ = shutdown(browser3, handle3, job3).await;
     }
 
     println!("\n=== 16.2 review & testing complete ===");
