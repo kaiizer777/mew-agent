@@ -171,7 +171,7 @@ fn make_test_config() -> mew_agent::ProviderConfig {
 async fn evidence_1_and_2_mid_task_injection() -> anyhow::Result<()> {
     println!("\n=== EVIDENCE 1+2: 5-step task, inject at iter 2 ===");
     let cfg = make_test_config();
-    let mut agent = Agent::new(cfg, "open example.com and click the link");
+    let mut agent = Agent::new(cfg, "open example.com and click the link", None);
     let tx = agent.take_message_sender();
 
     // Background injection: send after a short delay so the message
@@ -297,7 +297,7 @@ async fn evidence_1_and_2_mid_task_injection() -> anyhow::Result<()> {
 async fn evidence_3_mid_task_correction() -> anyhow::Result<()> {
     println!("\n=== EVIDENCE 3: mid-task correction visible to next tool call ===");
     let cfg = make_test_config();
-    let mut agent = Agent::new(cfg, "log in");
+    let mut agent = Agent::new(cfg, "log in", None);
     let tx = agent.take_message_sender();
 
     let mut driver = Driver::new(agent);
@@ -346,7 +346,7 @@ async fn evidence_3_mid_task_correction() -> anyhow::Result<()> {
 async fn evidence_4_burst_none_dropped() -> anyhow::Result<()> {
     println!("\n=== EVIDENCE 4: 4 rapid messages, none dropped ===");
     let cfg = make_test_config();
-    let mut agent = Agent::new(cfg, "do thing");
+    let mut agent = Agent::new(cfg, "do thing", None);
     let tx = agent.take_message_sender();
 
     tx.send(UserMessage::now("burst-1")).await.unwrap();
@@ -423,7 +423,7 @@ async fn evidence_4_burst_none_dropped() -> anyhow::Result<()> {
 async fn evidence_5_long_no_input_noop() -> anyhow::Result<()> {
     println!("\n=== EVIDENCE 5: 30-iter no-input session is a true no-op ===");
     let cfg = make_test_config();
-    let mut agent = Agent::new(cfg, "do nothing");
+    let mut agent = Agent::new(cfg, "do nothing", None);
     // Take the sender and immediately drop it — simulates the case
     // where the user closed stdin before the agent even started.
     let tx = agent.take_message_sender();

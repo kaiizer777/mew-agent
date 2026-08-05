@@ -1,8 +1,30 @@
 pub mod agent;
+pub mod budget;
+pub mod captcha_solver;
+pub mod captcha_telemetry;
 pub mod chat;
+pub mod chat_agent;
+pub mod classify_cache;
 pub mod completeness;
+pub mod end_of_task_passthrough;
+pub mod handoff;
+pub mod orchestrator;
 pub mod pacing;
+pub mod planner;
+pub use planner::{Plan, Planner};
+pub mod resilience;
+pub mod research;
+pub mod router;
 pub mod session;
+pub mod summarizer;
+pub mod supervisor;
+pub mod todo;
+pub mod tracing_layer;
+pub mod worker;
+pub mod worker_pool;
+
+#[cfg(feature = "eval")]
+pub mod eval;
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +67,42 @@ pub struct AgentConfig {
     /// silently slowed.
     #[serde(default)]
     pub pacing: pacing::PacingConfig,
+    /// Phase 5: live step summarization. Controls verbosity
+    /// (concise vs. detailed), the live progress buffer cap,
+    /// and whether the end-of-task LLM summarizer is on.
+    /// Default: concise, 5 lines, LLM on.
+    #[serde(default)]
+    pub summarization: summarizer::SummarizationConfig,
+    /// Phase 7: long-horizon research loop config. When
+    /// `enabled` is true, the orchestrator's handoff builder
+    /// asks the `ResearchPlanner` first and the synthesizer
+    /// routes research-shaped `BrowserResult`s to the
+    /// consolidated renderer. The `platforms` list is
+    /// operator-editable; when empty, the agent falls back
+    /// to `default_job_board_platforms()` so a default
+    /// `mew-agent` install still works out of the box.
+    #[serde(default)]
+    pub research: research::ResearchConfig,
+    /// Phase 8: CAPTCHA / challenge page handling. The
+    /// default is fully disabled — the agent pauses the
+    /// session and messages the user when a challenge is
+    /// detected. Setting `enabled: true` enables an
+    /// opt-in path to delegate the challenge to a solving
+    /// service; **the `mew-agent` build today ships with
+    /// no solver implementation**, so even with
+    /// `enabled: true` the runtime falls back to the
+    /// pause-and-message path with a warning trace
+    /// event. See `mew_agent::captcha_solver` for the
+    /// extension point and
+    /// `docs/phase8-captcha-handling.md` for the
+    /// cost / ToS caveat.
+    #[serde(default)]
+    pub captcha: captcha_solver::CaptchaConfig,
+    /// Phase 14 / 16: when true, user browser tasks flow through the new
+    /// outer Planner loop (classify -> decompose to todos -> supervisor ->
+    /// evidence gate). Default false — legacy single ReAct loop path active.
+    #[serde(default)]
+    pub planner_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

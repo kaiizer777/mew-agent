@@ -290,19 +290,38 @@ pub fn todo_rejected_event(
     TodoRejectedEvent {
         task_id: task_id.to_string(),
         todo_id: todo_id.clone(),
-        worker_signature: mismatch.worker_signature.clone(),
-        planner_signature: mismatch.planner_signature.clone(),
+        evidence: Some(mismatch.clone()),
+        reason: None,
     }
 }
 
-/// Typed view of `OrchestratorEvent::TodoRejected` that lives
-/// in `todo.rs` so the data side can be tested without the
-/// orchestrator's event sink.
+/// Build a `TodoRejectedEvent` for the user-cancel path. Phase 14
+/// `cancel_todo` calls this to construct the event payload before
+/// passing it to `OrchestratorEvent::TodoRejected`.
+pub fn todo_cancelled_event(
+    task_id: &str,
+    todo_id: &TodoId,
+    reason: impl Into<String>,
+) -> TodoRejectedEvent {
+    TodoRejectedEvent {
+        task_id: task_id.to_string(),
+        todo_id: todo_id.clone(),
+        evidence: None,
+        reason: Some(reason.into()),
+    }
+}
+
+/// Typed view of `OrchestratorEvent::TodoRejected` that lives in
+/// `todo.rs` so the data side can be tested without the orchestrator's
+/// event sink. Mirrors the variant shape in `orchestrator.rs` —
+/// exactly one of `evidence` and `reason` is `Some`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoRejectedEvent {
     pub task_id: String,
     pub todo_id: TodoId,
-    pub worker_signature: String,
-    pub planner_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidenceMismatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 

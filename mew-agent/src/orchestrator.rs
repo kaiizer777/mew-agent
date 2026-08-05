@@ -45,6 +45,7 @@ use crate::chat_agent::ChatAgent;
 use crate::handoff::{BrowserResult, BrowserStatus, Handoff};
 use crate::router::{ConversationMessage, Intent};
 use crate::ProviderConfig;
+pub use crate::todo::EvidenceMismatch;
 // Phase 3: use the re-exported `Page` from `mew-cdp` rather
 // than depending on `chromiumoxide` directly. Keeps the
 // orchestrator's public surface free of the
@@ -59,7 +60,8 @@ use std::sync::Arc;
 /// the outside world — the actual `app.emit` calls and the Tauri
 /// Channel live behind a `TurnSink` implementation, which makes
 /// the orchestrator testable without Tauri.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
 pub enum OrchestratorEvent {
     /// A "browser task started" notice. Frontend renders this as
     /// a system message in the chat list ("Working on it…") and
@@ -115,13 +117,31 @@ pub enum OrchestratorEvent {
         step_count: u32,
         summary: String,
     },
-    /// Phase 12: evidence verification mismatch for a todo item.
-    /// The planner rejects the worker's completion claim because the
-    /// snapshot evidence signature did not match the re-hashed tree.
+    /// Phase 14: per-todo state change event emitted as planner advances.
+    TodoStateChanged {
+        task_id: String,
+        todo: crate::todo::Todo,
+    },
+    /// Phase 12 / 14: evidence verification mismatch or rejection for a todo item.
+    /// The planner rejects the worker's completion claim, or the user cancelled the
+    /// todo. Exactly one of `evidence` and `reason` is `Some`:
+    ///   - `evidence` is set when the worker's snapshot signature did not match
+    ///     the planner's re-hash (`Phase 12` no-shortcut rule).
+    ///   - `reason` is set when the user cancelled the todo via the Tauri command
+    ///     surface (`Phase 14` cancel_todo).
+    /// The frontend reducer checks which field is `Some` and renders
+    /// "evidence did not match" vs "cancelled by user" accordingly.
     TodoRejected {
+        task_id: String,
         todo_id: String,
-        worker_signature: String,
-        planner_signature: String,
+        /// Set on Phase 12 evidence-rejection path. Carries the worker-reported
+        /// and planner-recomputed signatures so a reviewer can read both
+        /// without re-running the task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<EvidenceMismatch>,
+        /// Set on Phase 14 user-cancel path. Plain-language reason for the chat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 
@@ -191,6 +211,7 @@ pub trait BrowserAgentFactory: Send + Sync {
 pub async fn run_turn(
     chat_agent: &ChatAgent,
     factory: Arc<dyn BrowserAgentFactory>,
+    pool: Option<Arc<crate::worker_pool::WorkerPool>>,
     sink: Arc<dyn TurnSink>,
     page: Option<&Page>,
     user_message: &str,
@@ -256,8 +277,7 @@ pub async fn run_turn(
             // `dispatch_browser_task` must stay in lockstep
             // on the event sequence — see the doc on
             // `dispatch_browser_task` for the canonical
-            // emission list.
-            dispatch_browser_task(chat_agent, factory, sink, page, handoff, history).await
+            dispatch_browser_task(chat_agent, factory, pool, sink, page, handoff, history).await
         }
     }
 }
@@ -284,8 +304,9 @@ pub async fn run_turn(
 pub async fn dispatch_browser_task(
     chat_agent: &ChatAgent,
     factory: Arc<dyn BrowserAgentFactory>,
+    pool: Option<Arc<crate::worker_pool::WorkerPool>>,
     sink: Arc<dyn TurnSink>,
-    page: &Page,
+    _page: &Page,
     handoff: Handoff,
     history: &[ConversationMessage],
 ) -> anyhow::Result<String> {
@@ -316,30 +337,26 @@ pub async fn dispatch_browser_task(
     // `BrowserResult` so the synthesis step still produces
     // a chat reply. This is the "never silent on the error
     // path" guarantee the Phase 3 spec calls out.
-    let fut = factory.run_browser_task(handoff.clone());
-    let result = match fut.await {
-        Ok(r) => r,
-        Err(e) => {
-            // Phase 10.1: the catch-all factory error is what the
-            // user sees when Chrome can't launch, the page is
-            // already gone, or the agent runtime is wedged. The
-            // old format string leaked the full anyhow chain into
-            // the `failure_reason` — that flows straight into the
-            // chat-reply payload and the user got internal Rust
-            // text. Keep the full chain in the trace; surface a
-            // short, actionable line in the chat.
-            tracing::error!(
-                event = "orchestrator_factory_error",
-                error = %e,
-                originating_message_id = %handoff.originating_message_id,
-                "BrowserAgentFactory returned an error; converting to Failed BrowserResult"
-            );
-            BrowserResult::failure(
-                "unknown-session",
-                "I couldn't start the browser task. The browser may not be reachable — try again, and if it keeps failing, restart the app."
-                    .to_string(),
-                None,
-            )
+    let result = if chat_agent.config().agent.planner_enabled && pool.is_some() {
+        crate::planner::Planner::run(handoff.clone(), pool.unwrap(), sink.clone()).await
+    } else {
+        let fut = factory.run_browser_task(handoff.clone());
+        match fut.await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    event = "orchestrator_factory_error",
+                    error = %e,
+                    originating_message_id = %handoff.originating_message_id,
+                    "BrowserAgentFactory returned an error; converting to Failed BrowserResult"
+                );
+                BrowserResult::failure(
+                    "unknown-session",
+                    "I couldn't start the browser task. The browser may not be reachable — try again, and if it keeps failing, restart the app."
+                        .to_string(),
+                    None,
+                )
+            }
         }
     };
     sink.emit(OrchestratorEvent::BrowserResultReady {
@@ -574,6 +591,7 @@ mod tests {
     /// without touching Chrome. The test uses this to drive
     /// the full `ChatAgent -> BrowserAgent -> ChatAgent` round
     /// trip in milliseconds, no LLM, no network.
+    #[allow(dead_code)]
     struct MockFactory {
         result: BrowserResult,
     }

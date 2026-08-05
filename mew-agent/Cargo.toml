@@ -3,6 +3,18 @@ name = "mew-agent"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Phase 9: the evaluation harness. The harness is opt-in because
+# (a) it adds the `mew-resilience` mock-fixture module to the dep
+# graph and (b) the runner is the right place for future
+# live-LLM integration (kept out of the default build until that
+# work lands). `cargo test --features eval -p mew-agent` runs the
+# full regression suite; `cargo test -p mew-agent` (default)
+# skips the eval-gated tests so a CI run on a host without the
+# fixtures dir can still pass.
+default = []
+eval = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,6 +28,12 @@ tracing-subscriber = { workspace = true }
 mew-cdp = { path = "../mew-cdp" }
 mew-perception = { path = "../mew-perception" }
 mew-nav = { path = "../mew-nav" }
+mew-resilience = { path = "../mew-resilience" }
 chromiumoxide = { workspace = true }
 url = { workspace = true }
 rand = "0.8"
+toml = "0.8"
+
+[[example]]
+name = "phase9_eval_harness"
+required-features = ["eval"]

@@ -34,11 +34,21 @@
 
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Deserialize, Serialize};
 
 /// Why a subtask ended in the state it's in now. The end-of-session
 /// summary includes this so a "skipped on purpose" is reported, not
 /// silently lumped in with "failed".
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Phase 7 adds `Exhausted` as a fourth terminal state, distinct
+/// from `Failed`. `Failed` means "I tried and the action broke" —
+/// a real failure the user needs to know about. `Exhausted` means
+/// "I looked, the platform didn't have it" — a research-shaped
+/// subtask on a platform that returned no qualifying rows. The
+/// long-horizon research loop needs this distinction because the
+/// *desired* behavior on a platform with no result is "move to the
+/// next platform," not "abort the whole task."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubTaskStatus {
     /// Subtask is on the list but not yet attempted or not yet verified.
     Pending,
@@ -50,6 +60,16 @@ pub enum SubTaskStatus {
     /// Subtask was attempted but the action failed or the model could
     /// not verify the outcome with a fresh snapshot.
     Failed { reason: String },
+    /// Phase 7: the platform was searched but no result satisfied the
+    /// acceptance criteria, OR the per-platform step/time budget ran
+    /// out before a result was found. The reason is the synthesizer-
+    /// facing explanation: "no listings matched", "step budget
+    /// exhausted", "time budget exhausted: 90s", etc. The
+    /// long-horizon loop treats this as a *successful* no-op for
+    /// the platform and moves on; only the user-facing synthesis
+    /// distinguishes "exhausted" from "found nothing" via the
+    /// reason string.
+    Exhausted { reason: String },
 }
 
 impl SubTaskStatus {
@@ -59,6 +79,7 @@ impl SubTaskStatus {
             SubTaskStatus::Done => "done",
             SubTaskStatus::Skipped { .. } => "skipped",
             SubTaskStatus::Failed { .. } => "failed",
+            SubTaskStatus::Exhausted { .. } => "exhausted",
         }
     }
 
@@ -68,7 +89,21 @@ impl SubTaskStatus {
             SubTaskStatus::Done => None,
             SubTaskStatus::Skipped { reason } => Some(reason.as_str()),
             SubTaskStatus::Failed { reason } => Some(reason.as_str()),
+            SubTaskStatus::Exhausted { reason } => Some(reason.as_str()),
         }
+    }
+
+    /// True when this status is terminal — the loop will not return
+    /// to it. Used by `incomplete_count` to count "still open"
+    /// subtasks. All four non-Pending statuses are terminal.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            SubTaskStatus::Done
+                | SubTaskStatus::Skipped { .. }
+                | SubTaskStatus::Failed { .. }
+                | SubTaskStatus::Exhausted { .. }
+        )
     }
 }
 
@@ -106,6 +141,11 @@ pub enum MarkOutcome {
     },
     /// Subtask moved to Skipped with the model's reason.
     MarkedSkipped { reason: String },
+    /// Phase 7: subtask moved to Exhausted with the budget guard's
+    /// reason. Distinct from `MarkedSkipped` and `MarkedDone` so
+    /// callers can branch on it. The long-horizon loop's budget
+    /// guard is the only caller.
+    MarkedExhausted { reason: String },
     /// No such id in the tracker.
     UnknownId,
     /// Evidence was rejected: no fresh snapshot since the last mark.
@@ -156,11 +196,13 @@ impl CompletenessTracker {
     }
 
     /// Convenience: how many subtasks are not yet in a terminal state.
-    /// Used by the gate. `Pending` counts as non-terminal.
+    /// Used by the gate. `Pending` counts as non-terminal; all four
+    /// terminal statuses (Done / Skipped / Failed / Exhausted) count
+    /// as completed-for-the-gate.
     pub fn incomplete_count(&self) -> usize {
         self.subtasks
             .iter()
-            .filter(|s| !matches!(s.status, SubTaskStatus::Done | SubTaskStatus::Skipped { .. } | SubTaskStatus::Failed { .. }))
+            .filter(|s| !s.status.is_terminal())
             .count()
     }
 
@@ -216,7 +258,8 @@ impl CompletenessTracker {
         match &sub.status {
             SubTaskStatus::Done
             | SubTaskStatus::Skipped { .. }
-            | SubTaskStatus::Failed { .. } => {
+            | SubTaskStatus::Failed { .. }
+            | SubTaskStatus::Exhausted { .. } => {
                 let current = sub.status.clone();
                 return MarkOutcome::AlreadyTerminal { current };
             }
@@ -270,7 +313,8 @@ impl CompletenessTracker {
         match &sub.status {
             SubTaskStatus::Done
             | SubTaskStatus::Skipped { .. }
-            | SubTaskStatus::Failed { .. } => {
+            | SubTaskStatus::Failed { .. }
+            | SubTaskStatus::Exhausted { .. } => {
                 let current = sub.status.clone();
                 return MarkOutcome::AlreadyTerminal { current };
             }
@@ -292,7 +336,8 @@ impl CompletenessTracker {
         match &sub.status {
             SubTaskStatus::Done
             | SubTaskStatus::Skipped { .. }
-            | SubTaskStatus::Failed { .. } => {
+            | SubTaskStatus::Failed { .. }
+            | SubTaskStatus::Exhausted { .. } => {
                 let current = sub.status.clone();
                 return MarkOutcome::AlreadyTerminal { current };
             }
@@ -303,12 +348,46 @@ impl CompletenessTracker {
         MarkOutcome::MarkedSkipped { reason }
     }
 
+    /// Phase 7: mark a subtask `Exhausted`. Distinct from `Failed`:
+    /// the agent looked, the platform didn't have it (or the
+    /// per-platform step/time budget ran out). The reason is
+    /// surfaced verbatim in the synthesis so the user can tell
+    /// "no results on this platform" from "the platform crashed."
+    ///
+    /// Like `Skipped` and `Failed`, this is a terminal status and
+    /// does *not* require a fresh snapshot — the budget guard's
+    /// reason is the evidence. The long-horizon loop treats an
+    /// `Exhausted` as a *successful* no-op for the platform and
+    /// moves on to the next one.
+    pub fn mark_exhausted(&mut self, id: &str, reason: String) -> MarkOutcome {
+        let Some(sub) = self.subtasks.iter_mut().find(|s| s.id == id) else {
+            return MarkOutcome::UnknownId;
+        };
+        match &sub.status {
+            SubTaskStatus::Done
+            | SubTaskStatus::Skipped { .. }
+            | SubTaskStatus::Failed { .. }
+            | SubTaskStatus::Exhausted { .. } => {
+                let current = sub.status.clone();
+                return MarkOutcome::AlreadyTerminal { current };
+            }
+            SubTaskStatus::Pending => {}
+        }
+        sub.status = SubTaskStatus::Exhausted { reason: reason.clone() };
+        sub.decided_at_secs = Some(now_secs());
+        MarkOutcome::MarkedExhausted { reason }
+    }
+
     /// `true` if the gate would let `finish()` through right now. The
     /// gate has two components:
     ///   1. If no subtasks were declared, the gate is a no-op (single
     ///      unit task; not what 15.1 targets).
     ///   2. If subtasks were declared, every one must be in a terminal
-    ///      status (Done / Skipped / Failed).
+    ///      status (Done / Skipped / Failed / Exhausted). Phase 7
+    ///      adds `Exhausted` to the terminal set — a research loop
+    ///      that has *tried every platform* is allowed to finish
+    ///      even when many subtasks are `Exhausted` (the desired
+    ///      behavior: "I looked everywhere; here's what I found").
     /// `finish_attempts` is *not* part of the gate — the loop counts
     /// attempts separately to decide whether to force a snapshot
     /// re-prompt or let `finish()` through.
@@ -343,7 +422,7 @@ impl CompletenessTracker {
         file: Option<&std::fs::File>,
         session_id: &str,
         task_summary: &str,
-    ) {
+    ) -> String {
         let ts = now_secs();
         let mut out = String::new();
         out.push_str(&format!(
@@ -376,14 +455,19 @@ impl CompletenessTracker {
                 .iter()
                 .filter(|s| matches!(s.status, SubTaskStatus::Failed { .. }))
                 .count();
+            let exhausted = self
+                .subtasks
+                .iter()
+                .filter(|s| matches!(s.status, SubTaskStatus::Exhausted { .. }))
+                .count();
             let pending = self
                 .subtasks
                 .iter()
                 .filter(|s| matches!(s.status, SubTaskStatus::Pending))
                 .count();
             out.push_str(&format!(
-                "[{}] [{}] counts: total={} done={} skipped={} failed={} pending={}\n",
-                ts, session_id, total, done, skipped, failed, pending
+                "[{}] [{}] counts: total={} done={} skipped={} failed={} exhausted={} pending={}\n",
+                ts, session_id, total, done, skipped, failed, exhausted, pending
             ));
             if self.gate_triggered {
                 out.push_str(&format!(
@@ -426,6 +510,8 @@ impl CompletenessTracker {
         if let Some(mut f) = file {
             let _ = f.write_all(out.as_bytes());
         }
+        
+        out
     }
 
     /// Short, single-line status for live `println!` output during a
@@ -452,14 +538,19 @@ impl CompletenessTracker {
             .iter()
             .filter(|s| matches!(s.status, SubTaskStatus::Failed { .. }))
             .count();
+        let exhausted = self
+            .subtasks
+            .iter()
+            .filter(|s| matches!(s.status, SubTaskStatus::Exhausted { .. }))
+            .count();
         let pending = self.incomplete_count();
-        // Show all four buckets — "0 pending" alone is misleading when
-        // everything is failed (a real run of the partial-success
-        // scenario showed 0/3 done, 0 pending which looked like a
-        // bug, when really 3/3 had been resolved as failed).
+        // Show all five buckets — "0 pending" alone is misleading when
+        // everything is failed or exhausted (a research loop that
+        // exhausted every platform has 0/0 pending and the user
+        // should see the bucket explicitly).
         format!(
-            "{}/{} done ({} skipped, {} failed), {} pending",
-            done, total, skipped, failed, pending
+            "{}/{} done ({} skipped, {} failed, {} exhausted), {} pending",
+            done, total, skipped, failed, exhausted, pending
         )
     }
 }
@@ -581,6 +672,98 @@ mod tests {
         let t = CompletenessTracker::new();
         assert!(t.gate_open(), "no subtasks declared should be an open gate");
         assert!(!t.has_subtasks());
+    }
+
+    // ---- Phase 7: Exhausted variant tests ----
+
+    #[test]
+    fn exhausted_is_terminal_for_gate_purposes() {
+        // The Phase 7 long-horizon research loop relies on this:
+        // a subtask that the budget guard force-marked Exhausted
+        // counts as done-for-the-gate, so the synthesis step
+        // can run and the user sees the consolidated answer.
+        let mut t = CompletenessTracker::new();
+        t.declare(vec![
+            DeclareItem { id: "a".into(), description: "platform A".into() },
+            DeclareItem { id: "b".into(), description: "platform B".into() },
+        ])
+        .unwrap();
+        // mark_exhausted doesn't need a snapshot.
+        match t.mark_exhausted("a", "step budget exhausted: 10/10".to_string()) {
+            MarkOutcome::MarkedExhausted { reason } => {
+                assert_eq!(reason, "step budget exhausted: 10/10");
+            }
+            other => panic!("expected MarkedExhausted, got {:?}", other),
+        }
+        assert_eq!(t.incomplete_count(), 1, "exhausted should not be incomplete");
+        assert!(!t.gate_open(), "one pending should keep gate closed");
+        t.mark_exhausted("b", "time budget exhausted: 90s".to_string());
+        assert!(t.gate_open(), "two exhausted should open the gate");
+    }
+
+    #[test]
+    fn exhausted_re_declare_is_rejected() {
+        // The "cannot re-declare after any resolution" rule
+        // must include Exhausted in "any" — the same reason as
+        // Skipped/Failed: a re-declare would erase evidence.
+        let mut t = CompletenessTracker::new();
+        t.declare(vec![DeclareItem { id: "a".into(), description: "x".into() }])
+            .unwrap();
+        t.mark_exhausted("a", "no result".to_string());
+        let res = t.declare(vec![DeclareItem { id: "a".into(), description: "y".into() }]);
+        assert!(res.is_err(), "redeclare after Exhausted must be rejected");
+    }
+
+    #[test]
+    fn exhausted_status_string_is_stable() {
+        // The synthesizer and the transcript both key on the
+        // string "exhausted" — same as the other statuses. A
+        // rename is a wire-format break.
+        assert_eq!(
+            SubTaskStatus::Exhausted { reason: "x".into() }.as_str(),
+            "exhausted"
+        );
+        assert_eq!(
+            SubTaskStatus::Exhausted { reason: "x".into() }.reason(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn mark_done_after_exhausted_is_rejected() {
+        // The pre-Phase-7 AlreadyTerminal check must catch
+        // Exhausted too — the LLM can't "rescue" a subtask the
+        // budget guard already closed.
+        let mut t = CompletenessTracker::new();
+        t.declare(vec![DeclareItem { id: "a".into(), description: "x".into() }])
+            .unwrap();
+        t.mark_exhausted("a", "no result".to_string());
+        t.record_snapshot(1, sig("s1"));
+        match t.mark_done("a", &sig("s1")) {
+            MarkOutcome::AlreadyTerminal { current } => {
+                assert!(matches!(current, SubTaskStatus::Exhausted { .. }));
+            }
+            other => panic!("expected AlreadyTerminal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inline_status_shows_exhausted_bucket() {
+        // The terminal/pending summary line on the live progress
+        // pill must include the exhausted count. The Phase 7
+        // user-visible rendering depends on this.
+        let mut t = CompletenessTracker::new();
+        t.declare(vec![
+            DeclareItem { id: "a".into(), description: "x".into() },
+            DeclareItem { id: "b".into(), description: "y".into() },
+            DeclareItem { id: "c".into(), description: "z".into() },
+        ])
+        .unwrap();
+        t.mark_exhausted("a", "no listings matched".to_string());
+        t.mark_exhausted("b", "step budget exhausted".to_string());
+        let s = t.inline_status();
+        assert!(s.contains("2 exhausted"), "inline_status should report the exhausted bucket, got: {s}");
+        assert!(s.contains("1 pending"), "inline_status should still report the remaining pending, got: {s}");
     }
 
     // Tiny test helpers to keep the assertions above readable.

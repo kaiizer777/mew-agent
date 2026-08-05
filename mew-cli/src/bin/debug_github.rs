@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     let out_dir = std::path::PathBuf::from("tests-output").join("debug_github");
     let _ = std::fs::create_dir_all(&out_dir);
 
-    let (browser, page, handle) = launch(binary_path, false).await?;
+    let (browser, page, handle, job) = launch(binary_path, false).await?;
     
     println!("Navigating to https://github.com...");
     let _ = tokio::time::timeout(
@@ -140,6 +140,6 @@ async fn main() -> anyhow::Result<()> {
         println!("No 'Create new' or 'New' interactive node found in first snapshot.");
     }
     
-    mew_cdp::shutdown(browser, handle).await?;
+    mew_cdp::shutdown(browser, handle, job).await?;
     Ok(())
 }

@@ -5,7 +5,7 @@ use mew_perception::extract_tree;
 async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt().try_init();
 
-    let (browser, page, handler_task) = launch(None, false).await?;
+    let (browser, page, handler_task, job) = launch(None, false).await?;
     
     // Create an HTML file that has an input text field and something else
     let html = r#"
@@ -71,6 +71,6 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => println!("SUCCESS: Caught expected stale ref error: {:?}", e),
     }
 
-    shutdown(browser, handler_task).await?;
+    shutdown(browser, handler_task, job).await?;
     Ok(())
 }

@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let task = &args[2];
     
     println!("Launching browser...");
-    let (browser, page, handler) = mew_cdp::launch(
+    let (browser, page, handler, job) = mew_cdp::launch(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
         false,
     ).await?;
@@ -47,10 +47,10 @@ async fn main() -> anyhow::Result<()> {
     let _ = page.goto(url).await?.wait_for_navigation().await;
 
     println!("\nRunning agent on {}...", url);
-    let mut agent_real = Agent::new(config, task);
+    let mut agent_real = Agent::new(config, task, None);
     let res = agent_real.run(&page).await;
     println!("Result of run: {:?}", res);
     
-    mew_cdp::shutdown(browser, handler).await?;
+    mew_cdp::shutdown(browser, handler, job).await?;
     Ok(())
 }

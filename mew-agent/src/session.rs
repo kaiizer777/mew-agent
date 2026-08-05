@@ -23,7 +23,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 
 /// Explicit lifecycle for an agent run. Anything outside this enum is invalid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionState {
     /// Loop is actively iterating.
     Running,
@@ -62,7 +62,7 @@ impl std::fmt::Display for SessionState {
 
 /// What kind of move was just made. Stored in the transition history so the
 /// transcript shows `Running -> Paused (pause)` rather than just the new state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Transition {
     Start,    // initial -> Running
     Pause,    // Running -> Paused
@@ -86,7 +86,7 @@ impl Transition {
 }
 
 /// A single recorded transition. Real wall-clock timestamp in seconds.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransitionRecord {
     pub from: SessionState,
     pub to: SessionState,
@@ -177,6 +177,14 @@ impl Inner {
         if let Some(r) = reason.as_ref() {
             self.last_reason = Some(r.clone());
         }
+        // Phase 1: capture the reason into an owned String *before*
+        // moving the original into the history record. The tracing
+        // event below needs to log the same string, and the borrow
+        // checker will not let us hold a borrow of `reason` past
+        // the move into `history.push`. Cloning once is cheap and
+        // keeps the log independent from the history record (a
+        // reviewer can read either without affecting the other).
+        let reason_for_log: String = reason.clone().unwrap_or_default();
         self.history.push(TransitionRecord {
             from,
             to,
@@ -184,6 +192,22 @@ impl Inner {
             reason,
             timestamp_secs: Self::now_secs(),
         });
+
+        // Phase 1: emit a structured tracing event for every
+        // successful state transition. The agent's session wrapper
+        // also records this in the transcript; the trace log
+        // captures the same fact in a structured, greppable form.
+        // We log via `tracing::info!` (no span) because the
+        // transition is the canonical event — the surrounding
+        // span, when present, is the ReAct loop iteration.
+        tracing::info!(
+            event = "session_transition",
+            from = from.as_str(),
+            to = to.as_str(),
+            kind = kind.as_str(),
+            reason = %reason_for_log,
+            "session state changed"
+        );
 
         // Always notify on a successful transition. A no-op transition (e.g.
         // pause when already paused) is rejected above, so we only fire when

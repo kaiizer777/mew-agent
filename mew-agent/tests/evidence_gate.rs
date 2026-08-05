@@ -1,7 +1,7 @@
 // mew v2 — Phase 12: Per-todo evidence gate tests.
 
 use mew_agent::todo::{
-    planner_signature, todo_rejected_event, verify_evidence, MarkTodoOutcome,
+    planner_signature, todo_cancelled_event, todo_rejected_event, verify_evidence, MarkTodoOutcome,
     Todo, TodoId, TodoStatus,
 };
 
@@ -178,6 +178,23 @@ fn test_todo_rejected_event_carries_task_and_signatures() {
     let event = todo_rejected_event("task-42", &todo.id, &mismatch);
     assert_eq!(event.task_id, "task-42");
     assert_eq!(event.todo_id, todo.id);
-    assert_eq!(event.worker_signature, "len:deadbeef");
-    assert_eq!(event.planner_signature, planner_signature(obs_text));
+    assert!(event.evidence.is_some());
+    assert!(event.reason.is_none());
+    let event_evidence = event.evidence.expect("evidence populated");
+    assert_eq!(event_evidence.worker_signature, "len:deadbeef");
+    assert_eq!(event_evidence.planner_signature, planner_signature(obs_text));
+}
+
+#[test]
+fn test_todo_cancelled_event_carries_reason() {
+    let todo = Todo::new(
+        TodoId::from_slug("send hi", 0),
+        "send hi",
+        None,
+    );
+    let event = todo_cancelled_event("task-99", &todo.id, "user clicked stop");
+    assert_eq!(event.task_id, "task-99");
+    assert_eq!(event.todo_id, todo.id);
+    assert!(event.evidence.is_none());
+    assert_eq!(event.reason.as_deref(), Some("user clicked stop"));
 }

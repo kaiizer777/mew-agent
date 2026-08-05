@@ -511,7 +511,7 @@ fn make_test_config() -> mew_agent::ProviderConfig {
 async fn test_real_agent_integration() {
     println!("\n=== TEST I: real Agent chat API integration ===");
     let cfg = make_test_config();
-    let mut agent = Agent::new(cfg, "open a tab");
+    let mut agent = Agent::new(cfg, "open a tab", None);
 
     // Take the sender and confirm it's a working mpsc sender.
     let tx = agent.take_message_sender();

@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Task: {}", task_desc);
 
     println!("Launching headed Chrome...");
-    let (browser, page, handler_task) = match mew_cdp::launch(
+    let (browser, page, handler_task, job) = match mew_cdp::launch(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
         config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
     ).await {
@@ -54,7 +54,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("Starting agent loop...");
-    let mut agent = mew_agent::agent::Agent::new(config, &task_desc);
+    // Phase 4 (Bug 3 fix): explicit `None` for the transcript dir
+    // keeps the historical `./transcripts/` behavior. The CLI runs
+    // from the workspace root, so the path lands at
+    // `<workspace>/transcripts/` — gitignored by `.gitignore`'s
+    // `/transcripts/` rule, and outside the Tauri dev watcher's
+    // scope (the CLI doesn't run under `cargo tauri dev`).
+    let mut agent = mew_agent::agent::Agent::new(config, &task_desc, None);
 
     // Phase 13.1: wire the live chat channel. Take the sender half from
     // the agent's MessageBus and hand it to the stdin reader thread. The
@@ -76,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Shutting down browser cleanly...");
-    if let Err(e) = mew_cdp::shutdown(browser, handler_task).await {
+    if let Err(e) = mew_cdp::shutdown(browser, handler_task, job).await {
         eprintln!("Error during browser shutdown: {e}");
     } else {
         println!("Browser process closed cleanly.");
