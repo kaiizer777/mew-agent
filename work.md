@@ -681,7 +681,7 @@ the global config). The checklist item below is the regression
 test for this.
 
 **Additional checklist item (replaces the bullet above):**
-- [ ] Regression test: a 3-todo task that would have hit the
+- [x] Regression test: a 3-todo task that would have hit the
       100-iteration cap in legacy mode completes cleanly in
       planner mode because each todo's counter resets at submit
       time. Assert: the trace shows three separate iteration
@@ -928,8 +928,8 @@ hatch so the planner is safe to leave on by default.
 | 11 | Todo schema and decomposition contract | shipped |
 | 12 | Per-todo evidence gate | shipped |
 | 13 | Browser Agent as long-lived supervised worker | shipped |
-| **14** | **Tauri command surface for the planner** | **not started** |
-| **15** | **Per-todo UI checklist surface** | **not started** |
-| **16** | **Planner outer loop, opt-in via config** | **not started** |
+| 14 | Tauri command surface for the planner | shipped |
+| 15 | Per-todo UI checklist surface | shipped |
+| 16 | Planner outer loop, opt-in via config | shipped |
 | **17** | **Evaluation harness for the planner-worker contract** | **not started** |
 | **18** | **Production hardening for the planner** | **not started** |
