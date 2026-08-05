@@ -84,6 +84,9 @@ fn for_user_from_detail(detail: &str, context: &str) -> String {
     if let Some(msg) = match_screenshot(detail) {
         return msg;
     }
+    if let Some(msg) = match_planner(detail) {
+        return msg;
+    }
 
     // Generic fallback. Never empty, never internal, never blames
     // the user. The action is implied by the verb phrase the
@@ -202,6 +205,29 @@ fn match_screenshot(detail: &str) -> Option<String> {
     None
 }
 
+/// Map Phase 14 planner and todo command failures.
+fn match_planner(detail: &str) -> Option<String> {
+    if detail.contains("not yet implemented") {
+        return Some("This action is not yet implemented.".to_string());
+    }
+    if detail.contains("worker pool is busy") || detail.contains("max in-flight capacity") {
+        return Some(
+            "The agent is currently busy with another task. Please wait for it to complete or stop it before starting a new one."
+                .to_string(),
+        );
+    }
+    if detail.contains("worker pool is shutting down") {
+        return Some("The system is shutting down. Please restart the application.".to_string());
+    }
+    if detail.contains("task not found") || detail.contains("unknown task_id") {
+        return Some("The requested task could not be found or has already finished.".to_string());
+    }
+    if detail.contains("todo not found") || detail.contains("unknown todo_id") {
+        return Some("The specified subtask was not found.".to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,11 +283,27 @@ mod tests {
     }
 
     #[test]
-    fn error_message_never_empty() {
-        // A regression here is a regression on the Phase 3
-        // "user always sees something" guarantee. Lock it.
-        let err = anyhow!("");
-        let msg = for_user(&err, "anything");
+    fn planner_busy_error_yields_user_facing_message() {
+        let err = anyhow!("worker pool is busy (max in-flight capacity reached)");
+        let msg = for_user(&err, "submit todo");
+        assert!(msg.contains("currently busy"));
+        assert!(!msg.contains("max in-flight capacity"));
+    }
+
+    #[test]
+    fn planner_not_implemented_error_yields_user_facing_message() {
+        let err = anyhow!("not yet implemented");
+        let msg = for_user(&err, "stop task");
+        assert!(msg.contains("not yet implemented"));
+        assert!(!msg.contains("{"));
+    }
+
+    #[test]
+    fn error_message_never_empty_and_never_json_dump() {
+        let err = anyhow!("{{\"code\": 500, \"details\": \"internal failure\"}}");
+        let msg = for_user(&err, "execute command");
         assert!(!msg.is_empty());
+        assert!(!msg.starts_with("{"));
     }
 }
+

@@ -25,6 +25,14 @@ tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 mew-agent = { workspace = true }
 mew-cdp = { workspace = true }
+# Phase 16.2: direct chromiumoxide dep is needed because the
+# pre-navigate to a "Loading…" data URL uses
+# `chromiumoxide::cdp::browser_protocol::page::NavigateParams`
+# directly. (`mew-cdp` re-exports `chromiumoxide::Page` but not
+# every CDP param type, and adding a re-export just for one
+# struct is the wrong call — the Tauri shell is the only place
+# this pre-navigate happens.)
+chromiumoxide = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 # Phase 1: structured tracing spans around the UI -> agent handoff
@@ -35,3 +43,7 @@ tracing = { workspace = true }
 # agent emits are quiet in release (`warn`-and-up) and detailed
 # in debug (`info`-and-up). Override at runtime with RUST_LOG.
 tracing-subscriber = { workspace = true }
+# Phase 14: planner commands, supervisor token, and task handle UUIDs
+tokio-util = "0.7"
+uuid = { version = "1.10", features = ["v4"] }
+

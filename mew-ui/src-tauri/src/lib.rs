@@ -50,7 +50,57 @@ struct ActiveSession {
     originating_message_id: String,
 }
 
-#[derive(Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct TaskHandle {
+    pub task_id: String,
+    pub todos: Vec<mew_agent::todo::Todo>,
+}
+
+/// Factory for BrowserAgentWorker in the Tauri shell.
+struct TauriWorkerFactory {
+    app_handle: AppHandle,
+}
+
+impl mew_agent::orchestrator::BrowserAgentFactory for TauriWorkerFactory {
+    fn run_browser_task<'a>(
+        &'a self,
+        handoff: mew_agent::handoff::Handoff,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<mew_agent::handoff::BrowserResult>> + Send + 'a>,
+    > {
+        let app_handle = self.app_handle.clone();
+        Box::pin(async move {
+            let config = load_config()?;
+            let (browser, page, handler_task, job) = mew_cdp::launch_headless(
+                config.browser.as_ref().and_then(|b| b.binary_path.clone()),
+                config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
+            ).await?;
+
+            let transcript_dir = app_handle.path().app_data_dir().ok().map(|d| d.join("transcripts"));
+            let mut agent = mew_agent::agent::Agent::new(config, &handoff.task_description, transcript_dir);
+            let session_id = agent.session_id().to_string();
+
+            let res = agent.run(&page).await;
+            let _ = mew_cdp::shutdown(browser, handler_task, job).await;
+
+            match res {
+                Ok(text) => Ok(mew_agent::handoff::BrowserResult::done(
+                    session_id,
+                    text,
+                    Vec::new(),
+                    None,
+                    None,
+                )),
+                Err(e) => Ok(mew_agent::handoff::BrowserResult::failure(
+                    session_id,
+                    format!("{e}"),
+                    None,
+                )),
+            }
+        })
+    }
+}
+
 struct AppState {
     active_session: Arc<Mutex<Option<ActiveSession>>>,
     /// Phase 10.4: shared in-process classify cache. Re-used
@@ -59,6 +109,40 @@ struct AppState {
     /// LLM round trip. `Arc` so every spawned task can clone
     /// it cheaply.
     classify_cache: Arc<mew_agent::classify_cache::ClassifyCache>,
+    /// Phase 14: long-lived worker pool for outer Planner execution.
+    worker_pool: std::sync::Mutex<Option<Arc<mew_agent::worker_pool::WorkerPool>>>,
+    signal_counter: std::sync::atomic::AtomicU64,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            active_session: Arc::new(Mutex::new(None)),
+            classify_cache: Arc::new(mew_agent::classify_cache::ClassifyCache::default()),
+            worker_pool: std::sync::Mutex::new(None),
+            signal_counter: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
+impl AppState {
+    pub fn get_or_init_worker_pool(&self, app_handle: &AppHandle) -> Arc<mew_agent::worker_pool::WorkerPool> {
+        let mut lock = self.worker_pool.lock().expect("worker pool lock poisoned");
+        if let Some(pool) = lock.as_ref() {
+            return pool.clone();
+        }
+
+        let factory: Arc<dyn mew_agent::orchestrator::BrowserAgentFactory> =
+            Arc::new(TauriWorkerFactory { app_handle: app_handle.clone() });
+        let worker = mew_agent::worker::BrowserAgentWorker::new("worker-1", factory);
+        let pool = Arc::new(mew_agent::worker_pool::WorkerPool::new(vec![worker]));
+        *lock = Some(pool.clone());
+        pool
+    }
+
+    pub fn next_signal_id(&self) -> u64 {
+        self.signal_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Phase 3: Tauri implementation of the orchestrator's
@@ -169,6 +253,32 @@ impl TurnSink for TauriSink {
                         "summary": summary,
                     }),
                 );
+            }
+            OrchestratorEvent::TodoStateChanged { task_id, todo } => {
+                let _ = self.app_handle.emit(
+                    "todo-state-changed",
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "todo": todo,
+                    }),
+                );
+            }
+            OrchestratorEvent::TodoRejected { task_id, todo_id, evidence, reason } => {
+                let mut payload = serde_json::json!({
+                    "task_id": task_id,
+                    "todo_id": todo_id,
+                });
+                if let Some(ev) = evidence {
+                    payload["evidence"] = serde_json::json!({
+                        "worker_signature": ev.worker_signature,
+                        "planner_signature": ev.planner_signature,
+                        "reason": ev.reason,
+                    });
+                }
+                if let Some(r) = reason {
+                    payload["reason"] = serde_json::Value::String(r);
+                }
+                let _ = self.app_handle.emit("todo-rejected", payload);
             }
         }
     }
@@ -336,6 +446,11 @@ async fn send_message(
             let cfg_clone = cfg.clone();
             let task_clone = task.clone();
             let chat_agent_clone = ChatAgent::new(cfg.clone());
+            let pool_for_task = if cfg.agent.planner_enabled {
+                Some(state.get_or_init_worker_pool(&app_handle))
+            } else {
+                None
+            };
 
             // Phase 10.1: the spawned task needs `app_handle` for
             // both the browser-task work (moved into
@@ -353,8 +468,9 @@ async fn send_message(
                     task_clone,
                     cfg_clone,
                     state_clone,
+                    pool_for_task,
                     app_clone,
-                    on_event,
+                    Some(on_event),
                     chat_agent_clone,
                 )
                 .await
@@ -393,8 +509,9 @@ async fn run_browser_task(
     task_desc: String,
     config: ProviderConfig,
     state: Arc<Mutex<Option<ActiveSession>>>,
+    pool: Option<Arc<mew_agent::worker_pool::WorkerPool>>,
     app_handle: AppHandle,
-    on_event: tauri::ipc::Channel<mew_agent::agent::AgentEvent>,
+    on_event: Option<tauri::ipc::Channel<mew_agent::agent::AgentEvent>>,
     chat_agent: ChatAgent,
 ) -> anyhow::Result<()> {
     // Phase 1: span the browser task end-to-end. The handoff
@@ -412,7 +529,7 @@ async fn run_browser_task(
 
     // Headless launch: no OS window, no taskbar entry. The browser is
     // controlled entirely via CDP; the user sees it through the Live
-    // Preview panel (screenshot polling below).
+    // Preview panel (screencast stream + immediate first frame below).
     let (browser, page, handler_task, job) = mew_cdp::launch_headless(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
         config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
@@ -426,47 +543,149 @@ async fn run_browser_task(
     })?;
 
 
-    // Live Preview: poll a JPEG screenshot every 500 ms and push it to
-    // the frontend via the `agent-screencast-frame` event. Using periodic
-    // CDP captureScreenshot instead of Page.startScreencast because
-    // startScreencast is unreliable across Chrome builds/headless modes.
-    // 2 fps is plenty for watching an agent browse.
-    let page_for_shot = page.clone();
+    // ----------------------------------------------------------------
+    // Phase 16.2: live preview, v2.
+    //
+    // Old behavior: a 500 ms `capture_screenshot` poll started
+    // AFTER `launch_headless` returned, AFTER the agent loop
+    // dispatched. The user saw a blank "Waiting for first frame…"
+    // placeholder for 1–3 s (Chrome cold start) + up to 500 ms
+    // (poll cadence) before the first frame painted. By then the
+    // agent had already taken 1–2 ReAct steps and the live
+    // preview was visibly "behind" the chat list.
+    //
+    // New behavior: as soon as Chrome is up, we (a) start a
+    // push-based `Page.startScreencast` stream and (b) take one
+    // synchronous `capture_screenshot` to ship a frame right now.
+    // We also pre-navigate to a small inline "Loading…" data URL
+    // so the first frame shows real browser chrome instead of an
+    // empty white `about:blank` square.
+    //
+    // The screencast pump task lives for the entire browser task;
+    // it exits when the `UnboundedSender` is dropped (i.e. when
+    // `screencast_tx` goes out of scope at the end of this
+    // function, or when `shutdown` closes the underlying browser).
+    // ----------------------------------------------------------------
+    let (screencast_tx, mut screencast_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, i32)>();
     let app_for_shot = app_handle.clone();
-    tauri::async_runtime::spawn(async move {
-        let interval = std::time::Duration::from_millis(500);
-        loop {
-            tokio::time::sleep(interval).await;
-            match mew_cdp::capture_screenshot(&page_for_shot).await {
-                Ok(data) => {
-                    let _ = app_for_shot.emit("agent-screencast-frame", data);
-                }
-                Err(e) => {
-                    // Phase 10.1: the screencast popover goes quiet
-                    // on a CDP screenshot error (the page is gone,
-                    // the browser is gone, etc.). The chat task is
-                    // usually still running on a different
-                    // perception path; warn the user once via the
-                    // chat list so they don't think the whole app
-                    // is frozen, then stop the poll.
+
+    // Pre-navigate the page to a tiny inline "Loading…"
+    // document. This makes the very first frame the user sees
+    // look like a real browser tab loading a page (chrome,
+    // address bar mock, "Loading…" body) instead of an empty
+    // white `about:blank` square. CDP `Page.navigate` is
+    // fire-and-forget for our purposes — the next screencast
+    // frame will pick up the rendered document.
+    {
+        use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
+        let loading_html = "data:text/html;charset=utf-8,\
+<!doctype html><html><head><title>mew agent</title>\
+<style>html,body{margin:0;height:100%;\
+background:linear-gradient(180deg,#f8fafc 0%,#eef2ff 100%);\
+font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\
+color:#1e293b;display:flex;align-items:center;justify-content:center;\
+flex-direction:column}\
+h1{font-weight:500;font-size:14px;letter-spacing:0.04em;margin:0 0 12px;\
+color:#475569}.dot{width:8px;height:8px;border-radius:50%;background:#2563eb;\
+box-shadow:0 0 0 0 rgba(37,99,235,.6);animation:ping 1.4s cubic-bezier(0,0,.2,1) infinite}\
+@keyframes ping{0%{box-shadow:0 0 0 0 rgba(37,99,235,.55)}\
+80%,100%{box-shadow:0 0 0 14px rgba(37,99,235,0)}}</style>\
+</head><body><div class=\"dot\"></div>\
+<h1>mew agent &middot; starting browser&hellip;</h1></body></html>";
+        match NavigateParams::builder().url(loading_html).build() {
+            Ok(nav_params) => {
+                if let Err(e) = page.execute(nav_params).await {
                     tracing::warn!(
-                        event = "screencast_poll_stopped",
+                        event = "live_preview_loading_navigate_failed",
                         error = %e,
-                        "screenshot poll stopped; sending a one-shot chat notice"
+                        "pre-navigate to loading.html failed; falling back to about:blank"
                     );
-                    let user_msg = error_message::for_user(&e, "refresh the live preview");
-                    let _ = app_for_shot.emit(
-                        "chat-reply",
-                        serde_json::json!({
-                            "originating_message_id": String::new(),
-                            "text": user_msg,
-                        }),
-                    );
-                    break;
                 }
             }
+            Err(e) => {
+                tracing::warn!(
+                    event = "live_preview_loading_navigate_build_failed",
+                    error = %e,
+                    "build NavigateParams failed; falling back to about:blank"
+                );
+            }
         }
-    });
+    }
+
+    // Start the push-based screencast + grab a synchronous
+    // first frame so the UI has something to paint the moment
+    // the task returns. This runs concurrently with the agent
+    // dispatch — the user sees the preview fill in *while* the
+    // ReAct loop is thinking.
+    let screencast_started = mew_cdp::start_screencast_with_first_frame(
+        &page,
+        screencast_tx.clone(),
+    )
+    .await
+    .is_ok();
+
+    if !screencast_started {
+        tracing::warn!(
+            event = "live_preview_screencast_start_failed",
+            "start_screencast_with_first_frame failed; falling back to legacy 500ms poll"
+        );
+        // Fallback: keep the old poll-based behavior so a
+        // screencast failure doesn't silently kill the preview.
+        let page_for_shot = page.clone();
+        let app_for_shot_fb = app_for_shot.clone();
+        tauri::async_runtime::spawn(async move {
+            let interval = std::time::Duration::from_millis(500);
+            loop {
+                tokio::time::sleep(interval).await;
+                match mew_cdp::capture_screenshot(&page_for_shot).await {
+                    Ok(data) => {
+                        let _ = app_for_shot_fb.emit("agent-screencast-frame", data);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "screencast_poll_stopped",
+                            error = %e,
+                            "screenshot poll stopped; sending a one-shot chat notice"
+                        );
+                        let user_msg =
+                            error_message::for_user(&e, "refresh the live preview");
+                        let _ = app_for_shot_fb.emit(
+                            "chat-reply",
+                            serde_json::json!({
+                                "originating_message_id": String::new(),
+                                "text": user_msg,
+                            }),
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        // Screencast pump: forward every (jpeg_b64, device_width)
+        // tuple from the channel to the frontend as
+        // `agent-screencast-frame`. The first item the channel
+        // yields is the synchronous one-shot screenshot, so the
+        // UI gets a frame before the next animation frame even
+        // if the screencast event stream takes a moment to
+        // produce its first EventScreencastFrame.
+        let app_for_pump = app_for_shot.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some((data, _device_width)) = screencast_rx.recv().await {
+                let _ = app_for_pump.emit("agent-screencast-frame", data);
+            }
+            tracing::info!(
+                event = "live_preview_screencast_pump_exit",
+                "screencast pump task ended (sender dropped)"
+            );
+        });
+    }
+
+    // Drop our local copy of the sender so the pump task exits
+    // cleanly when this function returns. The clone inside the
+    // screencast task itself is the only long-lived sender.
+    drop(screencast_tx);
 
 
 
@@ -517,7 +736,9 @@ async fn run_browser_task(
 
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
-            let _ = on_event.send(event);
+            if let Some(ch) = on_event.as_ref() {
+                let _ = ch.send(event);
+            }
         }
     });
 
@@ -597,6 +818,7 @@ async fn run_browser_task(
     let _reply = orchestrator::dispatch_browser_task(
         &chat_agent,
         factory,
+        pool,
         sink,
         &page,
         handoff,
@@ -645,26 +867,11 @@ impl orchestrator::BrowserAgentFactory for PrefabricatedAgentFactory {
     fn run_browser_task<'a>(
         &'a self,
         handoff: mew_agent::handoff::Handoff,
-        page: &'a mew_cdp::ReExportedPage,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<mew_agent::handoff::BrowserResult>> + Send + 'a>,
     > {
-        // `handoff` is currently unused — the agent's
-        // constructor already ran with the orchestrator's
-        // typed subtask list (via the
-        // `PrefabricatedAgentFactory`'s caller, the
-        // orchestrator's `dispatch_browser_task`). Phase 3.1
-        // will route the handoff's constraints and
-        // `originating_message_id` into the agent
-        // constructor.
         let _ = handoff;
 
-        // `take` the agent out of the factory so we can
-        // move it into the async block. The lock is held
-        // only for the `take` — we never hold it across an
-        // `.await`, so there is no `Send`-across-await
-        // hazard. The `std::sync::Mutex` is correct here
-        // because we never need to wait on it.
         let mut agent = match self.agent.lock().expect("PrefabricatedAgentFactory mutex poisoned").take() {
             Some(a) => a,
             None => {
@@ -677,14 +884,22 @@ impl orchestrator::BrowserAgentFactory for PrefabricatedAgentFactory {
         };
         let session_id = agent.session_id().to_string();
         Box::pin(async move {
-            let result = agent.run(page).await;
+            let config = load_config()?;
+            let (browser, page, handler_task, job) = mew_cdp::launch_headless(
+                config.browser.as_ref().and_then(|b| b.binary_path.clone()),
+                config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
+            ).await?;
+
+            let result = agent.run(&page).await;
+            let _ = mew_cdp::shutdown(browser, handler_task, job).await;
+
             match result {
                 Ok(text) => Ok(mew_agent::handoff::BrowserResult::done(
                     session_id,
                     text,
                     Vec::new(),
                     None,
-                    None, // raw_transcript_ref: future — agent should expose
+                    None,
                 )),
                 Err(e) => Ok(mew_agent::handoff::BrowserResult::failure(
                     session_id,
@@ -726,6 +941,211 @@ async fn resume_session(state: State<'_, AppState>) -> Result<String, String> {
     ))
 }
 
+/// Phase 14: outer planner task entry point.
+#[tauri::command]
+async fn start_task(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message: String,
+    history: Vec<FrontendMessage>,
+) -> Result<TaskHandle, String> {
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let cfg = load_config().map_err(|e| {
+        error_message::for_user(&e, "load the configuration file")
+    })?;
+
+    let chat_agent = ChatAgent::new(cfg.clone())
+        .with_classify_cache(state.classify_cache.clone());
+    let context: Vec<ConversationMessage> = history
+        .into_iter()
+        .map(|msg| ConversationMessage {
+            role: msg.role,
+            content: msg.content,
+        })
+        .collect();
+
+    let intent = chat_agent.classify_cached(&message, &context).await.map_err(|e| {
+        error_message::for_user(&e, "understand your message")
+    })?;
+
+    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink { app_handle: app.clone() });
+
+    use mew_agent::router::Intent;
+    match intent {
+        Intent::Chat(reply) => {
+            sink.emit(OrchestratorEvent::ChatReply {
+                originating_message_id: task_id.clone(),
+                text: reply,
+            });
+            Ok(TaskHandle {
+                task_id,
+                todos: Vec::new(),
+            })
+        }
+        Intent::BrowserTask(task) => {
+            if !cfg.agent.planner_enabled {
+                // Fallback mode (planner_enabled: false): run single ReAct task in background
+                let state_session = state.active_session.clone();
+                let app_clone = app.clone();
+                let cfg_clone = cfg.clone();
+                let task_clone = task.clone();
+                let chat_agent_clone = ChatAgent::new(cfg.clone());
+                let app_for_error = app_clone.clone();
+
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = run_browser_task(
+                        task_clone,
+                        cfg_clone,
+                        state_session,
+                        None, // legacy mode doesn't use the worker pool
+                        app_clone,
+                        None,
+                        chat_agent_clone,
+                    ).await {
+                        let user_msg = error_message::for_user(&e, "run the browser task");
+                        let sink_err: Arc<dyn TurnSink> = Arc::new(TauriSink { app_handle: app_for_error });
+                        sink_err.emit(OrchestratorEvent::ChatReply {
+                            originating_message_id: String::new(),
+                            text: user_msg,
+                        });
+                    }
+                });
+
+                Ok(TaskHandle {
+                    task_id,
+                    todos: Vec::new(),
+                })
+            } else {
+                // Planner enabled mode: decompose into typed todos and submit first todo
+                let handoff = chat_agent.build_handoff(&task, &task_id, Vec::new());
+                let todos = mew_agent::planner::decompose_to_todos(&handoff);
+
+                for todo in &todos {
+                    sink.emit(OrchestratorEvent::TodoStateChanged {
+                        task_id: task_id.clone(),
+                        todo: todo.clone(),
+                    });
+                }
+
+                if let Some(first_todo) = todos.first() {
+                    let pool = state.get_or_init_worker_pool(&app);
+                    let _rx = pool.submit(first_todo.clone(), handoff).map_err(|e| {
+                        error_message::for_user(&anyhow::anyhow!("{e:?}"), "submit subtask to planner")
+                    })?;
+                }
+
+                Ok(TaskHandle {
+                    task_id,
+                    todos,
+                })
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn pause_todo(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+    _todo_id: String,
+) -> Result<(), String> {
+    let pool = state.get_or_init_worker_pool(&app);
+    let sig_id = state.next_signal_id();
+    pool.signal(mew_agent::supervisor::SupervisorCommand::new(
+        sig_id,
+        mew_agent::supervisor::SupervisorSignal::Pause,
+    ));
+    let _ = task_id;
+    Ok(())
+}
+
+#[tauri::command]
+async fn resume_todo(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+    _todo_id: String,
+) -> Result<(), String> {
+    let pool = state.get_or_init_worker_pool(&app);
+    let sig_id = state.next_signal_id();
+    pool.signal(mew_agent::supervisor::SupervisorCommand::new(
+        sig_id,
+        mew_agent::supervisor::SupervisorSignal::Resume,
+    ));
+    let _ = task_id;
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_todo(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+    todo_id: String,
+) -> Result<(), String> {
+    let pool = state.get_or_init_worker_pool(&app);
+    let sig_id = state.next_signal_id();
+    pool.signal(mew_agent::supervisor::SupervisorCommand::new(
+        sig_id,
+        mew_agent::supervisor::SupervisorSignal::Cancel,
+    ));
+
+    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink { app_handle: app.clone() });
+    sink.emit(OrchestratorEvent::TodoRejected {
+        task_id,
+        todo_id,
+        evidence: None,
+        reason: Some("cancelled by user".to_string()),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn replan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<(), String> {
+    let pool = state.get_or_init_worker_pool(&app);
+    let cancel_sig_id = state.next_signal_id();
+    pool.signal(mew_agent::supervisor::SupervisorCommand::new(
+        cancel_sig_id,
+        mew_agent::supervisor::SupervisorSignal::Cancel,
+    ));
+
+    let handoff = mew_agent::handoff::Handoff::bare("replan task", &task_id);
+    let new_todos = mew_agent::planner::decompose_to_todos(&handoff);
+
+    let replan_sig_id = state.next_signal_id();
+    pool.signal(mew_agent::supervisor::SupervisorCommand::new(
+        replan_sig_id,
+        mew_agent::supervisor::SupervisorSignal::Replan(new_todos.clone()),
+    ));
+
+    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink { app_handle: app.clone() });
+    for todo in new_todos {
+        sink.emit(OrchestratorEvent::TodoStateChanged {
+            task_id: task_id.clone(),
+            todo,
+        });
+    }
+
+    Ok(())
+}
+
+/// Phase 18 ships with this; Phase 14 declares the signature only and stubs the body.
+#[tauri::command]
+async fn stop_task(
+    _state: State<'_, AppState>,
+    _task_id: String,
+) -> Result<(), String> {
+    Err(error_message::for_user(
+        &anyhow::anyhow!("not yet implemented"),
+        "stop task",
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   // No `tracing` global subscriber is installed here on purpose.
@@ -753,7 +1173,18 @@ pub fn run() {
   // side-channel cover all the diagnostics we need.
   tauri::Builder::default()
     .manage(AppState::default())
-    .invoke_handler(tauri::generate_handler![send_message, get_config_summary, pause_session, resume_session])
+    .invoke_handler(tauri::generate_handler![
+        send_message,
+        get_config_summary,
+        pause_session,
+        resume_session,
+        start_task,
+        pause_todo,
+        resume_todo,
+        cancel_todo,
+        replan,
+        stop_task
+    ])
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -762,8 +1193,97 @@ pub fn run() {
             .build(),
         )?;
       }
+      // Phase 16.3: workspace-root hint for the resolver.
+      //
+      // `mew-nav::SensitivePlatforms::load_from_default_location`
+      // and `mew-agent::load_config` both walk the parent
+      // directory tree looking for the workspace root. The
+      // walk works for a dev build whose CWD is somewhere
+      // inside the repo (the Tauri binary runs with CWD
+      // `target/debug/` for a `cargo tauri dev` build, and
+      // the walk finds the file on the first parent hop).
+      //
+      // For a release build the binary can live somewhere
+      // that has no `config/sensitive_platforms.toml` in
+      // any parent at all (a Windows installer drops it
+      // in `Program Files\mew-ui\`, a macOS bundle in
+      // `mew-ui.app/Contents/MacOS/`). The parent walk
+      // fails, the sensitive-platforms table is empty, and
+      // the LLM can't reach instagram.com / twitter.com /
+      // linkedin.com because direct nav to those hosts is
+      // blocked by the allowlist.
+      //
+      // The `MEW_WORKSPACE_DIR` env var is the escape
+      // hatch. We compute the most likely workspace root
+      // from the executable's own path and set it once
+      // here, before any agent task is created. If the env
+      // var is already set (an operator's deliberate
+      // override), we keep it.
+      if std::env::var("MEW_WORKSPACE_DIR").is_err() {
+        if let Some(workspace_root) = detect_workspace_root() {
+          // SAFETY: this `set_var` runs in the main
+          // thread before any agent task is spawned.
+          // Tauri's setup hook is single-threaded at this
+          // point — the async runtime hasn't started
+          // task spawning yet. Setting an env var is a
+          // documented no-panic pattern when the main
+          // thread holds no locks the runtime waits on.
+          std::env::set_var("MEW_WORKSPACE_DIR", &workspace_root);
+          eprintln!(
+            "[mew-ui] Phase 16.3: set MEW_WORKSPACE_DIR={} (inferred from exe path)",
+            workspace_root
+          );
+        }
+      }
       Ok(())
     })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
+}
+
+/// Infer the workspace root from the running executable's
+/// path. The binary lives at one of:
+///   * `<repo>/target/debug/app.exe`        — `cargo run` /
+///     `cargo tauri dev` dev build
+///   * `<repo>/target/release/app.exe`      — `cargo tauri
+///     build` release build
+///   * `<install>/mew-ui.exe`               — MSI / NSIS
+///     installer (no parent contains `Cargo.toml`)
+///   * `<bundle>/mew-ui.app/Contents/MacOS/mew-ui`
+///     — macOS `.app` bundle
+///
+/// We walk up from the binary's directory looking for a
+/// `Cargo.toml` whose first non-comment line contains the
+/// `[workspace]` marker. The first hit is the workspace
+/// root. If no workspace root is found (release install
+/// with no repo on disk), we return `None` and the
+/// `MEW_WORKSPACE_DIR` env var stays unset — the agent
+/// just runs without sensitive-platform routing, same as
+/// the pre-fix behavior.
+fn detect_workspace_root() -> Option<String> {
+    use std::path::PathBuf;
+    let exe = std::env::current_exe().ok()?;
+    let mut dir: PathBuf = exe.parent()?.to_path_buf();
+    const MAX_DEPTH: usize = 12;
+    for _ in 0..MAX_DEPTH {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.exists() {
+            // Cheap check for the workspace marker.
+            // We look for a `[workspace]` section header
+            // — that's enough to distinguish the repo
+            // root from a sub-crate's Cargo.toml
+            // (e.g. `mew-ui/src-tauri/Cargo.toml`,
+            // which has a `[lib]` block but not a
+            // `[workspace]` block).
+            if let Ok(content) = std::fs::read_to_string(&candidate) {
+                if content.lines().any(|l| l.trim() == "[workspace]") {
+                    return Some(dir.to_string_lossy().into_owned());
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
 }
