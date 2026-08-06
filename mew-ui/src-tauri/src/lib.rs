@@ -798,6 +798,7 @@ box-shadow:0 0 0 0 rgba(37,99,235,.6);animation:ping 1.4s cubic-bezier(0,0,.2,1)
     let factory: Arc<dyn orchestrator::BrowserAgentFactory> =
         Arc::new(PrefabricatedAgentFactory {
             agent: std::sync::Mutex::new(Some(agent)),
+            page: page.clone(),
         });
 
     // Emit the "task started" event before dispatching so the
@@ -861,6 +862,7 @@ box-shadow:0 0 0 0 rgba(37,99,235,.6);animation:ping 1.4s cubic-bezier(0,0,.2,1)
 /// the duration of the `take`, never across `.await`.
 struct PrefabricatedAgentFactory {
     agent: std::sync::Mutex<Option<mew_agent::agent::Agent>>,
+    page: chromiumoxide::Page,
 }
 
 impl orchestrator::BrowserAgentFactory for PrefabricatedAgentFactory {
@@ -883,15 +885,9 @@ impl orchestrator::BrowserAgentFactory for PrefabricatedAgentFactory {
             }
         };
         let session_id = agent.session_id().to_string();
+        let page = self.page.clone();
         Box::pin(async move {
-            let config = load_config()?;
-            let (browser, page, handler_task, job) = mew_cdp::launch_headless(
-                config.browser.as_ref().and_then(|b| b.binary_path.clone()),
-                config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
-            ).await?;
-
             let result = agent.run(&page).await;
-            let _ = mew_cdp::shutdown(browser, handler_task, job).await;
 
             match result {
                 Ok(text) => Ok(mew_agent::handoff::BrowserResult::done(
