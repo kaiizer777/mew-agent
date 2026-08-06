@@ -319,3 +319,14 @@ pub fn try_install_thread_local(
     // expected to store it in an `Option<DefaultGuard>` field.
     tracing::dispatcher::set_default(&dispatch)
 }
+
+/// Emit a trace event for the lifecycle of a planner todo.
+pub fn trace_todo_lifecycle(task_id: &str, todo_id: &str, phase: &str) {
+    tracing::info!(
+        event = "todo_lifecycle",
+        task_id = task_id,
+        todo_id = todo_id,
+        phase = phase,
+        "todo lifecycle transition"
+    );
+}

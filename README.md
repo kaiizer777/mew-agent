@@ -37,7 +37,7 @@ The workspace is a Cargo workspace with focused, modular crates:
 | `mew-perception` | Accessibility-tree extraction, stable `@eX` ref assignment, semantic classification, snapshot diffing. |
 | `mew-nav` | URL Resolution Layer + sensitive-platform routing table loader. Pure-Rust library (no `serde_yaml` dep — uses `toml`). |
 | `mew-resilience` | The six failure-mode detectors (stale ref, modal interrupts, session loss, rate limit, irreversible actions, vision confidence) + mock-page fixtures for testing without a live browser. |
-| `mew-agent` | `ChatAgent` + `BrowserAgent` + `Orchestrator`, `Handoff` / `Result` types, `CompletenessTracker`, `PacingGuard`, `planner`, `summarizer`, `research`, `eval`. |
+| `mew-agent` | `ChatAgent` + `Planner` + `BrowserAgent` + `Orchestrator`, `Todo` / `Handoff` / `Result` types, `CompletenessTracker`, `PacingGuard`, `planner`, `summarizer`, `research`, `eval`. |
 | `mew-cli` | Headless CLI entrypoint (still useful for debugging, transcript logging, and the no-UI examples). |
 | `mew-ui` (Tauri) | Tauri 2 shell, IPC bridge, `TauriSink` (the orchestrator's `TurnSink` impl for Tauri events), intent router, single chat surface, Tauri Channel for live events. |
 
@@ -65,6 +65,7 @@ browser:
   visible_cursor: false
 
 agent:
+  planner_enabled: true       # Phase 18: Planner enabled by default for improved stability and observability
   allowed_domains:
     - example.com
     - en.wikipedia.org
@@ -163,13 +164,12 @@ cargo run --example phase9_eval_harness -p mew-agent
 └────────────────────────┬─────────────────────────────────┘
                          │
        ┌─────────────────┴──────────────────┐
-       ▼                                    ▼
-  ChatAgent                          BrowserAgent
-  - intent classify                  - ReAct loop
-  - build_handoff (Handoff)          - perceive → act
-  - synthesize_reply (Result)        - emit ProgressLine
-                                     - completeness gate
-                                     - finish() → BrowserResult
+       ▼                 ▼                  ▼
+  ChatAgent         Planner            BrowserAgent
+  - classify        - split to todos   - ReAct loop
+  - build_handoff   - budget guard     - perceive → act
+  - reply (Result)  - pool dispatch    - completeness gate
+                    - -> BrowserResult - finish() → TodoResult
 ```
 
 The `Handoff` struct (`task_description`, `subtasks`, `constraints`, `originating_message_id`) is the unit ChatAgent hands to BrowserAgent. The `Result` struct (`status: Done | Partial | Failed`, `summary`, `key_findings`, `final_snapshot_signature`, `raw_transcript_ref`) is what BrowserAgent hands back. `ChatAgent::synthesize_reply` turns the `Result` into the user-facing text that lands in the chat list as a `chat-reply` event.

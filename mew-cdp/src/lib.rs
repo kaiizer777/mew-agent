@@ -18,6 +18,21 @@ pub use chromiumoxide::Page as ReExportedPage;
 mod process_lifetime;
 use process_lifetime::JobObject;
 
+// Orphan-chrome reaper — see `orphan_reap.rs` for the
+// full design doc. Called at the top of every `launch` /
+// `launch_headless` to clean up any chrome.exe the parent
+// process left behind on a hard kill. Without this sweep,
+// a stale chrome holding our `user_data_dir` (SQLite lock)
+// or our port 9222 (TCP listener) causes the next launch
+// to fail with a generic "browser may not be reachable"
+// error, hiding the real root cause.
+//
+// The module is `pub` so example/test harnesses can call
+// `reap_orphaned_chromes` directly; the public API is a
+// single function with a stable signature.
+pub mod orphan_reap;
+use orphan_reap::reap_orphaned_chromes;
+
 #[derive(Error, Debug)]
 pub enum StaleRefError {
     #[error("Stale ref: Node with BackendNodeId {0:?} could not be found or resolved.")]
@@ -225,8 +240,85 @@ const VISIBLE_CURSOR_SCRIPT: &str = r#"
 })();
 "#;
 
+/// Resolve the browser profile directory.
+///
+/// The historical call site used `std::env::current_dir()?.join("profile")`,
+/// which is **fragile** — the Tauri shell (`app.exe`) is sometimes launched
+/// from the workspace root, sometimes from `mew-ui/src-tauri/`, sometimes
+/// from VSCode, and the CWD in each case is different. When the reaper
+/// looked at one CWD's `profile` while Chrome was using a *different*
+/// CWD's `profile`, the reaper saw a clean state and Chrome hit
+/// "ProcessSingleton ... Lock file can not be created! Error code: 32"
+/// because the other path's stale lockfile was still on disk.
+///
+/// Resolution order (first match wins):
+///   1. `MEW_BROWSER_PROFILE` env var — power-user / test override.
+///   2. `<exe_dir>/profile` — deterministic regardless of how the
+///      binary was launched. The Tauri app's `app.exe` lives in
+///      `target/debug/` or `target/release/` and a `profile/` next
+///      to it is unambiguous. Cargo examples and tests still get a
+///      sensible default: example binaries land in
+///      `target/debug/examples/`, so `examples/../profile` is
+///      `target/debug/profile` — same on every run from a clean
+///      build, no CWD dependency.
+///   3. `<cwd>/profile` — the historical behavior, kept as a
+///      last-resort fallback so a developer running `cargo test`
+///      from a non-standard layout still gets a working profile.
+///
+/// All three options produce an absolute path so the reaper, the
+/// chromiumoxide `user_data_dir`, and any later relaunch agree on
+/// the same directory even if CWD changes between calls.
+fn resolve_profile_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+
+    // (1) Env-var override — the explicit escape hatch.
+    if let Ok(p) = std::env::var("MEW_BROWSER_PROFILE") {
+        let p = PathBuf::from(p);
+        if p.is_absolute() {
+            return p;
+        }
+        // Relative env-var values resolve against the exe dir, not CWD,
+        // so a wrapper script that sets `MEW_BROWSER_PROFILE=profile`
+        // gets the same directory as the no-env-var case.
+        if let Some(exe_dir) = exe_dir() {
+            return exe_dir.join(&p);
+        }
+        // No exe dir available (extremely unusual) — best effort.
+        let p_for_join = p.clone();
+        return std::env::current_dir()
+            .map(|c| c.join(&p_for_join))
+            .unwrap_or_else(|_| p);
+    }
+
+    // (2) Exe-dir-relative — the deterministic default.
+    if let Some(exe_dir) = exe_dir() {
+        return exe_dir.join("profile");
+    }
+
+    // (3) CWD fallback — kept for the rare case where the current
+    // executable path cannot be determined (e.g. some sandboxed
+    // environments).
+    std::env::current_dir()
+        .map(|c| c.join("profile"))
+        .unwrap_or_else(|_| PathBuf::from("profile"))
+}
+
+/// Best-effort: directory containing the running executable.
+///
+/// `std::env::current_exe()` returns the path to the current binary
+/// (e.g. `target/debug/app.exe` or `target/debug/examples/foo.exe`).
+/// `.parent()` is the directory the binary lives in. Returns `None`
+/// if the path cannot be obtained.
+fn exe_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
 /// Launches a headed Chrome instance via CDP using chromiumoxide.
-/// Configured with a fixed remote debugging port (9222) and persistent user data directory (`./profile`).
+/// Configured with a fixed remote debugging port (9222) and persistent
+/// user data directory. The profile path is resolved by
+/// [`resolve_profile_dir`] — see its docs for the resolution order.
 ///
 /// `visible_cursor` (Phase 16.1) — when true, the page-level script in
 /// [`VISIBLE_CURSOR_SCRIPT`] is registered on every navigation so a
@@ -254,7 +346,32 @@ pub async fn launch(
     binary_path: Option<String>,
     visible_cursor: bool,
 ) -> Result<(Browser, Page, tokio::task::JoinHandle<()>, JobObject)> {
-    let profile_dir = std::env::current_dir()?.join("profile");
+    let profile_dir = resolve_profile_dir();
+
+    // Root-cause fix: before any BrowserConfig work,
+    // sweep the process table for any chrome.exe that's
+    // holding our `profile_dir` (SQLite lock on
+    // History/Cookies/Preferences) or our debug port.
+    // See `orphan_reap.rs` for the design doc. The
+    // reaper is a best-effort sweep — failures are
+    // logged and skipped, never fatal — so the launch
+    // still proceeds and either fails with its real
+    // error (which the orchestrator can now surface
+    // to the user, see `orchestrator.rs`'s factory-error
+    // fallback) or is retried by `launch_inner`.
+    reap_orphaned_chromes(&profile_dir, DEFAULT_PORT);
+
+    // Settle delay: after `TerminateProcess` the OS
+    // closes the dying process's handles asynchronously.
+    // Spawning the new Chrome immediately can race the
+    // kernel cleanup and hit the singleton "Error code:
+    // 32" before the dying process's handles are fully
+    // released. 200 ms is short enough to feel instant
+    // and long enough for the kernel to finish the
+    // majority of handle teardown. `launch_inner` adds
+    // a full retry on top of this for the rare cases
+    // where the settle isn't enough.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Phase X: 4K live preview. The viewport is bumped from
     // 1280×800 to 3840×2160 so the page renders at true 4K
@@ -288,7 +405,20 @@ pub async fn launch_headless(
     binary_path: Option<String>,
     visible_cursor: bool,
 ) -> Result<(Browser, Page, tokio::task::JoinHandle<()>, JobObject)> {
-    let profile_dir = std::env::current_dir()?.join("profile");
+    let profile_dir = resolve_profile_dir();
+
+    // Root-cause fix: see the matching block in
+    // `launch` above. The reaper's behavior is identical
+    // for headless vs. headed — the difference is only
+    // whether the child chrome has a window.
+    reap_orphaned_chromes(&profile_dir, DEFAULT_PORT);
+
+    // Settle delay — see the matching block in `launch`
+    // above for the rationale. 200 ms gives the kernel
+    // time to finish closing handles of any chrome the
+    // reaper just terminated, so the new chrome's
+    // singleton file create doesn't race the cleanup.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Phase X: 4K live preview — see `launch()` for the
     // rationale. Headless mode uses the same 3840×2160
@@ -316,7 +446,81 @@ async fn launch_inner(
     visible_cursor: bool,
 ) -> Result<(Browser, Page, tokio::task::JoinHandle<()>, JobObject)> {
 
-    let (mut browser, mut handler) = Browser::launch(config).await?;
+    // Phase X.2: launch-with-retry. `Browser::launch` spawns the
+    // child Chrome and waits for it to print the DevTools websocket
+    // URL on stderr. If Chrome exits early — typically because the
+    // Windows process-singleton lockfile can't be created
+    // (`Lock file can not be created! Error code: 32`) — chromiumoxide
+    // returns `CdpError::LaunchExit` and we get nothing back. The
+    // reaper (called from `launch` / `launch_headless` before this)
+    // is a best-effort sweep; it does NOT guarantee a clean slate,
+    // because:
+    //
+    //   1. `RmGetList` only finds processes that have registered
+    //      with the Restart Manager. A Chrome child that hasn't
+    //      registered yet, or one in the middle of dying, is
+    //      invisible to Pass 2.
+    //   2. After `TerminateProcess` the OS closes the process's
+    //      handles asynchronously. A subsequent `Browser::launch`
+    //      can race ahead of the kernel cleanup and the new Chrome
+    //      hits `code: 32` on the singleton file.
+    //
+    // The retry loop below catches that race: on the first failure,
+    // sleep, re-run the reaper (which now sees the half-dead Chrome
+    // that registered in the meantime), and try the launch again.
+    // After 3 attempts we give up and surface the real error so
+    // the user sees the genuine failure mode instead of a permanent
+    // lockup.
+    const MAX_LAUNCH_ATTEMPTS: u32 = 3;
+    const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(750);
+
+    let user_data_dir = config.user_data_dir.clone();
+    let mut attempt: u32 = 0;
+
+    let mut pair: Option<(Browser, chromiumoxide::handler::Handler)> = None;
+    loop {
+        attempt += 1;
+        tracing::info!(
+            attempt,
+            max_attempts = MAX_LAUNCH_ATTEMPTS,
+            "Browser::launch attempt"
+        );
+        match Browser::launch(config.clone()).await {
+            Ok(p) => {
+                pair = Some(p);
+                break;
+            }
+            Err(e) => {
+                let detail = format!("{e:#}");
+                let is_singleton_race = detail.contains("Lock file can not be created")
+                    || detail.contains("ProcessSingleton")
+                    || detail.contains("Error code: 32");
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MAX_LAUNCH_ATTEMPTS,
+                    is_singleton_race,
+                    error = %e,
+                    "Browser::launch failed; considering retry"
+                );
+                let any_err = anyhow::Error::from(e);
+                let give_up = attempt >= MAX_LAUNCH_ATTEMPTS || !is_singleton_race;
+                if give_up {
+                    return Err(any_err);
+                }
+                // Re-run the reaper against the configured
+                // user-data-dir. The reaper will catch the
+                // half-dead Chrome that wasn't visible to the
+                // first sweep, terminate it, and clean its stale
+                // lockfile. Then sleep to let the kernel finish
+                // closing handles before we try again.
+                if let Some(ref dir) = user_data_dir {
+                    reap_orphaned_chromes(dir, DEFAULT_PORT);
+                }
+                tokio::time::sleep(RETRY_BACKOFF).await;
+            }
+        }
+    }
+    let (mut browser, mut handler) = pair.expect("loop either returned or set pair");
 
     // Phase 3.3 (Bug 2): create a Job Object and assign the
     // chromiumoxide-launched Chrome PID to it as early as possible
@@ -1049,10 +1253,23 @@ pub async fn start_screencast(
         .max_height(2160)
         .build();
 
-    page.execute(params).await?;
-
+    // CRITICAL ordering: subscribe to `EventScreencastFrame` BEFORE
+    // sending the `Page.startScreencast` command.
+    //
+    // `chromiumoxide::Page::event_listener::<T>()` attaches a NEW
+    // listener to the existing event bus; any events fired before
+    // this call are lost. CDP `Page.startScreencast` begins firing
+    // `EventScreencastFrame` immediately on the next animation tick,
+    // so subscribing after `page.execute(params)` causes the first
+    // batch of frames to be silently dropped — which is exactly the
+    // bug that produced "1 frame received" on the frontend: the JS
+    // listener would only ever see the synchronous one-shot
+    // `capture_screenshot` (the white pre-navigate "Loading…" page),
+    // and then nothing. Subscribe first, then enable.
     let mut stream = page.event_listener::<EventScreencastFrame>().await?;
     let page_clone = page.clone();
+
+    page.execute(params).await?;
 
     tokio::spawn(async move {
         while let Some(event) = stream.next().await {
@@ -1073,43 +1290,111 @@ pub async fn start_screencast(
 
 /// Phase 16.2: live preview, v2.
 ///
-/// Wraps [`start_screencast`] and immediately takes a synchronous
-/// one-shot [`capture_screenshot`] so the caller has a frame
-/// available *before* the first `EventScreencastFrame` arrives.
-/// Without this, callers see a 0–500 ms blank gap between
-/// "browser launched" and "first frame painted" — that gap is
-/// what was making the Live Preview pane feel "late" relative
-/// to the agent's first ReAct step.
+/// Wraps the live-preview pipeline and ships one synchronous
+/// one-shot [`capture_screenshot`] so the caller has a frame in
+/// the channel before the first poll tick lands.
+///
+/// Earlier revisions tried CDP's push-based `Page.startScreencast`
+/// event stream. The event stream was unreliable in practice:
+/// chromiumoxide 0.9.1 + the bundled `stealth-browser/chrome.exe`
+/// (Chromium 146) silently produced zero `EventScreencastFrame`
+/// events after the initial enable, even with the listener
+/// subscribed in the correct order. The probe
+/// (`mew-cdp/examples/screencast_probe.rs`) reproduces the bug
+/// reliably: `Page.startScreencast` returns Ok, but the
+/// chromiumoxide event stream yields nothing. The result was a
+/// frozen first frame on the right pane — the JS side saw the
+/// one-shot, and then nothing for the entire agent run.
+///
+/// This version uses a *poll-based* screencast instead: every
+/// `POLL_INTERVAL_MS` we take a `Page.captureScreenshot` and
+/// forward the JPEG to `tx`. Trade-off vs. the push model:
+///
+///   * **Pro:** reliable. `Page.captureScreenshot` is a one-shot
+///     CDP call that always returns, so the polling cadence is
+///     deterministic and never depends on a flaky event stream.
+///   * **Pro:** no listener-race risk. The earlier "subscribe
+///     before enable" dance is gone.
+///   * **Con:** every poll is a full CDP round-trip + a JPEG
+///     encode at the source resolution. At `POLL_INTERVAL_MS = 500`
+///     and the 4K viewport, each poll is ~100-300 ms of CPU
+///     on Chromium's encoder, so 2 fps is the practical ceiling.
+///     That's identical to the push model in practice (the
+///     `every_nth_frame: 5` setting on the old code was also
+///     ~2 fps at 4K) but the *latency* between a navigation and
+///     the new frame on the right pane is now bounded by
+///     `POLL_INTERVAL_MS` instead of the next screencast tick.
 ///
 /// The caller (typically the Tauri shell) pumps the
 /// `UnboundedReceiver<(String, i32)>` and forwards every tuple
 /// to the frontend as an `agent-screencast-frame` event. The
-/// first item out of the channel is always the synchronous
-/// `capture_screenshot` result, so the UI can paint a frame
-/// the instant `start_screencast_with_first_frame` returns.
-///
-/// `max_width` and `max_height` are forwarded to the
-/// `Page.startScreencast` params so the screencast matches the
-/// Tauri window aspect ratio (the synchronous one-shot
-/// screenshot uses the page's actual content size and may be
-/// larger; the UI down-scales).
+/// poll task and the one-shot both write to that same channel,
+/// so the JS side sees a single, monotonic frame stream.
 pub async fn start_screencast_with_first_frame(
     page: &Page,
     tx: tokio::sync::mpsc::UnboundedSender<(String, i32)>,
 ) -> Result<()> {
-    // Synchronous first frame. Failure here is non-fatal: the
-    // screencast stream will deliver a frame within a few hundred
-    // ms anyway, and we don't want a transient screenshot
-    // failure (e.g. page is still painting) to break the
-    // entire live-preview pipeline.
+    // First-frame one-shot. We take this synchronously *before*
+    // starting the poll task so the user has a frame on screen
+    // immediately. The poll task is responsible for keeping the
+    // preview up-to-date; this one-shot just removes the visible
+    // gap between "agent started" and "first poll lands".
     if let Ok(data) = capture_screenshot(page).await {
-        // Best-effort: if the receiver is gone, the screencast
-        // task below will also exit on the first send error.
+        // Best-effort: if the receiver is gone, the poll task
+        // below will also exit on the first send error.
         let _ = tx.send((data, 0));
     }
 
-    start_screencast(page, tx).await
+    // Spawn the poll task. The task lives until either the
+    // receiver is dropped (sender returns Err on send) or the
+    // Page is closed (page.execute returns Err on every poll).
+    let page_for_poll = page.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+            POLL_INTERVAL_MS,
+        ));
+        // First tick is immediate on `interval`; skip it so we
+        // don't double-up with the synchronous one-shot above.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match capture_screenshot(&page_for_poll).await {
+                Ok(data) => {
+                    if tx.send((data, 0)).is_err() {
+                        // Receiver gone. Bail.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Page is gone or in some bad state. Log
+                    // and stop — the agent loop will surface a
+                    // proper error to the user, and the right
+                    // pane is the least of their worries at
+                    // that point.
+                    tracing::warn!(
+                        event = "live_preview_poll_screenshot_failed",
+                        error = %e,
+                        "Live preview poll task: capture_screenshot failed; \
+                         stopping the live preview"
+                    );
+                    break;
+                }
+            }
+        }
+        tracing::info!(
+            event = "live_preview_poll_task_exit",
+            "Live preview poll task ended"
+        );
+    });
+
+    Ok(())
 }
+
+/// Polling cadence for the live-preview poll task. 500 ms = 2 fps,
+/// matching the practical throughput of the old push-based
+/// screencast at the 4K viewport (which had `every_nth_frame: 5`
+/// for the same reason). Lower = smoother preview, higher CPU.
+const POLL_INTERVAL_MS: u64 = 500;
 
 /// Sets the window bounds for the browser window associated with the given page.
 pub async fn set_window_bounds(page: &Page, rect: WindowRect) -> Result<()> {

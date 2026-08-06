@@ -1137,13 +1137,17 @@ async fn replan(
 /// Phase 18 ships with this; Phase 14 declares the signature only and stubs the body.
 #[tauri::command]
 async fn stop_task(
-    _state: State<'_, AppState>,
+    state: tauri::State<'_, AppState>,
     _task_id: String,
 ) -> Result<(), String> {
-    Err(error_message::for_user(
-        &anyhow::anyhow!("not yet implemented"),
-        "stop task",
-    ))
+    let lock = state.worker_pool.lock().map_err(|e| e.to_string())?;
+    if let Some(pool) = lock.as_ref() {
+        pool.signal(mew_agent::supervisor::SupervisorCommand::new(
+            state.next_signal_id(),
+            mew_agent::supervisor::SupervisorSignal::Cancel,
+        ));
+    }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

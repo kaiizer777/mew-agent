@@ -483,6 +483,7 @@ impl Planner {
             });
 
             loop {
+                crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "submit");
                 let rx = match pool.submit(todo.clone(), task.clone()) {
                     Ok(rx) => rx,
                     Err(e) => {
@@ -519,6 +520,7 @@ impl Planner {
                 };
 
                 if result.cancelled {
+                    crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "cancel");
                     todo.status = crate::todo::TodoStatus::Failed { reason: "cancelled by user".into() };
                     sink.emit(crate::orchestrator::OrchestratorEvent::TodoRejected {
                         task_id: task.originating_message_id.clone(),
@@ -541,10 +543,12 @@ impl Planner {
 
                     match outcome {
                         crate::todo::MarkTodoOutcome::MarkedDone { evidence } => {
+                            crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_done");
                             last_snapshot_sig = Some(evidence.planner_signature);
                             break;
                         }
                         crate::todo::MarkTodoOutcome::StaleEvidence(mismatch) => {
+                            crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_rejected");
                             sink.emit(crate::orchestrator::OrchestratorEvent::TodoRejected {
                                 task_id: task.originating_message_id.clone(),
                                 todo_id: todo.id.to_string(),
@@ -555,8 +559,10 @@ impl Planner {
                             if todo.attempts >= 3 {
                                 if let Some(ref acc) = todo.acceptance {
                                     if acc.kind == crate::todo::AcceptanceKind::AnySnapshot {
+                                        crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_exhausted");
                                         todo.status = crate::todo::TodoStatus::Failed { reason: "evidence mismatched 3 times (exhausted)".into() };
                                     } else {
+                                        crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_failed");
                                         // "otherwise Replan once" (in a real replan we might rebuild todos, here we just fail for now)
                                         todo.status = crate::todo::TodoStatus::Failed { reason: "evidence mismatched 3 times (replan required)".into() };
                                     }
@@ -569,6 +575,7 @@ impl Planner {
                 } else {
                     todo.attempts += 1;
                     if todo.attempts >= 3 {
+                        crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_failed");
                         todo.status = crate::todo::TodoStatus::Failed { 
                             reason: result.failure_reason.unwrap_or_else(|| "unknown failure".into())
                         };

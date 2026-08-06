@@ -23,11 +23,23 @@ thiserror = "2.0.19"
 # SIGTERM stub (also kills gracefully but not on SIGKILL'd parent —
 # see the module docs in `src/process_lifetime.rs`).
 [target.'cfg(windows)'.dependencies]
+# Win32_System_RestartManager is added for the Phase X.1
+# profile-lock-aware orphan reaper. The RmGetList / RmRegisterResources
+# pair enumerates processes that hold handles to files inside our
+# user_data_dir, which is the only reliable way to identify a
+# zombie Chromium holding a SingletonLock / lockfile (the port-based
+# sweep alone misses it because the zombie can be between
+# listeners — e.g. on shutdown, or on a non-default debug port).
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_System_RestartManager",
+    # Pass 3 (stale-lockfile cleanup) uses CreateFileW +
+    # DeleteFileW, which live under Win32_Storage_FileSystem.
+    "Win32_Storage_FileSystem",
 ] }
 
 # Phase 5.2 review harness: the `phase5_2_dock` example drives a real
@@ -36,6 +48,14 @@ windows-sys = { version = "0.59", features = [
 # loader. Workspace path dep, no separate crate published.
 [dev-dependencies]
 mew-agent = { path = "../mew-agent" }
+# `reap_smoketest` enables a tracing subscriber so the
+# reaper's debug/trace events surface on stderr. Only
+# used by the example; the lib itself does not pull in
+# `tracing-subscriber` (it would conflict with
+# `tauri-plugin-log` for the global LogTracer; see
+# `mew-cdp`'s comment on the no-tracing-subscriber-init
+# pattern).
+tracing-subscriber = { workspace = true }
 
 # Unix (macOS/Linux) stub: Drop-based SIGTERM+SIGKILL for graceful
 # shutdown. Does NOT cover a parent that is itself SIGKILL'd before

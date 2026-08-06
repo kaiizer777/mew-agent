@@ -344,6 +344,41 @@ pub async fn dispatch_browser_task(
         match fut.await {
             Ok(r) => r,
             Err(e) => {
+                // Phase root-cause fix: surface the *real*
+                // anyhow chain to the user, not a canned
+                // placeholder. The previous version of this
+                // arm always returned the same
+                // "browser may not be reachable" string
+                // regardless of whether the failure was
+                // (a) a stale chrome process holding our
+                // port 9222, (b) a missing `binary_path`
+                // entry, (c) the agent already having been
+                // consumed (PrefabricatedAgentFactory), or
+                // (d) a totally different error class. The
+                // canned string masked the real diagnostic
+                // and turned every BrowserAgentFactory
+                // error into a single opaque chat message.
+                //
+                // We still need to *truncate* — the anyhow
+                // chain can include file paths, internal
+                // ids, and other content that's not
+                // appropriate for the user-facing chat list.
+                // The 400-char cap mirrors the chat-agent
+                // synthesizer's own truncation policy, so
+                // a user who reads the chat list and then
+                // looks at the trace log gets a consistent
+                // message in both places.
+                //
+                // The full anyhow chain stays in the trace
+                // log via the `tracing::error!` below — the
+                // user-facing message just gets a
+                // cleanable one-liner.
+                let detail = format!("{e:#}");
+                let truncated: String = detail.chars().take(400).collect();
+                let user_msg = format!(
+                    "I couldn't start the browser task: {}. Check that your previous browser session has fully closed, then try again.",
+                    truncated
+                );
                 tracing::error!(
                     event = "orchestrator_factory_error",
                     error = %e,
@@ -352,8 +387,7 @@ pub async fn dispatch_browser_task(
                 );
                 BrowserResult::failure(
                     "unknown-session",
-                    "I couldn't start the browser task. The browser may not be reachable — try again, and if it keeps failing, restart the app."
-                        .to_string(),
+                    user_msg,
                     None,
                 )
             }

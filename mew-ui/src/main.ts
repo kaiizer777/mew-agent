@@ -120,7 +120,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <div class="header">
         <div class="title">Mew Agent</div>
         <div class="header-controls">
-          <div id="status-indicator" class="status-indicator status-idle">Idle</div>
+          <button id="status-indicator" class="status-indicator status-idle" disabled>Idle</button>
           <button id="verbosity-btn" class="ctrl-btn verbosity-btn" title="Toggle progress verbosity" aria-label="Toggle verbosity">Concise</button>
           <button id="pause-btn" class="ctrl-btn" disabled>Pause</button>
           <button id="resume-btn" class="ctrl-btn" disabled>Resume</button>
@@ -161,7 +161,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 const chatList = document.querySelector<HTMLDivElement>('#chat-list')!;
 const chatForm = document.querySelector<HTMLFormElement>('#chat-form')!;
 const chatInput = document.querySelector<HTMLInputElement>('#chat-input')!;
-const statusIndicator = document.querySelector<HTMLDivElement>('#status-indicator')!;
+const statusIndicator = document.querySelector<HTMLButtonElement>('#status-indicator')!;
 const pauseBtn = document.querySelector<HTMLButtonElement>('#pause-btn')!;
 const resumeBtn = document.querySelector<HTMLButtonElement>('#resume-btn')!;
 const verbosityBtn = document.querySelector<HTMLButtonElement>('#verbosity-btn')!;
@@ -429,6 +429,8 @@ function updateStatus(state: string): void {
     resumeBtn.disabled = true;
   } else if (lower.includes('run') || lower.includes('start') || lower.includes('work')) {
     statusIndicator.classList.add('status-running');
+    statusIndicator.disabled = false;
+    statusIndicator.title = "Click to stop task";
     chatInput.placeholder = 'Type to steer agent...';
     pauseBtn.disabled = false;
     resumeBtn.disabled = true;
@@ -444,11 +446,15 @@ function updateStatus(state: string): void {
     resumeBtn.disabled = true;
   } else if (lower.includes('done')) {
     statusIndicator.classList.add('status-done');
+    statusIndicator.disabled = true;
+    statusIndicator.title = "";
     chatInput.placeholder = 'Type a message...';
     pauseBtn.disabled = true;
     resumeBtn.disabled = true;
   } else {
     statusIndicator.classList.add('status-idle');
+    statusIndicator.disabled = true;
+    statusIndicator.title = "";
   }
   // Mirror the chat pill onto the preview pane so the right side
   // never disagrees with the left. The pill is purely cosmetic
@@ -723,6 +729,17 @@ resumeBtn.addEventListener('click', async () => {
       kind: 'chat_reply',
       text: `[System Error] ${err}`,
     });
+  }
+});
+
+// Phase 18: status indicator doubles as a kill switch
+statusIndicator.addEventListener('click', async () => {
+  if (activeTaskId) {
+    try {
+      await invoke('stop_task', { taskId: activeTaskId });
+    } catch (err) {
+      console.error("Failed to stop task:", err);
+    }
   }
 });
 

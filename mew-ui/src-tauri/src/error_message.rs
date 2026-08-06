@@ -228,6 +228,14 @@ fn match_planner(detail: &str) -> Option<String> {
     None
 }
 
+/// Phase 18: Map a Todo rejection into a user-facing sentence.
+pub fn todo_rejected(mismatch: &mew_agent::todo::EvidenceMismatch) -> String {
+    format!(
+        "The agent's evidence did not match the planner's signature ({}). Please try again.",
+        mismatch.planner_signature
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +312,20 @@ mod tests {
         let msg = for_user(&err, "execute command");
         assert!(!msg.is_empty());
         assert!(!msg.starts_with("{"));
+    }
+
+    #[test]
+    fn todo_rejected_yields_plain_language_sentence() {
+        let mismatch = mew_agent::todo::EvidenceMismatch {
+            worker_signature: "len:0123abcd".to_string(),
+            planner_signature: "len:0123abce".to_string(),
+            reason: "stale iteration".to_string(),
+        };
+        let msg = super::todo_rejected(&mismatch);
+        assert!(msg.contains("len:0123abce"));
+        assert!(msg.contains("did not match"));
+        assert!(!msg.starts_with("{"));
+        assert!(!msg.contains("EvidenceMismatch"));
     }
 }
 

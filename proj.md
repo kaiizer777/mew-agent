@@ -90,15 +90,15 @@ All six are unit-tested against `mock_fixtures.rs` — pure-Rust `TreeNode` cons
 
 The decision-making core. The crate is organized around a typed pipeline, not free functions.
 
-#### 2.5.1 The two-agent split
+#### 2.5.1 The three-agent split
 
 ```
-ChatAgent                          BrowserAgent
-- classify_intent                  - run_inner ReAct loop
-- build_handoff (Handoff)          - perceive → act
-- synthesize_reply (Result)        - emit ProgressLine
-                                   - completeness gate
-                                   - finish() → BrowserResult
+ChatAgent                 Planner                     BrowserAgent
+- classify_intent         - decompose to todos        - run_inner ReAct loop
+- build_handoff (Handoff) - budget guard              - perceive → act
+- synthesize_reply        - dispatch to worker pool   - emit ProgressLine
+                          - return BrowserResult      - completeness gate
+                                                      - finish() → TodoResult
 ```
 
 `ChatAgent` is in `mew_agent::chat_agent`. It has its own system prompt (`CHAT_AGENT_SYSTEM_PROMPT`), distinct from `BrowserAgent`'s. A test asserts the two prompts do not share the browser-side "COMPLETENESS PROTOCOL" phrase, so a future copy-paste gets caught.
@@ -260,7 +260,7 @@ The minimum code change that closes the user-visible "result computed but never 
 - **Tauri 2 integration.** Scaffolded `mew-ui`. Side-stepped unreliable Windows reparenting by adopting pure CDP `Browser.setWindowBounds` for docking.
 - **Stream segregation.** One-shot `app.emit` for session lifecycle events; ordered Tauri `Channel<any>` for the live event stream.
 - **Intent classification.** A single input field that routes to conversational chat or browser task without the user noticing the boundary.
-- **Two-agent split.** `ChatAgent` + `BrowserAgent` + typed `Handoff` / `Result` structs. `mew_agent::chat_agent.rs`, `mew_agent::handoff.rs`, `mew_agent::orchestrator.rs`. `ChatAgent::synthesize_reply` is the only place a user-facing chat message is produced. The bug-2 root cause ("final result computed but never `app.emit`'d") is fixed by construction.
+- **Two-agent split.** `mew-agent` crate contains `ChatAgent`, `Planner`, `BrowserAgent`, `Orchestrator`, `Todo`, `Handoff`, and `Result` types. Includes `CompletenessTracker`, `PacingGuard`, and modules for `planner`, `summarizer`, `research`, and `eval`. Orchestrated via `mew_agent::orchestrator.rs`. `ChatAgent::synthesize_reply` is the only place a user-facing chat message is produced. The bug-2 root cause ("final result computed but never `app.emit`'d") is fixed by construction.
 - **Mid-task steering ack channel.** `orchestrator::acknowledge_steering` + `SteeringAcknowledged` event + `TauriSink::chat-steering-ack` + frontend listener — the user sees "Got it, the agent will adjust." in the same frame as their steering message.
 - **Live round trip verified.** `phase3_round_trip.rs` exercises the full `ChatAgent → BrowserAgent → ChatAgent` flow and asserts equivalent end state for both `Done` and `Failed` results.
 
@@ -350,6 +350,13 @@ browser:
   visible_cursor: false                            # ghost cursor overlay; default off
 
 agent:
+  planner_enabled: false
+  todo:
+    enabled: false
+    default_budget_secs: 120
+    max_attempts: 3
+    max_concurrent_tasks: 4
+    replan_max_per_task: 1
   allowed_domains: [list]                          # safety whitelist
   task_presets: { name: "task string" }            # named task shortcuts
   pacing:
