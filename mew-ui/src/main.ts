@@ -97,6 +97,12 @@ let nextMessageId = 1;
 const mintId = (): string => `m${nextMessageId++}`;
 let activeTaskId: string | null = null;
 let activeTaskSteps = 0;
+// Bug fix: shared handle for the "fade to Idle" timer set by
+// `finishWorkingPill`. Stored at module scope so the next task's
+// `startWorkingPill` can clearTimeout() it — otherwise a fast
+// follow-up prompt inside the 1800 ms window would have its
+// `activeTaskId` wiped by the *previous* task's pending timer.
+let idleTimer: number | null = null;
 // Phase 5: cap on the visible live progress lines per
 // task. Mirrors `agent.summarization.live_lines_cap` in
 // config.yaml (default 5). Older lines are collapsed into
@@ -460,7 +466,21 @@ function updateStatus(state: string): void {
   // never disagrees with the left. The pill is purely cosmetic
   // (the actual stream health comes from the frame counter and
   // the "Live" status dot).
+  //
+  // Bug fix: the `agent-screencast-frame` listener adds the
+  // `is-live` class to both `previewStatusPill` and
+  // `previewStatusDot` on every frame, but it never removes it.
+  // Across two consecutive browser tasks this leaks: task 1
+  // finishes with `is-live` still on the pill/dot, and the
+  // "Idle" / "Done" transitions below never clear it, so when
+  // task 2 starts the pill still reads with the cyan "Live"
+  // chrome even after the new task's first frame has updated
+  // the image. Strip `is-live` here at the top of every state
+  // transition; the frame listener will re-add it the moment
+  // a new frame lands, which is the only correct signal.
   if (previewStatusPill && previewStatusDot) {
+    previewStatusPill.classList.remove('is-live');
+    previewStatusDot.classList.remove('is-live');
     if (lower.includes('run') || lower.includes('start') || lower.includes('work')) {
       previewStatusPill.textContent = 'Streaming';
       previewStatusDot.classList.add('is-active');
@@ -485,6 +505,20 @@ function updateStatus(state: string): void {
 }
 
 function startWorkingPill(): void {
+  // Bug fix: a fast-follow-up second task used to be clobbered
+  // by the *previous* task's "fade to Idle" timer. `finishWorkingPill`
+  // schedules a 1800 ms setTimeout that nulls `activeTaskId`; if
+  // the user sent the next prompt inside that window, the late
+  // timer would fire AFTER the new `chat-task-started` handler
+  // had already set `activeTaskId` to the new task's id — wiping
+  // it back to null and dropping the chat pill back to "Idle"
+  // mid-task. The "other stuff" the user noticed is the same
+  // race on the live preview's status pill / dot. Clearing the
+  // pending timer here makes the new task own the slot.
+  if (idleTimer !== null) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
   activeTaskSteps = 0;
   if (activeTaskId) {
     const todos = taskTodos.get(activeTaskId) || [];
@@ -524,7 +558,15 @@ function finishWorkingPill(kind: 'done' | 'failed'): void {
   } else {
     updateStatus(`Failed · ${activeTaskSteps} step${activeTaskSteps === 1 ? '' : 's'}`);
   }
-  setTimeout(() => {
+  // Bug fix: store the handle on a module-level `idleTimer` so
+  // a follow-up `startWorkingPill` (next prompt) can clear it.
+  // Otherwise the late timer wipes the new task's `activeTaskId`
+  // and drops the preview pill back to "Idle" mid-task.
+  if (idleTimer !== null) {
+    clearTimeout(idleTimer);
+  }
+  idleTimer = window.setTimeout(() => {
+    idleTimer = null;
     updateStatus('Idle');
     activeTaskId = null;
     activeTaskSteps = 0;

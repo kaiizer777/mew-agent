@@ -1356,28 +1356,29 @@ pub async fn start_screencast_with_first_frame(
         // First tick is immediate on `interval`; skip it so we
         // don't double-up with the synchronous one-shot above.
         interval.tick().await;
+        let mut consecutive_errors = 0;
         loop {
             interval.tick().await;
             match capture_screenshot(&page_for_poll).await {
                 Ok(data) => {
+                    consecutive_errors = 0;
                     if tx.send((data, 0)).is_err() {
                         // Receiver gone. Bail.
                         break;
                     }
                 }
                 Err(e) => {
-                    // Page is gone or in some bad state. Log
-                    // and stop — the agent loop will surface a
-                    // proper error to the user, and the right
-                    // pane is the least of their worries at
-                    // that point.
+                    consecutive_errors += 1;
                     tracing::warn!(
                         event = "live_preview_poll_screenshot_failed",
                         error = %e,
-                        "Live preview poll task: capture_screenshot failed; \
-                         stopping the live preview"
+                        consecutive_errors,
+                        "Live preview poll task: capture_screenshot failed"
                     );
-                    break;
+                    if consecutive_errors >= 20 {
+                        tracing::error!("Live preview poll task: too many consecutive errors, stopping.");
+                        break;
+                    }
                 }
             }
         }
