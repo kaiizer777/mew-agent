@@ -29,6 +29,25 @@ pub mod orchestrator;
 pub mod exporter;
 pub mod pacing;
 pub mod planner;
+// Phase 8: named personal-workflow presets (`mew run-preset
+// daily_remote_jobs`). Pure-Rust typed surface — see the
+// module-level doc for the design rationale and the seed
+// preset list.
+pub mod presets;
+// Phase 8: job/freelance lesson surface (Tauri command +
+// CLI plumbing). Filters the `mew-memory` `LessonStore`
+// down to the two task shapes the user cares about
+// (JobSearch + LeadGen) with a typed `JobFreelanceLesson`
+// struct the chat list can render with a stable layout.
+pub mod job_freelance_lessons;
+// Phase 8: per-run results digest export. Writes a
+// Markdown summary of the run's findings to
+// `<data_dir>/digests/YYYY-MM-DD.md` at task completion,
+// independent of the in-chat summary. Pure-Rust, no
+// chrono dep, no LLM call, no network. See the module
+// doc for the on-disk format and the `enabled: true`
+// gate.
+pub mod digests;
 // Phase 36: agent-optimized task prompt compiler. Pure-Rust
 // pre-flight normalization of the raw user task into an
 // agent-executable form (no LLM call, no `regex` crate).
@@ -115,8 +134,37 @@ pub struct CredentialsConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
+    /// Legacy free-form task-text presets. The `mew run --preset
+    /// <name>` path looks up a `String` from this map and dispatches
+    /// it as a one-shot task description. Operators can edit this in
+    /// `config.yaml`. The structured-typed path
+    /// (`mew run-preset <name>`) uses the Phase 8 `presets::TaskPreset`
+    /// surface — see `mew_agent::presets::default_presets()` for the
+    /// seed list. Both surfaces are available; they don't
+    /// interfere with each other.
     #[serde(default)]
     pub task_presets: std::collections::HashMap<String, String>,
+    /// Phase 8: structured per-run results digest export. When
+    /// `enabled: true`, the agent writes a Markdown summary of
+    /// the run's findings to `<data_dir>/digests/YYYY-MM-DD.md`
+    /// at task completion, independent of the in-chat summary.
+    /// Default `enabled: false` (no file written) — operators
+    /// who want the digest must opt in. The on-disk format is
+    /// stable so a future "review last week's digests" command
+    /// can read it.
+    #[serde(default)]
+    pub digests: DigestConfig,
+    /// Phase 8: structured preset overrides. The seed presets
+    /// from `mew_agent::presets::default_presets()` are the
+    /// baseline; an operator who wants to override the budget
+    /// per-platform for a specific preset can add an entry here
+    /// (the map is keyed by preset name and values are
+    /// `TaskPreset` records). When a preset exists in both the
+    /// defaults and the operator's `task_preset_overrides`, the
+    /// operator's entry wins. Missing presets fall back to the
+    /// seed defaults.
+    #[serde(default)]
+    pub task_preset_overrides: std::collections::HashMap<String, presets::TaskPreset>,
     #[serde(default)]
     pub allowed_domains: Option<Vec<String>>,
     /// Phase 4: single-credential auth. The user supplies one Gmail
@@ -424,6 +472,41 @@ impl Default for AutoApplyConfig {
     }
 }
 
+/// Phase 8: configuration for the on-disk results digest
+/// export. When `enabled: true`, the agent writes a Markdown
+/// summary of the run's findings to
+/// `<data_dir>/digests/YYYY-MM-DD.md` at task completion,
+/// independent of the in-chat summary. The file is
+/// append-only and idempotent for the same date — a fresh
+/// run on the same day overwrites the prior file. Default
+/// `enabled: false` (no file written). The path can be
+/// overridden via `output_dir`; when `None`, the agent
+/// resolves to the standard per-platform data directory
+/// (Tauri's `app_data_dir()` in the UI, `<cwd>/digests/`
+/// in CLI / test contexts).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DigestConfig {
+    #[serde(default = "default_digest_enabled")]
+    pub enabled: bool,
+    /// `None` = use the runtime-resolved default
+    /// (Tauri: `<app_data_dir>/digests/`; CLI: `<cwd>/digests/`).
+    #[serde(default)]
+    pub output_dir: Option<std::path::PathBuf>,
+}
+
+fn default_digest_enabled() -> bool {
+    false
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_digest_enabled(),
+            output_dir: None,
+        }
+    }
+}
+
 fn default_max_tools_per_turn() -> usize {
     1
 }
@@ -443,6 +526,8 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             task_presets: std::collections::HashMap::new(),
+            digests: DigestConfig::default(),
+            task_preset_overrides: std::collections::HashMap::new(),
             allowed_domains: None,
             credentials: CredentialsConfig::default(),
             pacing: crate::pacing::PacingConfig::default(),

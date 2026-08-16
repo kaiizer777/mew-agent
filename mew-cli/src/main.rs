@@ -11,13 +11,22 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: mew run \"task description\" or mew run --preset \"preset_name\"");
+        eprintln!("Usage:");
+        eprintln!("  mew run \"task description\"");
+        eprintln!("  mew run --preset \"preset_name\"");
+        eprintln!("  mew run-preset \"preset_name\"          # Phase 8: structured preset path");
+        eprintln!("  mew list-presets                        # Phase 8: catalog of available presets");
+        eprintln!("  mew memory dump");
         return Ok(());
     }
 
     let config = mew_agent::load_config()?;
 
     let mut task_desc = String::new();
+    // Phase 8: structured-preset path. The CLI dispatches on
+    // `args[1] == "run-preset"`; the legacy `mew run --preset
+    // <name>` (free-form text) stays as the back-compat surface.
+    let mut structured_handoff: Option<mew_agent::handoff::Handoff> = None;
 
     if args[1] == "memory" {
         let sub = args.get(2).map(|s| s.as_str()).unwrap_or("dump");
@@ -58,7 +67,47 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if args[1] == "run" {
+    // Phase 8: `mew list-presets` — print the available
+    // preset catalog to stdout. Useful for "what presets
+    // can I trigger?" and for shell-completion.
+    if args[1] == "list-presets" {
+        let merged = mew_agent::presets::merged_presets(&config.agent.task_preset_overrides);
+        print!("{}", mew_agent::presets::render_preset_catalog(&merged));
+        return Ok(());
+    }
+
+    if args[1] == "run-preset" {
+        if args.len() != 3 {
+            eprintln!("Usage: mew run-preset \"preset_name\"");
+            eprintln!(
+                "Available presets: {}",
+                mew_agent::presets::render_preset_catalog(&mew_agent::presets::merged_presets(
+                    &config.agent.task_preset_overrides
+                ))
+            );
+            return Ok(());
+        }
+        let preset_name = &args[2];
+        let merged = mew_agent::presets::merged_presets(&config.agent.task_preset_overrides);
+        match mew_agent::presets::resolve_preset(preset_name, &merged) {
+            Some(preset) => {
+                let handoff = mew_agent::presets::build_handoff_for_preset(preset, "cli-preset");
+                task_desc = handoff.task_description.clone();
+                structured_handoff = Some(handoff);
+            }
+            None => {
+                eprintln!(
+                    "Preset '{}' not found. Available presets:",
+                    preset_name
+                );
+                eprint!(
+                    "{}",
+                    mew_agent::presets::render_preset_catalog(&merged)
+                );
+                return Ok(());
+            }
+        }
+    } else if args[1] == "run" {
         if args.len() == 3 {
             task_desc = args[2].clone();
         } else if args.len() == 4 && args[2] == "--preset" {
@@ -79,6 +128,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Task: {}", task_desc);
+    if let Some(h) = &structured_handoff {
+        println!(
+            "Preset subtasks ({}): {}",
+            h.subtasks.len(),
+            h.subtasks
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<&str>>()
+                .join(", ")
+        );
+    }
 
     println!("Launching headed Chrome...");
     let (browser, page, handler_task, job) = match mew_cdp::launch(

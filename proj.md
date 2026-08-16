@@ -456,9 +456,41 @@ agent:
     provider: <name>                               # 2captcha | anti-captcha | capmonster | ...
     api_key_env: <env var>                         # env var holding the provider key
     per_session_cap: 5
+  auto_apply:                                      # Phase 6: application / outreach action layer
+    enabled: false                                 # master switch; default false (pure no-op)
+    require_confirmation_per_application: true     # pause per application when enabled
+    max_applications_per_run: 10                   # hard cap, hard-clamped to [1, 1000]
+  export:                                          # Phase 41: lead-gen result export
+    enabled: false
+    format: csv                                    # csv | json | markdown
+    output_dir: null                               # null = <cwd>/exports/
+  digests:                                         # Phase 8: per-run results digest export
+    enabled: false                                 # default false (no file written)
+    output_dir: null                               # null = <cwd>/digests/; Tauri overrides to <app_data_dir>/digests/
+  task_preset_overrides: {}                        # Phase 8: structured preset overrides (typed TaskPreset)
 ```
 
 `config/sensitive_platforms.toml` and `config/research_platforms.toml` are the two operator-editable data tables. See their inline comments for the full schema.
+
+### Phase 8 seed presets
+
+The `mew_agent::presets` module ships three named, structured presets
+that the user can trigger with `mew run-preset <name>` (CLI) or
+`list_presets` (Tauri command). The seeds live in
+`mew_agent::presets::default_presets()` and are merged with the
+operator's `task_preset_overrides` from `config.yaml`:
+
+| Preset | Shape | Platforms | TaskShape on Handoff |
+| --- | --- | --- | --- |
+| `daily_remote_jobs` | `DailyRemoteJobs` | LinkedIn, Indeed, Wellfound, WeWorkRemotely, RemoteOK | `Some(JobSearch)` |
+| `daily_freelance_leads` | `DailyFreelanceLeads` | Upwork, Contra, WeWorkRemotely-Contract, Freelancer.com, Guru | `Some(LeadGen)` |
+| `weekly_full_search` | `WeeklyFullSearch` | both lists, union clamped to 6 platforms | `None` (mixed vertical) |
+
+The structured preset path is distinct from the legacy
+`task_presets: HashMap<String, String>` map (the Phase 17
+`mew run --preset <name>` free-form-text path). Both surfaces
+exist; they don't interfere with each other. See
+`docs/personal-use-setup.md` for the user-facing setup flow.
 
 ---
 

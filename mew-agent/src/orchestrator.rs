@@ -41,12 +41,14 @@
 // sink. The orchestrator is the *protocol*, not the *runtime*.
 
 use crate::agent::Agent;
+use crate::auth::AuthState;
 use crate::chat_agent::ChatAgent;
 use crate::exporter::{self, AnyFinding};
 use crate::handoff::{BrowserResult, BrowserStatus, Handoff, MapsFinding};
 use crate::router::{ConversationMessage, Intent};
+use crate::session_summary::SessionSummaryInputs;
 pub use crate::todo::EvidenceMismatch;
-use crate::{ExportConfig, ProviderConfig};
+use crate::{DigestConfig, ExportConfig, ProviderConfig};
 // Phase 3: use the re-exported `Page` from `mew-cdp` rather
 // than depending on `chromiumoxide` directly. Keeps the
 // orchestrator's public surface free of the
@@ -602,6 +604,25 @@ pub async fn dispatch_browser_task(
         &task_label,
         &handoff.originating_message_id,
     );
+    // Phase 8: per-run digest export. Fire-and-forget — the
+    // digest is independent of the in-chat reply, so the
+    // write result is logged but never blocks the chat
+    // surface. When the digest path resolves, we append a
+    // `📁 Digest saved to: ...` line to the chat reply so
+    // the user can see the file path without leaving the
+    // chat. The append is a no-op when the write fails.
+    let digest_path =
+        maybe_write_digest(&chat_agent.config().agent.digests, &handoff, &result, None, 0);
+    let reply = if let Some(path) = digest_path.as_ref() {
+        let mut out = reply;
+        out.push_str(&format!(
+            "\n\n📁 Digest saved to: {}",
+            path.display()
+        ));
+        out
+    } else {
+        reply
+    };
     sink.emit(OrchestratorEvent::ChatReply {
         originating_message_id: handoff.originating_message_id.clone(),
         text: reply.clone(),
@@ -1283,6 +1304,69 @@ fn maybe_export_and_append_trailer(
                  continuing without the file:// trailer"
             );
             (reply, None)
+        }
+    }
+}
+
+/// Phase 8: per-run results digest export. When
+/// `agent.digests.enabled: true`, the orchestrator writes a
+/// Markdown summary of the run's findings to
+/// `<data_dir>/digests/YYYY-MM-DD.md` at task completion,
+/// independent of the in-chat summary. The path is
+/// returned so the caller can append a `📁 Digest saved
+/// to: ...` line to the chat reply — same pattern as
+/// Phase 41's lead-gen export.
+///
+/// `output_dir` resolution: when `digest_config.output_dir`
+/// is `Some`, use it verbatim. When `None`, fall back to
+/// `<cwd>` — the Tauri UI overrides this at runtime via
+/// `app_data_dir()` by writing the resolved path into
+/// `config.yaml` before the agent runs, so a release
+/// install writes digests to the per-user app-data tree.
+///
+/// Non-fatal — a write error degrades to the pre-Phase-8
+/// byte-equivalent behavior (no file, no trailer).
+fn maybe_write_digest(
+    digest_config: &DigestConfig,
+    handoff: &Handoff,
+    result: &BrowserResult,
+    auth_state: Option<&AuthState>,
+    applications_sent: usize,
+) -> Option<std::path::PathBuf> {
+    if !digest_config.enabled {
+        return None;
+    }
+    let out_dir: std::path::PathBuf = match &digest_config.output_dir {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    };
+    let when = std::time::SystemTime::now();
+    let inputs = SessionSummaryInputs {
+        result,
+        auth_state,
+        applications_sent,
+        platforms_not_reached: Vec::new(),
+    };
+    let section =
+        crate::digests::render_run_section(when, &inputs, &handoff.task_description);
+    match crate::digests::write_run_digest(&out_dir, when, &section) {
+        Ok(path) => {
+            tracing::info!(
+                event = "phase8_digest_written",
+                originating_message_id = %handoff.originating_message_id,
+                path = %path.display(),
+                "Phase 8: per-run digest written to disk"
+            );
+            Some(path)
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = "phase8_digest_failed",
+                originating_message_id = %handoff.originating_message_id,
+                error = %e,
+                "Phase 8: failed to write digest; continuing without on-disk record"
+            );
+            None
         }
     }
 }

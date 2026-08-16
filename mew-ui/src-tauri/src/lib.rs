@@ -55,6 +55,38 @@ fn get_recent_lessons(app_handle: AppHandle) -> Result<Vec<String>, String> {
     Ok(digest)
 }
 
+/// Phase 8: typed job/freelance lesson surface. Returns a
+/// structured `Vec<JobFreelanceLesson>` (id, task_shape,
+/// platform, lesson_text, confidence, times_helped) so the
+/// chat list can render the two verticals (jobs / freelance)
+/// with a stable layout. The existing `get_recent_lessons`
+/// command is the cross-vertical surface; this one is the
+/// focused surface for the user's daily-use case.
+#[tauri::command]
+fn get_job_freelance_lessons(
+    app_handle: AppHandle,
+) -> Result<Vec<mew_agent::job_freelance_lessons::JobFreelanceLesson>, String> {
+    let data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+    Ok(mew_agent::job_freelance_lessons::collect(&data_dir))
+}
+
+/// Phase 8: list the available named presets. Returns the
+/// catalog as a Markdown string the chat list can render
+/// directly under a "Available presets:" header. The
+/// underlying `mew_agent::presets::merged_presets` merges
+/// the seed defaults with the operator's
+/// `task_preset_overrides` from `config.yaml`.
+#[tauri::command]
+fn list_presets() -> Result<String, String> {
+    let cfg =
+        load_config().map_err(|e| error_message::for_user(&e, "load the configuration file"))?;
+    let merged = mew_agent::presets::merged_presets(&cfg.agent.task_preset_overrides);
+    Ok(mew_agent::presets::render_preset_catalog(&merged))
+}
+
 /// Phase 41: open the export directory in the OS file
 /// manager. Surfaced as a "📂 Open exports folder" button
 /// next to the export file link in the chat reply. The
@@ -1331,6 +1363,8 @@ pub fn run() {
             send_message,
             get_config_summary,
             get_recent_lessons,
+            get_job_freelance_lessons,
+            list_presets,
             pause_session,
             resume_session,
             start_task,
