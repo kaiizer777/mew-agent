@@ -108,7 +108,9 @@ impl EvalReport {
     /// comma-separated string in the last column.
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str("| Scenario | Passed | Status | Subtasks | Steps | Elapsed (ms) | Failure modes |\n");
+        out.push_str(
+            "| Scenario | Passed | Status | Subtasks | Steps | Elapsed (ms) | Failure modes |\n",
+        );
         out.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
         for r in &self.rows {
             let _ = writeln!(

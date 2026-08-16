@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
-use mew_agent::chat::{MessageBus, UserMessage};
 use mew_agent::agent::Agent;
+use mew_agent::chat::{MessageBus, UserMessage};
 
 // ----------------------------------------------------------------------------
 // Simulated-loop harness. Mirrors the Agent's per-iteration behavior closely
@@ -105,7 +105,8 @@ impl SimLoop {
             self.messages = rebuilt;
             let after = self.messages.len();
             let now = now_secs();
-            self.truncated_log.push((now, self.iteration, before, after));
+            self.truncated_log
+                .push((now, self.iteration, before, after));
         }
 
         // 3) Simulate "I just took a snapshot and called the LLM, here's
@@ -233,12 +234,17 @@ async fn test_mid_task_injection() {
         pre_count, 4,
         "expected task (1) + 3 obs = 4 user messages, got {pre_count}"
     );
-    println!("  before injection: {} user messages in history (1 task + 3 snapshots)", pre_count);
+    println!(
+        "  before injection: {} user messages in history (1 task + 3 snapshots)",
+        pre_count
+    );
 
     // Inject a steering note.
-    tx.send(UserMessage::now("also open a new tab and check the weather"))
-        .await
-        .unwrap();
+    tx.send(UserMessage::now(
+        "also open a new tab and check the weather",
+    ))
+    .await
+    .unwrap();
     println!("  injected: 'also open a new tab and check the weather'");
 
     // Next iteration: drain should pick it up, history appends.
@@ -323,9 +329,9 @@ async fn test_mid_task_correction() {
     // (after the original task, before the next snapshot we generate).
     let mut found_note_idx = None;
     for (i, m) in sim.messages.iter().enumerate() {
-        if m.get("content").and_then(|c| c.as_str()) == Some(
-            "[user note while task is running] no, use my other account",
-        ) {
+        if m.get("content").and_then(|c| c.as_str())
+            == Some("[user note while task is running] no, use my other account")
+        {
             found_note_idx = Some(i);
             break;
         }
@@ -334,9 +340,14 @@ async fn test_mid_task_correction() {
     let task_idx = sim
         .messages
         .iter()
-        .position(|m| m.get("content").and_then(|c| c.as_str()) == Some("Task: do the original thing"))
+        .position(|m| {
+            m.get("content").and_then(|c| c.as_str()) == Some("Task: do the original thing")
+        })
         .expect("task should be present");
-    assert!(note_idx > task_idx, "note should come after the original task");
+    assert!(
+        note_idx > task_idx,
+        "note should come after the original task"
+    );
     println!("  PASS: correction note at position {note_idx} (after task at {task_idx}) — next LLM call sees it");
 }
 
@@ -355,12 +366,15 @@ async fn test_navigation_preserves_user_notes() {
     sim.step(false);
     tx.send(UserMessage::now("use my other account on this site too"))
         .await
-    .unwrap();
+        .unwrap();
     sim.step(false);
 
     // History should now have: system, task, 2 obs+assistant pairs, the note.
     let pre_truncate_len = sim.messages.len();
-    println!("  before simulated nav: {} messages, 1 user note", pre_truncate_len);
+    println!(
+        "  before simulated nav: {} messages, 1 user note",
+        pre_truncate_len
+    );
     assert_eq!(sim.user_notes().len(), 1);
 
     // Simulate the navigation reset.
@@ -503,7 +517,10 @@ fn make_test_config() -> mew_agent::ProviderConfig {
             max_tokens: None,
             max_cost: None,
         },
-        browser: Some(BrowserConfig { binary_path: None, visible_cursor: false }),
+        browser: Some(BrowserConfig {
+            binary_path: None,
+            visible_cursor: false,
+        }),
         agent: AgentConfig::default(),
     }
 }
@@ -546,15 +563,15 @@ async fn test_real_agent_integration() {
         .count();
     assert_eq!(
         user_count,
-        1 /* original task */ + 3 /* 3 notes */,
+        1 /* original task */ + 3, /* 3 notes */
         "history should have original task + 3 user notes"
     );
     println!("  PASS: history has 1 original task + 3 user notes = 4 user messages");
 
     // The original task is preserved.
-    let has_task = history.iter().any(|m| {
-        m.get("content").and_then(|c| c.as_str()) == Some("Task: open a tab")
-    });
+    let has_task = history
+        .iter()
+        .any(|m| m.get("content").and_then(|c| c.as_str()) == Some("Task: open a tab"));
     assert!(has_task, "original task must be preserved");
     println!("  PASS: original 'Task: open a tab' preserved in history");
 
@@ -563,7 +580,10 @@ async fn test_real_agent_integration() {
         .iter()
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
         .filter(|c| c.starts_with("[user note while task is running]"))
-        .map(|c| c.trim_start_matches("[user note while task is running] ").to_string())
+        .map(|c| {
+            c.trim_start_matches("[user note while task is running] ")
+                .to_string()
+        })
         .collect();
     assert_eq!(
         note_texts,

@@ -1,5 +1,5 @@
-use tracing_subscriber::EnvFilter;
 use std::env;
+use tracing_subscriber::EnvFilter;
 
 mod stdin_chat;
 
@@ -19,6 +19,45 @@ async fn main() -> anyhow::Result<()> {
 
     let mut task_desc = String::new();
 
+    if args[1] == "memory" {
+        let sub = args.get(2).map(|s| s.as_str()).unwrap_or("dump");
+        if sub == "dump" {
+            let data_dir = std::path::PathBuf::from("transcripts");
+            let store = mew_memory::LessonStore::new(&data_dir);
+            let lessons = store.read_all()?;
+            println!(
+                "=== Episodic Memory Store Dump ({} lessons) ===",
+                lessons.len()
+            );
+            if lessons.is_empty() {
+                println!("(memory store is empty)");
+            } else {
+                for l in &lessons {
+                    let platform = l.platform.as_deref().unwrap_or("any");
+                    let conflicts = if l.conflicting_with.is_empty() {
+                        "none".to_string()
+                    } else {
+                        l.conflicting_with.join(", ")
+                    };
+                    println!("--------------------------------------------------");
+                    println!("ID:           {}", l.id);
+                    println!("Created At:   {}", l.created_at);
+                    println!("Task Shape:   {:?}", l.task_shape);
+                    println!("Platform:     {}", platform);
+                    println!("Situation:    {}", l.situation);
+                    println!("Lesson:       {}", l.lesson_text);
+                    println!("Confidence:   {:.2}", l.confidence_score);
+                    println!("Times Seen:   {}", l.times_seen);
+                    println!("Times Helped: {}", l.times_helped);
+                    println!("Outcome:      {:?}", l.outcome);
+                    println!("Conflicts:    {}", conflicts);
+                }
+                println!("--------------------------------------------------");
+            }
+            return Ok(());
+        }
+    }
+
     if args[1] == "run" {
         if args.len() == 3 {
             task_desc = args[2].clone();
@@ -31,11 +70,11 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
         } else {
-            eprintln!("Usage: mew run \"task description\" or mew run --preset \"preset_name\"");
+            eprintln!("Usage: mew run \"task description\" or mew memory dump");
             return Ok(());
         }
     } else {
-        eprintln!("Usage: mew run \"task description\" or mew run --preset \"preset_name\"");
+        eprintln!("Usage: mew run \"task description\" or mew memory dump");
         return Ok(());
     }
 
@@ -44,12 +83,18 @@ async fn main() -> anyhow::Result<()> {
     println!("Launching headed Chrome...");
     let (browser, page, handler_task, job) = match mew_cdp::launch(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
-        config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
-    ).await {
+        config
+            .browser
+            .as_ref()
+            .map(|b| b.visible_cursor)
+            .unwrap_or(false),
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to launch Chrome: {e}");
-            return Err(e.into());
+            return Err(e);
         }
     };
 

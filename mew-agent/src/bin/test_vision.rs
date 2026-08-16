@@ -6,7 +6,7 @@ use std::env;
 async fn main() -> anyhow::Result<()> {
     // Suppress heavy logs unless testing
     // tracing_subscriber::fmt::init();
-    
+
     let config = load_config()?;
     let cwd = env::current_dir().unwrap();
     // Read the test HTML from tests-output/test_vision/ where it now
@@ -16,30 +16,35 @@ async fn main() -> anyhow::Result<()> {
         "file:///{}/test_vision.html",
         html_dir.display().to_string().replace("\\", "/")
     );
-    
+
     let (browser, page, handler, job) = mew_cdp::launch(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
         false,
-    ).await?;
-    
+    )
+    .await?;
+
     // Navigate
     println!("Navigating to test page...");
     mew_cdp::navigate(&page, &file_url).await?;
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    
+
     // Task 1: Normal button
     println!("\n=== TASK 1: Click the 'Click Me Normal' button ===");
-    let mut agent1 = Agent::new(config.clone(), "Click the 'Click Me Normal' button and then finish.", None);
+    let mut agent1 = Agent::new(
+        config.clone(),
+        "Click the 'Click Me Normal' button and then finish.",
+        None,
+    );
     agent1.run(&page).await?;
-    
+
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    
+
     // Task 2: Image button (vision fallback)
     println!("\n=== TASK 2: There is a small square image button on the page that has no text. Click it. ===");
     let mut agent2 = Agent::new(config.clone(), "There is a small square image button on the page that has no text. Find its ref in the accessibility tree (it may just look like an empty button or image). Use vision_inspect on it to verify it is the image button, then click it and finish.", None);
     agent2.run(&page).await?;
-    
+
     mew_cdp::shutdown(browser, handler, job).await?;
-    
+
     Ok(())
 }

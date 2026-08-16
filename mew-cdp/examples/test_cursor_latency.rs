@@ -8,8 +8,8 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
+use chromiumoxide::Page;
 use mew_cdp::{click_ref, compute_element_center, launch, move_cursor_and_ripple, shutdown};
 
 fn parse_args() -> Result<bool> {
@@ -27,8 +27,14 @@ fn parse_args() -> Result<bool> {
 fn median(v: &mut Vec<u128>) -> u128 {
     v.sort();
     let n = v.len();
-    if n == 0 { return 0; }
-    if n % 2 == 1 { v[n/2] } else { (v[n/2 - 1] + v[n/2]) / 2 }
+    if n == 0 {
+        return 0;
+    }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2
+    }
 }
 
 #[tokio::main]
@@ -84,7 +90,13 @@ async fn main() -> Result<()> {
 
         bare_clicks.push(bare);
         full_clicks.push(full);
-        println!("trial {}: bare={}ms full={}ms (delta={}ms)", i+1, bare, full, full as i128 - bare as i128);
+        println!(
+            "trial {}: bare={}ms full={}ms (delta={}ms)",
+            i + 1,
+            bare,
+            full,
+            full as i128 - bare as i128
+        );
     }
 
     let bare_med = median(&mut bare_clicks);
@@ -92,7 +104,10 @@ async fn main() -> Result<()> {
     println!();
     println!("median bare click_ref:   {} ms", bare_med);
     println!("median full (cursor):    {} ms", full_med);
-    println!("median cursor overhead:  {} ms", full_med as i128 - bare_med as i128);
+    println!(
+        "median cursor overhead:  {} ms",
+        full_med as i128 - bare_med as i128
+    );
     println!("(includes 200ms slide sleep + 1 box-model call + 1 ripple evaluate)");
 
     let _ = shutdown(browser, handle, job).await;

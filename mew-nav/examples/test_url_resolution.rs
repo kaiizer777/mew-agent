@@ -63,10 +63,7 @@ async fn main() -> anyhow::Result<()> {
     use std::sync::Mutex;
     let transcript = Mutex::new(transcript);
 
-    let banner = format!(
-        "\n--- 14.2 test run @ {:?} ---\n",
-        Instant::now()
-    );
+    let banner = format!("\n--- 14.2 test run @ {:?} ---\n", Instant::now());
     let mut t = transcript.lock().unwrap();
     t.write_all(banner.as_bytes())?;
     t.flush()?;
@@ -74,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Print the live test plan so the operator running this can see what's about to fire.
     println!("Phase 14.2 — URL resolution review & testing");
-    println!("  Direct-guess probe timeout: {:?}", DIRECT_GUESS_PROBE_TIMEOUT);
+    println!(
+        "  Direct-guess probe timeout: {:?}",
+        DIRECT_GUESS_PROBE_TIMEOUT
+    );
     println!("  Transcript log: {}", TRANSCRIPT_PATH);
     println!();
 
@@ -82,9 +82,7 @@ async fn main() -> anyhow::Result<()> {
     // CLI does, with a permissive (None) allowlist — this test isn't
     // exercising the allowlist, only the resolver.
     let (browser, page, handler_task, job) = mew_cdp::launch(
-        Some(
-            "C:\\Users\\bari2\\Desktop\\mew-agent\\stealth-browser\\chrome.exe".to_string(),
-        ),
+        Some("C:\\Users\\bari2\\Desktop\\mew-agent\\stealth-browser\\chrome.exe".to_string()),
         false,
     )
     .await?;
@@ -327,8 +325,7 @@ async fn main() -> anyhow::Result<()> {
     // timeout*, not 0ms (fast-fail) and not wildly higher (a hung
     // probe that didn't honor the timeout). We allow a generous
     // upper bound of 2x the timeout to absorb scheduler noise.
-    let true_timeout_ok = elapsed >= custom_timeout
-        && elapsed < custom_timeout * 2;
+    let true_timeout_ok = elapsed >= custom_timeout && elapsed < custom_timeout * 2;
     if true_timeout_ok {
         passed += 1;
         println!(

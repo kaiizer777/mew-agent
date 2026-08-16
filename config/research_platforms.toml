@@ -42,6 +42,8 @@
 #                     already contain a specific phrase. Empty
 #                     means "use the goal verbatim." The
 #                     orchestrator can override at runtime.
+#   platform_kind   — e.g. "job_board", "generic".
+#   query_template  — URL template to bypass the search box.
 #
 # Why a separate file (not config.yaml):
 #   1. The research list is a *data* table, not a config knob.
@@ -76,6 +78,32 @@
 # each, search the goal, and try to surface at least one
 # finding with an email or URL per the default acceptance.
 
+# Phase 40: top-level `required_domains` key. When a session is
+# routed to a `JobSearch` or `LeadGen` shape, `expand_allowlist`
+# appends every entry below to the session-local
+# `agent.allowed_domains` vec. The expansion is session-local
+# only — the file on disk is untouched. Both bare and
+# `www.`-prefixed forms are listed because a server's
+# redirect chain can land the agent on either.
+required_domains = [
+    "linkedin.com",
+    "www.linkedin.com",
+    "indeed.com",
+    "www.indeed.com",
+    "wellfound.com",
+    "www.wellfound.com",
+    "weworkremotely.com",
+    "www.weworkremotely.com",
+    "remoteok.com",
+    "www.remoteok.com",
+    "producthunt.com",
+    "www.producthunt.com",
+    "indiehackers.com",
+    "www.indiehackers.com",
+    "ycombinator.com",
+    "www.ycombinator.com",
+]
+
 [[entry]]
 id = "linkedin"
 platform = "LinkedIn"
@@ -84,6 +112,8 @@ entry_hint = "Search the goal; filter Remote; click first 3 results"
 step_budget = 12
 time_budget_secs = 90
 default_query = ""
+platform_kind = "job_board"
+query_template = "https://www.linkedin.com/jobs/search/?keywords={role}&location={location}&f_WT={remote}"
 
 [[entry]]
 id = "indeed"
@@ -93,6 +123,8 @@ entry_hint = "Search the goal; filter Remote"
 step_budget = 10
 time_budget_secs = 75
 default_query = ""
+platform_kind = "job_board"
+query_template = "https://www.indeed.com/jobs?q={role}&l={location}"
 
 [[entry]]
 id = "wellfound"
@@ -102,6 +134,8 @@ entry_hint = "Search the goal; click first 3 startup roles"
 step_budget = 10
 time_budget_secs = 75
 default_query = ""
+platform_kind = "job_board"
+query_template = "https://wellfound.com/jobs?search={role}"
 
 [[entry]]
 id = "weworkremotely"
@@ -111,6 +145,8 @@ entry_hint = "Search the goal; click first 3 results"
 step_budget = 10
 time_budget_secs = 75
 default_query = ""
+platform_kind = "job_board"
+query_template = "https://weworkremotely.com/remote-jobs/search?term={role}"
 
 [[entry]]
 id = "remoteok"
@@ -120,6 +156,41 @@ entry_hint = "Search the goal; click first 3 results"
 step_budget = 8
 time_budget_secs = 60
 default_query = ""
+platform_kind = "job_board"
+query_template = "https://remoteok.com/remote-{role}-jobs"
+
+# [[entry]]
+# id = "otta"
+# platform = "Otta"
+# domain = "otta.com"
+# entry_hint = "Search the goal; click first 3 results"
+# step_budget = 10
+# time_budget_secs = 75
+# default_query = ""
+# platform_kind = "job_board"
+# query_template = "https://app.otta.com/jobs?search={role}"
+# 
+# [[entry]]
+# id = "flexjobs"
+# platform = "FlexJobs"
+# domain = "flexjobs.com"
+# entry_hint = "Search the goal; click first 3 results"
+# step_budget = 10
+# time_budget_secs = 75
+# default_query = ""
+# platform_kind = "job_board"
+# query_template = "https://www.flexjobs.com/search?search={role}&location={location}"
+# 
+# [[entry]]
+# id = "remoteco"
+# platform = "Remote.co"
+# domain = "remote.co"
+# entry_hint = "Search the goal; click first 3 results"
+# step_budget = 10
+# time_budget_secs = 75
+# default_query = ""
+# platform_kind = "job_board"
+# query_template = "https://remote.co/remote-jobs/search/?q={role}"
 
 # Aggregators / boards we don't want as a default but which
 # operators commonly enable. Commented out so the default
@@ -151,3 +222,47 @@ default_query = ""
 # step_budget = 10
 # time_budget_secs = 75
 # default_query = ""
+
+# ----------------------------------------------------------------------
+# Phase 20: SaaS Lead-Gen Vertical Pack
+#
+# Ethical & ToS Boundary: This vertical intentionally avoids
+# LinkedIn Sales Navigator or paid/restricted scraper flows given
+# ToS and budget boundaries. It focuses on public, low-friction
+# sources at $0 budget: launch boards, startup directories, and
+# public registries.
+# ----------------------------------------------------------------------
+
+[[entry]]
+id = "producthunt"
+platform = "ProductHunt"
+domain = "producthunt.com"
+entry_hint = "Discover candidate companies/startups in target category"
+step_budget = 10
+time_budget_secs = 75
+default_query = ""
+platform_kind = "lead_source"
+query_template = "https://www.producthunt.com/search?q={industry}"
+
+[[entry]]
+id = "indiehackers"
+platform = "IndieHackers"
+domain = "indiehackers.com"
+entry_hint = "Search products and companies by industry"
+step_budget = 10
+time_budget_secs = 75
+default_query = ""
+platform_kind = "lead_source"
+query_template = "https://www.indiehackers.com/products?query={industry}"
+
+[[entry]]
+id = "ycombinator"
+platform = "YCombinator"
+domain = "ycombinator.com"
+entry_hint = "Filter startup directory by industry and size"
+step_budget = 10
+time_budget_secs = 75
+default_query = ""
+platform_kind = "lead_source"
+query_template = "https://www.ycombinator.com/companies?q={industry}"
+

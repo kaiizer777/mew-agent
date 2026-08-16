@@ -39,7 +39,10 @@ pub enum SessionState {
 
 impl SessionState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, SessionState::Stopped | SessionState::Done | SessionState::Failed)
+        matches!(
+            self,
+            SessionState::Stopped | SessionState::Done | SessionState::Failed
+        )
     }
 
     /// Human-readable label, used in the transcript log.
@@ -117,6 +120,13 @@ struct Inner {
     /// could un-park; using a single `Arc<Notify>` keeps things simple and avoids
     /// the "lost wakeup" trap of swapping notifiers mid-park.
     notify: Arc<Notify>,
+    /// Phase 26: Worker health model tracking heartbeats, progress, actions, and token spend.
+    health: mew_resilience::WorkerHealth,
+    /// Phase 4: per-session authentication state. Tracks whether the
+    /// agent has authenticated via Google, which domains are authenticated,
+    /// and failure counts for login attempts. Persisted across subtasks
+    /// so a respawned worker doesn't have to re-login.
+    auth: crate::auth::AuthState,
 }
 
 impl Inner {
@@ -126,6 +136,8 @@ impl Inner {
             history: Vec::new(),
             last_reason: None,
             notify: Arc::new(Notify::new()),
+            health: mew_resilience::WorkerHealth::new("worker-main"),
+            auth: crate::auth::AuthState::default(),
         }
     }
 
@@ -309,7 +321,12 @@ impl SessionHandle {
     /// transcript and via `last_reason()` so a calling thread can read it.
     pub async fn stop(&self, reason: String) -> Result<SessionState, SessionError> {
         let mut guard = self.inner.lock().await;
-        guard.try_transition(SessionState::Stopped, Transition::Stop, "stop", Some(reason))
+        guard.try_transition(
+            SessionState::Stopped,
+            Transition::Stop,
+            "stop",
+            Some(reason),
+        )
     }
 
     /// Mark the session as `Done`. Called when the agent's `finish()` tool
@@ -340,13 +357,12 @@ impl SessionHandle {
         // First check: do we need to park at all? Avoid the notify round-trip
         // when state is already Running — this is the common, no-op path.
         {
-            let guard = self.inner.lock().await;
+            let mut guard = self.inner.lock().await;
+            guard.health.on_checkpoint();
             match guard.state {
                 SessionState::Running => return Ok(()),
                 SessionState::Paused => {}
-                SessionState::Stopped
-                | SessionState::Done
-                | SessionState::Failed => {
+                SessionState::Stopped | SessionState::Done | SessionState::Failed => {
                     return Err(SessionError::Cancelled(format!(
                         "session entered terminal state {:?}",
                         guard.state
@@ -364,14 +380,50 @@ impl SessionHandle {
         let guard = self.inner.lock().await;
         match guard.state {
             SessionState::Running => Ok(()),
-            SessionState::Stopped | SessionState::Done | SessionState::Failed => Err(
-                SessionError::Cancelled(format!("session entered terminal state {:?}", guard.state)),
-            ),
+            SessionState::Stopped | SessionState::Done | SessionState::Failed => {
+                Err(SessionError::Cancelled(format!(
+                    "session entered terminal state {:?}",
+                    guard.state
+                )))
+            }
             // We were notified but still Paused? That shouldn't happen — every
             // notify is paired with a successful transition. Treat defensively.
             SessionState::Paused => Err(SessionError::Cancelled(
                 "checkpoint woken in unexpected state Paused".to_string(),
             )),
         }
+    }
+
+    /// Mutate worker health state under the session lock.
+    pub async fn update_health<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut mew_resilience::WorkerHealth) -> R,
+    {
+        let mut guard = self.inner.lock().await;
+        f(&mut guard.health)
+    }
+
+    /// Evaluate current worker health state against detector config.
+    pub async fn evaluate_health(
+        &self,
+        config: &mew_resilience::StuckDetectorConfig,
+    ) -> mew_resilience::WorkerHealthReport {
+        let guard = self.inner.lock().await;
+        mew_resilience::detect_stuck(&guard.health, config)
+    }
+
+    /// Phase 4: mutate authentication state under the session lock.
+    pub async fn update_auth<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut crate::auth::AuthState) -> R,
+    {
+        let mut guard = self.inner.lock().await;
+        f(&mut guard.auth)
+    }
+
+    /// Phase 4: read authentication state snapshot.
+    pub async fn auth_state(&self) -> crate::auth::AuthState {
+        let guard = self.inner.lock().await;
+        guard.auth.clone()
     }
 }

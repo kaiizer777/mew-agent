@@ -50,7 +50,9 @@ async fn main() -> Result<()> {
     let mut all_pass = true;
     let mut tag = |label: &str, ok: bool, detail: &str| {
         let mark = if ok { "PASS" } else { "FAIL" };
-        if !ok { all_pass = false; }
+        if !ok {
+            all_pass = false;
+        }
         println!("[{mark}] {label} — {detail}");
     };
 
@@ -60,22 +62,46 @@ async fn main() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // Step 2: window.__mewCursor should be installed.
-    let has_api = exists(&page, "!!(window.__mewCursor && window.__mewCursor.moveTo && window.__mewCursor.click)").await?;
-    tag("API installed", has_api, "window.__mewCursor.moveTo + .click present");
+    let has_api = exists(
+        &page,
+        "!!(window.__mewCursor && window.__mewCursor.moveTo && window.__mewCursor.click)",
+    )
+    .await?;
+    tag(
+        "API installed",
+        has_api,
+        "window.__mewCursor.moveTo + .click present",
+    );
 
     // Step 3: cursor DOM element present with pointer-events: none.
     let has_cursor_dom = exists(&page, "!!document.getElementById('__mew-cursor')").await?;
-    tag("Cursor DOM present", has_cursor_dom, "#__mew-cursor exists in document");
+    tag(
+        "Cursor DOM present",
+        has_cursor_dom,
+        "#__mew-cursor exists in document",
+    );
 
     let pe = string_value(&page, "(document.getElementById('__mew-cursor')||{}).style && document.getElementById('__mew-cursor').style.pointerEvents").await?;
-    tag("pointer-events: none", pe.contains("none"), &format!("got: {pe}"));
+    tag(
+        "pointer-events: none",
+        pe.contains("none"),
+        &format!("got: {pe}"),
+    );
 
     // Step 4: move to (300,200) and read back the transform.
     page.evaluate("window.__mewCursor.moveTo(300, 200)").await?;
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    let t = string_value(&page, "document.getElementById('__mew-cursor').style.transform").await?;
+    let t = string_value(
+        &page,
+        "document.getElementById('__mew-cursor').style.transform",
+    )
+    .await?;
     let moved = t.contains("300") && t.contains("200");
-    tag("moveTo updates transform", moved, &format!("transform = {t}"));
+    tag(
+        "moveTo updates transform",
+        moved,
+        &format!("transform = {t}"),
+    );
 
     // Step 5: navigate to a second page and confirm re-injection.
     let data_url2 = "data:text/html,<html><body style='margin:0;'><h2>page 2</h2></body></html>";
@@ -83,23 +109,43 @@ async fn main() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let re_injected = exists(&page, "!!(window.__mewCursor && window.__mewCursor.moveTo)").await?;
     let cursor_after_nav = exists(&page, "!!document.getElementById('__mew-cursor')").await?;
-    tag("Re-injection on navigation", re_injected && cursor_after_nav, "API + DOM both present on page 2");
+    tag(
+        "Re-injection on navigation",
+        re_injected && cursor_after_nav,
+        "API + DOM both present on page 2",
+    );
 
     // Step 6: fire click ripple and confirm the ripple element exists and
     // its transform contains the requested x/y.
     page.evaluate("window.__mewCursor.click(400, 250)").await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let has_ripple = exists(&page, "!!document.getElementById('__mew-cursor-ripple')").await?;
-    let ripple_t = string_value(&page, "document.getElementById('__mew-cursor-ripple').style.transform").await?;
-    tag("Click ripple element present", has_ripple, "#__mew-cursor-ripple exists");
+    let ripple_t = string_value(
+        &page,
+        "document.getElementById('__mew-cursor-ripple').style.transform",
+    )
+    .await?;
+    tag(
+        "Click ripple element present",
+        has_ripple,
+        "#__mew-cursor-ripple exists",
+    );
     let ripple_at = ripple_t.contains("400") && ripple_t.contains("250");
-    tag("Ripple positioned at click point", ripple_at, &format!("transform = {ripple_t}"));
+    tag(
+        "Ripple positioned at click point",
+        ripple_at,
+        &format!("transform = {ripple_t}"),
+    );
 
     // Step 7: real interaction is not blocked — call into a tiny DOM API
     // on the page and confirm it executes. (Just exercises that we haven't
     // somehow broken the page object.)
     let body_html_ok = exists(&page, "document.body && document.body.tagName === 'BODY'").await?;
-    tag("Page still interactive", body_html_ok, "document.body accessible after cursor use");
+    tag(
+        "Page still interactive",
+        body_html_ok,
+        "document.body accessible after cursor use",
+    );
 
     println!();
     if all_pass {
@@ -109,5 +155,9 @@ async fn main() -> Result<()> {
     }
 
     let _ = shutdown(browser, handle, job).await;
-    if all_pass { Ok(()) } else { anyhow::bail!("visible_cursor verification failed") }
+    if all_pass {
+        Ok(())
+    } else {
+        anyhow::bail!("visible_cursor verification failed")
+    }
 }

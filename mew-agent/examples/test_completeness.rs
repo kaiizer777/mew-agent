@@ -30,7 +30,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mew_agent::agent::Agent;
-use mew_agent::completeness::{SubTaskStatus, SubTask};
+use mew_agent::completeness::{SubTask, SubTaskStatus};
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -94,7 +94,9 @@ fn test_declare_populates_canonical_list() {
     assert_eq!(list[0].id, "msg-alice");
     assert_eq!(list[1].id, "msg-bob");
     assert_eq!(list[2].id, "msg-carol");
-    assert!(list.iter().all(|s| matches!(s.status, SubTaskStatus::Pending)));
+    assert!(list
+        .iter()
+        .all(|s| matches!(s.status, SubTaskStatus::Pending)));
     println!(
         "  PASS: {} subtasks declared, all Pending, ids=[{}, {}, {}]",
         list.len(),
@@ -108,7 +110,11 @@ fn test_declare_populates_canonical_list() {
     let descs: Vec<&str> = list.iter().map(|s| s.description.as_str()).collect();
     assert_eq!(
         descs,
-        vec!["send a message to alice", "send a message to bob", "send a message to carol"]
+        vec![
+            "send a message to alice",
+            "send a message to bob",
+            "send a message to carol"
+        ]
     );
     println!("  PASS: descriptions persisted in code, not just model memory");
 }
@@ -156,9 +162,10 @@ fn test_finish_gate_blocks_when_pending() {
     println!("  PASS: 1/2 done -> gate still closed (incomplete_count=1)");
 
     // Skip the other. Gate opens.
-    let outcome = agent
-        .completeness_for_test()
-        .mark_skipped("msg-bob", "user said bob is on vacation this week".to_string());
+    let outcome = agent.completeness_for_test().mark_skipped(
+        "msg-bob",
+        "user said bob is on vacation this week".to_string(),
+    );
     assert!(matches!(
         outcome,
         mew_agent::completeness::MarkOutcome::MarkedSkipped { .. }
@@ -265,7 +272,9 @@ fn test_summary_logged_for_every_exit() {
     agent
         .completeness_for_test()
         .record_snapshot(1, "snap-A".to_string());
-    let _ = agent.completeness_for_test().mark_done("msg-alice", "snap-A");
+    let _ = agent
+        .completeness_for_test()
+        .mark_done("msg-alice", "snap-A");
     let _ = agent
         .completeness_for_test()
         .mark_skipped("msg-bob", "out of scope per user".to_string());
@@ -295,11 +304,7 @@ fn test_summary_logged_for_every_exit() {
         );
     }
     let body = std::fs::read_to_string(&tmp).expect("read tmp transcript");
-    println!(
-        "  wrote {} bytes to {}",
-        body.len(),
-        tmp.display()
-    );
+    println!("  wrote {} bytes to {}", body.len(), tmp.display());
     // Check the canonical shape:
     assert!(body.contains("=== COMPLETENESS SUMMARY ==="));
     assert!(body.contains("=== END COMPLETENESS SUMMARY ==="));
@@ -346,15 +351,17 @@ fn test_summary_reports_partial_success() {
     agent
         .completeness_for_test()
         .record_snapshot(1, "snap-A".to_string());
-    let _ = agent.completeness_for_test().mark_done("msg-alice", "snap-A");
-    // Bob is the impossible one — we attempted and could not verify.
     let _ = agent
         .completeness_for_test()
-        .mark_failed(
-            "msg-bob",
-            "no matching contact in the recipient list; cannot verify send".to_string(),
-        );
-    let _ = agent.completeness_for_test().mark_done("msg-carol", "snap-A");
+        .mark_done("msg-alice", "snap-A");
+    // Bob is the impossible one — we attempted and could not verify.
+    let _ = agent.completeness_for_test().mark_failed(
+        "msg-bob",
+        "no matching contact in the recipient list; cannot verify send".to_string(),
+    );
+    let _ = agent
+        .completeness_for_test()
+        .mark_done("msg-carol", "snap-A");
 
     // The summary must show partial success.
     let tmp = std::env::temp_dir().join(format!("mew_15_1_partial_{}.log", now_secs()));
@@ -456,12 +463,12 @@ fn test_does_not_over_verify() {
 fn test_summary_written_for_error_exit() {
     println!("\n=== TEST 7: summary written even on non-finish exit ===");
     let mut agent = Agent::new_for_test("send to alice");
-    let _ = agent.completeness_for_test().declare(vec![
-        mew_agent::completeness::DeclareItem {
+    let _ = agent
+        .completeness_for_test()
+        .declare(vec![mew_agent::completeness::DeclareItem {
             id: "msg-alice".into(),
             description: "send to alice".into(),
-        },
-    ]);
+        }]);
     // Simulate: model tried but could not verify; loop crashed.
     let _ = agent
         .completeness_for_test()
@@ -478,11 +485,9 @@ fn test_summary_written_for_error_exit() {
         // The outer `run` wrapper calls `write_summary` on every exit
         // path; here we drive that same call directly.
         let sid = agent.session_id_for_test().to_string();
-        agent.completeness_for_test().write_summary(
-            Some(&f),
-            &sid,
-            "send a message to alice",
-        );
+        agent
+            .completeness_for_test()
+            .write_summary(Some(&f), &sid, "send a message to alice");
     }
     let body = std::fs::read_to_string(&tmp).expect("read tmp");
     assert!(body.contains("status=failed"));

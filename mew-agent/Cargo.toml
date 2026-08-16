@@ -29,10 +29,28 @@ mew-cdp = { path = "../mew-cdp" }
 mew-perception = { path = "../mew-perception" }
 mew-nav = { path = "../mew-nav" }
 mew-resilience = { path = "../mew-resilience" }
+mew-memory = { workspace = true }
 chromiumoxide = { workspace = true }
 url = { workspace = true }
 rand = "0.8"
 toml = "0.8"
+urlencoding = "2.1.3"
+# Phase 41: lead-gen result export. The `csv` crate
+# provides the CSV writer used by `exporter::write_csv`.
+# Picked from the workspace `[workspace.dependencies]`
+# alias so a future crate can opt in without pulling a
+# second copy.
+csv = { workspace = true }
+
+[dev-dependencies]
+# Phase 41: test-only `tempfile` for the export unit
+# tests. The spec's work-item says "use tempdir", but
+# `tempfile` is the maintained successor to the now-archived
+# `tempdir` crate (3.7.7, last release 2018) and exposes a
+# drop-cleaning temp dir via the same `TempDir::new()` API.
+# Test-only — `tempfile` is NOT in the production dep
+# graph, only here.
+tempfile = "3"
 
 [[example]]
 name = "phase9_eval_harness"

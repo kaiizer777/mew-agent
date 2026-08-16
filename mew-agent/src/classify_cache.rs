@@ -87,7 +87,14 @@ pub fn cache_key(message: &str, history: &[ConversationMessage]) -> u64 {
     message.hash(&mut h);
     history.len().hash(&mut h);
     // Last two messages. Empty if the history is shorter.
-    for msg in history.iter().rev().take(2).collect::<Vec<_>>().into_iter().rev() {
+    for msg in history
+        .iter()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         msg.role.hash(&mut h);
         msg.content.hash(&mut h);
     }

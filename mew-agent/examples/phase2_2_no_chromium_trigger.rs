@@ -77,9 +77,7 @@ async fn main() -> anyhow::Result<()> {
     let agent_cargo = std::fs::read_to_string("Cargo.toml")?;
     let has_chromiumoxide = agent_cargo.lines().any(|l| {
         let t = l.trim();
-        t.starts_with("chromiumoxide")
-            || t.starts_with("mew-cdp")
-            || t.starts_with("mew_cdp")
+        t.starts_with("chromiumoxide") || t.starts_with("mew-cdp") || t.starts_with("mew_cdp")
     });
     // mew-agent DOES depend on chromiumoxide in its [dependencies] for the
     // agent loop. What matters is that *the router doesn't touch it*. The
@@ -97,9 +95,7 @@ async fn main() -> anyhow::Result<()> {
     //     concern. We guard against regressions here. ---
     println!();
     println!("[2] structural: send_message must still have the BrowserTask stub");
-    let send_message_rs = std::fs::read_to_string(
-        "../mew-ui/src-tauri/src/lib.rs",
-    )?;
+    let send_message_rs = std::fs::read_to_string("../mew-ui/src-tauri/src/lib.rs")?;
     assert!(
         send_message_rs.contains("Browser Task Started"),
         "send_message should still have the Phase-2.1 stub for BrowserTask \
@@ -128,10 +124,20 @@ async fn main() -> anyhow::Result<()> {
             Intent::Chat(_) => {
                 println!("    [{:02}] Chat      ✓  msg={:?}", i + 1, msg);
             }
-            Intent::BrowserTask(t) => {
+            Intent::BrowserTask { task: t, .. } => {
                 all_chat = false;
-                fail_msgs.push(format!("[{:02}] msg={:?} → BrowserTask({:?})", i + 1, msg, t));
-                println!("    [{:02}] BrowserTask ✗  msg={:?}  task={:?}", i + 1, msg, t);
+                fail_msgs.push(format!(
+                    "[{:02}] msg={:?} → BrowserTask({:?})",
+                    i + 1,
+                    msg,
+                    t
+                ));
+                println!(
+                    "    [{:02}] BrowserTask ✗  msg={:?}  task={:?}",
+                    i + 1,
+                    msg,
+                    t
+                );
             }
         }
         // small delay

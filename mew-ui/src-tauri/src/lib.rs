@@ -1,14 +1,12 @@
-use mew_agent::{load_config, ProviderConfig};
-use mew_agent::session::SessionHandle;
 use mew_agent::chat::UserMessage;
 use mew_agent::chat_agent::ChatAgent;
-use mew_agent::orchestrator::{
-    self, acknowledge_steering, OrchestratorEvent, TurnSink,
-};
+use mew_agent::orchestrator::{self, acknowledge_steering, OrchestratorEvent, TurnSink};
 use mew_agent::router::ConversationMessage;
+use mew_agent::session::SessionHandle;
+use mew_agent::{load_config, ProviderConfig};
 use std::sync::Arc;
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
-use tauri::{AppHandle, Manager, State, Emitter};
 
 mod error_message;
 
@@ -17,17 +15,95 @@ mod error_message;
 /// fields pulled from the actual parsed config — not a hardcoded string.
 #[tauri::command]
 fn get_config_summary() -> Result<String, String> {
-    let cfg: ProviderConfig = load_config()
-        .map_err(|e| error_message::for_user(&e, "load the configuration file"))?;
+    let cfg: ProviderConfig =
+        load_config().map_err(|e| error_message::for_user(&e, "load the configuration file"))?;
     Ok(format!(
         "model={} base_url={} max_iter={} browser_binary={:?}",
         cfg.opencode_zen.default_model,
         cfg.opencode_zen.base_url,
         cfg.opencode_zen.max_iterations,
-        cfg.browser
-            .as_ref()
-            .and_then(|b| b.binary_path.as_deref())
+        cfg.browser.as_ref().and_then(|b| b.binary_path.as_deref())
     ))
+}
+
+/// Phase 29: user-facing command to inspect what the self-learning agent has learned.
+/// Surfaces plain-language digest of recent high-confidence lessons from memory store.
+#[tauri::command]
+fn get_recent_lessons(app_handle: AppHandle) -> Result<Vec<String>, String> {
+    let data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+    let store = mew_memory::store::LessonStore::new(data_dir);
+    let lessons = store
+        .read_all()
+        .map_err(|e| format!("failed to read memory lessons: {e}"))?;
+
+    let digest: Vec<String> = lessons
+        .into_iter()
+        .filter(|l| l.confidence_score >= 0.8 && l.conflicting_with.is_empty())
+        .map(|l| {
+            let platform_str = l
+                .platform
+                .as_deref()
+                .map(|p| format!(" [{}]", p))
+                .unwrap_or_default();
+            format!("Recently learned{}: {}", platform_str, l.lesson_text)
+        })
+        .collect();
+
+    Ok(digest)
+}
+
+/// Phase 41: open the export directory in the OS file
+/// manager. Surfaced as a "📂 Open exports folder" button
+/// next to the export file link in the chat reply. The
+/// directory is `<app_data_dir>/exports/` (resolved via
+/// `app_handle.path().app_data_dir()` — the same path the
+/// agent's `ExportConfig::output_dir` resolves to when the
+/// Tauri UI passes a Tauri-resolved path through
+/// `config.yaml`).
+///
+/// The actual file-manager invocation is platform-specific
+/// — `explorer.exe` on Windows, `open` on macOS,
+/// `xdg-open` on Linux. We dispatch via a single
+/// `std::process::Command::new` with a `cfg!(windows)`
+/// branch; a missing platform path returns a clean error
+/// string the Tauri webview can surface to the user
+/// (no panic, no silent failure).
+#[tauri::command]
+fn open_export_directory(app_handle: AppHandle) -> Result<(), String> {
+    let exports_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {e}"))?
+        .join("exports");
+    // Create the directory if it doesn't exist yet so
+    // explorer.exe doesn't pop an error dialog on a
+    // fresh install.
+    std::fs::create_dir_all(&exports_dir)
+        .map_err(|e| format!("create exports dir {}: {e}", exports_dir.display()))?;
+    let path_str = exports_dir.to_string_lossy().into_owned();
+    eprintln!("[mew-ui] opening exports dir: {path_str}");
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer.exe")
+            .arg(&exports_dir)
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&exports_dir).spawn()
+    } else {
+        // Linux / BSD: xdg-open is the standard.
+        std::process::Command::new("xdg-open").arg(&exports_dir).spawn()
+    };
+    result.map_err(|e| {
+        format!(
+            "failed to open exports directory {}: {e}. \
+             The file is at the path shown in the chat reply; \
+             you can open it manually.",
+            path_str
+        )
+    })?;
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -66,18 +142,32 @@ impl mew_agent::orchestrator::BrowserAgentFactory for TauriWorkerFactory {
         &'a self,
         handoff: mew_agent::handoff::Handoff,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<mew_agent::handoff::BrowserResult>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<mew_agent::handoff::BrowserResult>>
+                + Send
+                + 'a,
+        >,
     > {
         let app_handle = self.app_handle.clone();
         Box::pin(async move {
             let config = load_config()?;
             let (browser, page, handler_task, job) = mew_cdp::launch_headless(
                 config.browser.as_ref().and_then(|b| b.binary_path.clone()),
-                config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
-            ).await?;
+                config
+                    .browser
+                    .as_ref()
+                    .map(|b| b.visible_cursor)
+                    .unwrap_or(false),
+            )
+            .await?;
 
-            let transcript_dir = app_handle.path().app_data_dir().ok().map(|d| d.join("transcripts"));
-            let mut agent = mew_agent::agent::Agent::new(config, &handoff.task_description, transcript_dir);
+            let transcript_dir = app_handle
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|d| d.join("transcripts"));
+            let mut agent =
+                mew_agent::agent::Agent::new(config, &handoff.task_description, transcript_dir);
             let session_id = agent.session_id().to_string();
 
             let res = agent.run(&page).await;
@@ -126,22 +216,43 @@ impl Default for AppState {
 }
 
 impl AppState {
-    pub fn get_or_init_worker_pool(&self, app_handle: &AppHandle) -> Arc<mew_agent::worker_pool::WorkerPool> {
+    pub fn get_or_init_worker_pool(
+        &self,
+        app_handle: &AppHandle,
+    ) -> Arc<mew_agent::worker_pool::WorkerPool> {
         let mut lock = self.worker_pool.lock().expect("worker pool lock poisoned");
         if let Some(pool) = lock.as_ref() {
             return pool.clone();
         }
 
         let factory: Arc<dyn mew_agent::orchestrator::BrowserAgentFactory> =
-            Arc::new(TauriWorkerFactory { app_handle: app_handle.clone() });
-        let worker = mew_agent::worker::BrowserAgentWorker::new("worker-1", factory);
-        let pool = Arc::new(mew_agent::worker_pool::WorkerPool::new(vec![worker]));
+            Arc::new(TauriWorkerFactory {
+                app_handle: app_handle.clone(),
+            });
+        let config = load_config().unwrap_or_else(|_| mew_agent::ProviderConfig {
+            opencode_zen: mew_agent::OpencodeZenConfig {
+                base_url: String::new(),
+                api_key: String::new(),
+                default_model: String::new(),
+                max_iterations: 15,
+                max_tokens: None,
+                max_cost: None,
+            },
+            browser: None,
+            agent: mew_agent::AgentConfig::default(),
+        });
+        let worker_count = config.agent.research.max_concurrent_workers.max(1);
+        let pool = Arc::new(mew_agent::worker_pool::WorkerPool::from_factory(
+            factory,
+            worker_count,
+        ));
         *lock = Some(pool.clone());
         pool
     }
 
     pub fn next_signal_id(&self) -> u64 {
-        self.signal_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.signal_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -263,7 +374,12 @@ impl TurnSink for TauriSink {
                     }),
                 );
             }
-            OrchestratorEvent::TodoRejected { task_id, todo_id, evidence, reason } => {
+            OrchestratorEvent::TodoRejected {
+                task_id,
+                todo_id,
+                evidence,
+                reason,
+            } => {
                 let mut payload = serde_json::json!({
                     "task_id": task_id,
                     "todo_id": todo_id,
@@ -280,10 +396,35 @@ impl TurnSink for TauriSink {
                 }
                 let _ = self.app_handle.emit("todo-rejected", payload);
             }
+            OrchestratorEvent::TaskRecovered {
+                originating_message_id,
+                reason_note,
+                attempt,
+            } => {
+                let _ = self.app_handle.emit(
+                    "chat-task-recovered",
+                    serde_json::json!({
+                        "originating_message_id": originating_message_id,
+                        "reason_note": reason_note,
+                        "attempt": attempt,
+                    }),
+                );
+            }
+            OrchestratorEvent::PartialFinding {
+                originating_message_id,
+                finding,
+            } => {
+                let _ = self.app_handle.emit(
+                    "chat-partial-finding",
+                    serde_json::json!({
+                        "originating_message_id": originating_message_id,
+                        "finding": finding,
+                    }),
+                );
+            }
         }
     }
 }
-
 
 #[tauri::command]
 async fn send_message(
@@ -334,13 +475,10 @@ async fn send_message(
             // session's originating message id — the user is
             // steering the task that was started by that
             // earlier turn, not by this new turn.
-            let sink: Arc<dyn TurnSink> =
-                Arc::new(TauriSink { app_handle: app_handle.clone() });
-            acknowledge_steering(
-                &sink,
-                &session.originating_message_id,
-                &text,
-            );
+            let sink: Arc<dyn TurnSink> = Arc::new(TauriSink {
+                app_handle: app_handle.clone(),
+            });
+            acknowledge_steering(&sink, &session.originating_message_id, &text);
             return Ok(format!("[Routed to running agent] {}", text));
         } else {
             // The agent loop is dead. Clear it from state and fall through to classification.
@@ -367,8 +505,7 @@ async fn send_message(
     // `classify_cache` handle is shared from the
     // `AppState` so an identical re-prompt skips the
     // network round trip on the second attempt.
-    let chat_agent = ChatAgent::new(cfg.clone())
-        .with_classify_cache(state.classify_cache.clone());
+    let chat_agent = ChatAgent::new(cfg.clone()).with_classify_cache(state.classify_cache.clone());
     let context: Vec<ConversationMessage> = history
         .into_iter()
         .map(|msg| ConversationMessage {
@@ -398,14 +535,17 @@ async fn send_message(
     // doesn't touch Chrome, so it can run inline. The browser
     // path is the one that needs a `&Page` and therefore
     // belongs in a spawned task.
-    let intent = chat_agent.classify_cached(&text, &context).await.map_err(|e| {
-        tracing::error!(
-            event = "ui_handoff_classify_failed",
-            error = %e,
-            "classify() returned an error"
-        );
-        error_message::for_user(&e, "understand your message")
-    })?;
+    let intent = chat_agent
+        .classify_cached(&text, &context)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                event = "ui_handoff_classify_failed",
+                error = %e,
+                "classify() returned an error"
+            );
+            error_message::for_user(&e, "understand your message")
+        })?;
 
     use mew_agent::router::Intent;
     match intent {
@@ -422,8 +562,9 @@ async fn send_message(
             // synchronous `invoke<string>` return value stays
             // consistent with the emitted payload — they
             // both carry the same text).
-            let sink: Arc<dyn TurnSink> =
-                Arc::new(TauriSink { app_handle: app_handle.clone() });
+            let sink: Arc<dyn TurnSink> = Arc::new(TauriSink {
+                app_handle: app_handle.clone(),
+            });
             let message_id = chat_agent.mint_message_id();
             sink.emit(OrchestratorEvent::ChatReply {
                 originating_message_id: message_id,
@@ -431,7 +572,7 @@ async fn send_message(
             });
             Ok(reply)
         }
-        Intent::BrowserTask(task) => {
+        Intent::BrowserTask { task, .. } => {
             tracing::info!(
                 event = "ui_handoff_classify",
                 intent = "browser_task",
@@ -486,8 +627,9 @@ async fn send_message(
                     // anyhow chain is still in the trace; the chat
                     // gets a plain-language line.
                     let user_msg = error_message::for_user(&e, "run the browser task");
-                    let sink: Arc<dyn TurnSink> =
-                        Arc::new(TauriSink { app_handle: app_for_error });
+                    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink {
+                        app_handle: app_for_error,
+                    });
                     sink.emit(OrchestratorEvent::ChatReply {
                         originating_message_id: String::new(),
                         text: user_msg,
@@ -532,8 +674,14 @@ async fn run_browser_task(
     // Preview panel (screencast stream + immediate first frame below).
     let (browser, page, handler_task, job) = mew_cdp::launch_headless(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
-        config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
-    ).await.map_err(|e| {
+        config
+            .browser
+            .as_ref()
+            .map(|b| b.visible_cursor)
+            .unwrap_or(false),
+    )
+    .await
+    .map_err(|e| {
         tracing::error!(
             event = "browser_task_launch_chrome_failed",
             error = %e,
@@ -541,7 +689,6 @@ async fn run_browser_task(
         );
         anyhow::anyhow!("{}", error_message::for_user(&e, "start the browser"))
     })?;
-
 
     // ----------------------------------------------------------------
     // Phase 16.2: live preview, v2.
@@ -618,12 +765,10 @@ box-shadow:0 0 0 0 rgba(37,99,235,.6);animation:ping 1.4s cubic-bezier(0,0,.2,1)
     // the task returns. This runs concurrently with the agent
     // dispatch — the user sees the preview fill in *while* the
     // ReAct loop is thinking.
-    let screencast_started = mew_cdp::start_screencast_with_first_frame(
-        &page,
-        screencast_tx.clone(),
-    )
-    .await
-    .is_ok();
+    let screencast_started =
+        mew_cdp::start_screencast_with_first_frame(&page, screencast_tx.clone())
+            .await
+            .is_ok();
 
     if !screencast_started {
         tracing::warn!(
@@ -648,8 +793,7 @@ box-shadow:0 0 0 0 rgba(37,99,235,.6);animation:ping 1.4s cubic-bezier(0,0,.2,1)
                             error = %e,
                             "screenshot poll stopped; sending a one-shot chat notice"
                         );
-                        let user_msg =
-                            error_message::for_user(&e, "refresh the live preview");
+                        let user_msg = error_message::for_user(&e, "refresh the live preview");
                         let _ = app_for_shot_fb.emit(
                             "chat-reply",
                             serde_json::json!({
@@ -686,8 +830,6 @@ box-shadow:0 0 0 0 rgba(37,99,235,.6);animation:ping 1.4s cubic-bezier(0,0,.2,1)
     // cleanly when this function returns. The clone inside the
     // screencast task itself is the only long-lived sender.
     drop(screencast_tx);
-
-
 
     // Phase 4 (Bug 3 fix): resolve a transcript directory that lives
     // OUTSIDE the Tauri source tree. Tauri's dev-mode file watcher
@@ -742,7 +884,8 @@ box-shadow:0 0 0 0 rgba(37,99,235,.6);animation:ping 1.4s cubic-bezier(0,0,.2,1)
         }
     });
 
-    let mut agent = mew_agent::agent::Agent::new(config, &task_desc, transcript_dir).with_event_sender(tx);
+    let mut agent =
+        mew_agent::agent::Agent::new(config, &task_desc, transcript_dir).with_event_sender(tx);
     let chat_tx = agent.take_message_sender();
     let session_handle = agent.session_handle();
     let session_id = agent.session_id().to_string();
@@ -791,15 +934,16 @@ box-shadow:0 0 0 0 rgba(37,99,235,.6);animation:ping 1.4s cubic-bezier(0,0,.2,1)
         &task_desc,
         &originating_message_id,
         Vec::new(), // constraints: future work — sensitive platforms surface here
+        None,
+        None,
     );
     let sink: Arc<dyn orchestrator::TurnSink> = Arc::new(TauriSink {
         app_handle: app_handle.clone(),
     });
-    let factory: Arc<dyn orchestrator::BrowserAgentFactory> =
-        Arc::new(PrefabricatedAgentFactory {
-            agent: std::sync::Mutex::new(Some(agent)),
-            page: page.clone(),
-        });
+    let factory: Arc<dyn orchestrator::BrowserAgentFactory> = Arc::new(PrefabricatedAgentFactory {
+        agent: std::sync::Mutex::new(Some(agent)),
+        page: page.clone(),
+    });
 
     // Emit the "task started" event before dispatching so the
     // user gets a "Working on it…" line immediately. (The
@@ -816,16 +960,9 @@ box-shadow:0 0 0 0 rgba(37,99,235,.6);animation:ping 1.4s cubic-bezier(0,0,.2,1)
     // (e.g. loop termination), the orchestrator converts to
     // a `Failed` `BrowserResult` so the user still sees a
     // chat message.
-    let _reply = orchestrator::dispatch_browser_task(
-        &chat_agent,
-        factory,
-        pool,
-        sink,
-        &page,
-        handoff,
-        &[],
-    )
-    .await?;
+    let _reply =
+        orchestrator::dispatch_browser_task(&chat_agent, factory, pool, sink, &page, handoff, &[])
+            .await?;
 
     // Clear the active session so the next message goes back
     // to the classifier.
@@ -870,11 +1007,20 @@ impl orchestrator::BrowserAgentFactory for PrefabricatedAgentFactory {
         &'a self,
         handoff: mew_agent::handoff::Handoff,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<mew_agent::handoff::BrowserResult>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<mew_agent::handoff::BrowserResult>>
+                + Send
+                + 'a,
+        >,
     > {
         let _ = handoff;
 
-        let mut agent = match self.agent.lock().expect("PrefabricatedAgentFactory mutex poisoned").take() {
+        let mut agent = match self
+            .agent
+            .lock()
+            .expect("PrefabricatedAgentFactory mutex poisoned")
+            .take()
+        {
             Some(a) => a,
             None => {
                 return Box::pin(async move {
@@ -946,12 +1092,10 @@ async fn start_task(
     history: Vec<FrontendMessage>,
 ) -> Result<TaskHandle, String> {
     let task_id = uuid::Uuid::new_v4().to_string();
-    let cfg = load_config().map_err(|e| {
-        error_message::for_user(&e, "load the configuration file")
-    })?;
+    let cfg =
+        load_config().map_err(|e| error_message::for_user(&e, "load the configuration file"))?;
 
-    let chat_agent = ChatAgent::new(cfg.clone())
-        .with_classify_cache(state.classify_cache.clone());
+    let chat_agent = ChatAgent::new(cfg.clone()).with_classify_cache(state.classify_cache.clone());
     let context: Vec<ConversationMessage> = history
         .into_iter()
         .map(|msg| ConversationMessage {
@@ -960,11 +1104,14 @@ async fn start_task(
         })
         .collect();
 
-    let intent = chat_agent.classify_cached(&message, &context).await.map_err(|e| {
-        error_message::for_user(&e, "understand your message")
-    })?;
+    let intent = chat_agent
+        .classify_cached(&message, &context)
+        .await
+        .map_err(|e| error_message::for_user(&e, "understand your message"))?;
 
-    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink { app_handle: app.clone() });
+    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink {
+        app_handle: app.clone(),
+    });
 
     use mew_agent::router::Intent;
     match intent {
@@ -978,7 +1125,12 @@ async fn start_task(
                 todos: Vec::new(),
             })
         }
-        Intent::BrowserTask(task) => {
+        Intent::BrowserTask {
+            task,
+            job_query,
+            lead_query,
+            ..
+        } => {
             if !cfg.agent.planner_enabled {
                 // Fallback mode (planner_enabled: false): run single ReAct task in background
                 let state_session = state.active_session.clone();
@@ -997,9 +1149,13 @@ async fn start_task(
                         app_clone,
                         None,
                         chat_agent_clone,
-                    ).await {
+                    )
+                    .await
+                    {
                         let user_msg = error_message::for_user(&e, "run the browser task");
-                        let sink_err: Arc<dyn TurnSink> = Arc::new(TauriSink { app_handle: app_for_error });
+                        let sink_err: Arc<dyn TurnSink> = Arc::new(TauriSink {
+                            app_handle: app_for_error,
+                        });
                         sink_err.emit(OrchestratorEvent::ChatReply {
                             originating_message_id: String::new(),
                             text: user_msg,
@@ -1013,7 +1169,8 @@ async fn start_task(
                 })
             } else {
                 // Planner enabled mode: decompose into typed todos and submit first todo
-                let handoff = chat_agent.build_handoff(&task, &task_id, Vec::new());
+                let handoff =
+                    chat_agent.build_handoff(&task, &task_id, Vec::new(), job_query, lead_query);
                 let todos = mew_agent::planner::decompose_to_todos(&handoff);
 
                 for todo in &todos {
@@ -1026,14 +1183,14 @@ async fn start_task(
                 if let Some(first_todo) = todos.first() {
                     let pool = state.get_or_init_worker_pool(&app);
                     let _rx = pool.submit(first_todo.clone(), handoff).map_err(|e| {
-                        error_message::for_user(&anyhow::anyhow!("{e:?}"), "submit subtask to planner")
+                        error_message::for_user(
+                            &anyhow::anyhow!("{e:?}"),
+                            "submit subtask to planner",
+                        )
                     })?;
                 }
 
-                Ok(TaskHandle {
-                    task_id,
-                    todos,
-                })
+                Ok(TaskHandle { task_id, todos })
             }
         }
     }
@@ -1087,7 +1244,9 @@ async fn cancel_todo(
         mew_agent::supervisor::SupervisorSignal::Cancel,
     ));
 
-    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink { app_handle: app.clone() });
+    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink {
+        app_handle: app.clone(),
+    });
     sink.emit(OrchestratorEvent::TodoRejected {
         task_id,
         todo_id,
@@ -1098,11 +1257,7 @@ async fn cancel_todo(
 }
 
 #[tauri::command]
-async fn replan(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    task_id: String,
-) -> Result<(), String> {
+async fn replan(app: AppHandle, state: State<'_, AppState>, task_id: String) -> Result<(), String> {
     let pool = state.get_or_init_worker_pool(&app);
     let cancel_sig_id = state.next_signal_id();
     pool.signal(mew_agent::supervisor::SupervisorCommand::new(
@@ -1119,7 +1274,9 @@ async fn replan(
         mew_agent::supervisor::SupervisorSignal::Replan(new_todos.clone()),
     ));
 
-    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink { app_handle: app.clone() });
+    let sink: Arc<dyn TurnSink> = Arc::new(TauriSink {
+        app_handle: app.clone(),
+    });
     for todo in new_todos {
         sink.emit(OrchestratorEvent::TodoStateChanged {
             task_id: task_id.clone(),
@@ -1132,10 +1289,7 @@ async fn replan(
 
 /// Phase 18 ships with this; Phase 14 declares the signature only and stubs the body.
 #[tauri::command]
-async fn stop_task(
-    state: tauri::State<'_, AppState>,
-    _task_id: String,
-) -> Result<(), String> {
+async fn stop_task(state: tauri::State<'_, AppState>, _task_id: String) -> Result<(), String> {
     let lock = state.worker_pool.lock().map_err(|e| e.to_string())?;
     if let Some(pool) = lock.as_ref() {
         pool.signal(mew_agent::supervisor::SupervisorCommand::new(
@@ -1148,97 +1302,99 @@ async fn stop_task(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-  // No `tracing` global subscriber is installed here on purpose.
-  //
-  // The Tauri UI is a `log`-facade consumer, not a `tracing` global
-  // subscriber. `tracing` events from `mew-agent` flow through the
-  // per-session JSONL layer (`mew-agent::tracing_layer`) using a
-  // thread-local override that the `ChatAgent` constructor wires
-  // up — that path does NOT depend on a `tracing` global. And
-  // anything that uses the `log::*` macros (chromiumoxide, reqwest,
-  // h2, etc.) gets forwarded to the webview console by
-  // `tauri-plugin-log` below.
-  //
-  // An earlier version of this function called
-  // `tracing_subscriber::registry().try_init()` to set a
-  // `tracing-subscriber` env-filter + fmt layer as the *tracing*
-  // global. That was redundant (the JSONL layer is what we
-  // actually use) AND it panicked the Tauri setup hook with
-  // "attempted to set a logger after the logging system was
-  // already initialized" because the `tracing-subscriber` default
-  // feature set pulls in `tracing-log`, and `tracing-log`'s
-  // `LogTracer::init()` claims the `log::Log` global — which
-  // `tauri-plugin-log` then can't claim. So we just don't do
-  // either init here; the webview console + the opt-in JSONL
-  // side-channel cover all the diagnostics we need.
-  tauri::Builder::default()
-    .manage(AppState::default())
-    .invoke_handler(tauri::generate_handler![
-        send_message,
-        get_config_summary,
-        pause_session,
-        resume_session,
-        start_task,
-        pause_todo,
-        resume_todo,
-        cancel_todo,
-        replan,
-        stop_task
-    ])
-    .setup(|app| {
-      if cfg!(debug_assertions) {
-        app.handle().plugin(
-          tauri_plugin_log::Builder::default()
-            .level(log::LevelFilter::Info)
-            .build(),
-        )?;
-      }
-      // Phase 16.3: workspace-root hint for the resolver.
-      //
-      // `mew-nav::SensitivePlatforms::load_from_default_location`
-      // and `mew-agent::load_config` both walk the parent
-      // directory tree looking for the workspace root. The
-      // walk works for a dev build whose CWD is somewhere
-      // inside the repo (the Tauri binary runs with CWD
-      // `target/debug/` for a `cargo tauri dev` build, and
-      // the walk finds the file on the first parent hop).
-      //
-      // For a release build the binary can live somewhere
-      // that has no `config/sensitive_platforms.toml` in
-      // any parent at all (a Windows installer drops it
-      // in `Program Files\mew-ui\`, a macOS bundle in
-      // `mew-ui.app/Contents/MacOS/`). The parent walk
-      // fails, the sensitive-platforms table is empty, and
-      // the LLM can't reach instagram.com / twitter.com /
-      // linkedin.com because direct nav to those hosts is
-      // blocked by the allowlist.
-      //
-      // The `MEW_WORKSPACE_DIR` env var is the escape
-      // hatch. We compute the most likely workspace root
-      // from the executable's own path and set it once
-      // here, before any agent task is created. If the env
-      // var is already set (an operator's deliberate
-      // override), we keep it.
-      if std::env::var("MEW_WORKSPACE_DIR").is_err() {
-        if let Some(workspace_root) = detect_workspace_root() {
-          // SAFETY: this `set_var` runs in the main
-          // thread before any agent task is spawned.
-          // Tauri's setup hook is single-threaded at this
-          // point — the async runtime hasn't started
-          // task spawning yet. Setting an env var is a
-          // documented no-panic pattern when the main
-          // thread holds no locks the runtime waits on.
-          std::env::set_var("MEW_WORKSPACE_DIR", &workspace_root);
-          eprintln!(
-            "[mew-ui] Phase 16.3: set MEW_WORKSPACE_DIR={} (inferred from exe path)",
-            workspace_root
-          );
-        }
-      }
-      Ok(())
-    })
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    // No `tracing` global subscriber is installed here on purpose.
+    //
+    // The Tauri UI is a `log`-facade consumer, not a `tracing` global
+    // subscriber. `tracing` events from `mew-agent` flow through the
+    // per-session JSONL layer (`mew-agent::tracing_layer`) using a
+    // thread-local override that the `ChatAgent` constructor wires
+    // up — that path does NOT depend on a `tracing` global. And
+    // anything that uses the `log::*` macros (chromiumoxide, reqwest,
+    // h2, etc.) gets forwarded to the webview console by
+    // `tauri-plugin-log` below.
+    //
+    // An earlier version of this function called
+    // `tracing_subscriber::registry().try_init()` to set a
+    // `tracing-subscriber` env-filter + fmt layer as the *tracing*
+    // global. That was redundant (the JSONL layer is what we
+    // actually use) AND it panicked the Tauri setup hook with
+    // "attempted to set a logger after the logging system was
+    // already initialized" because the `tracing-subscriber` default
+    // feature set pulls in `tracing-log`, and `tracing-log`'s
+    // `LogTracer::init()` claims the `log::Log` global — which
+    // `tauri-plugin-log` then can't claim. So we just don't do
+    // either init here; the webview console + the opt-in JSONL
+    // side-channel cover all the diagnostics we need.
+    tauri::Builder::default()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            send_message,
+            get_config_summary,
+            get_recent_lessons,
+            pause_session,
+            resume_session,
+            start_task,
+            pause_todo,
+            resume_todo,
+            cancel_todo,
+            replan,
+            stop_task,
+            open_export_directory
+        ])
+        .setup(|app| {
+            if cfg!(debug_assertions) {
+                app.handle().plugin(
+                    tauri_plugin_log::Builder::default()
+                        .level(log::LevelFilter::Info)
+                        .build(),
+                )?;
+            }
+            // Phase 16.3: workspace-root hint for the resolver.
+            //
+            // `mew-nav::SensitivePlatforms::load_from_default_location`
+            // and `mew-agent::load_config` both walk the parent
+            // directory tree looking for the workspace root. The
+            // walk works for a dev build whose CWD is somewhere
+            // inside the repo (the Tauri binary runs with CWD
+            // `target/debug/` for a `cargo tauri dev` build, and
+            // the walk finds the file on the first parent hop).
+            //
+            // For a release build the binary can live somewhere
+            // that has no `config/sensitive_platforms.toml` in
+            // any parent at all (a Windows installer drops it
+            // in `Program Files\mew-ui\`, a macOS bundle in
+            // `mew-ui.app/Contents/MacOS/`). The parent walk
+            // fails, the sensitive-platforms table is empty, and
+            // the LLM can't reach instagram.com / twitter.com /
+            // linkedin.com because direct nav to those hosts is
+            // blocked by the allowlist.
+            //
+            // The `MEW_WORKSPACE_DIR` env var is the escape
+            // hatch. We compute the most likely workspace root
+            // from the executable's own path and set it once
+            // here, before any agent task is created. If the env
+            // var is already set (an operator's deliberate
+            // override), we keep it.
+            if std::env::var("MEW_WORKSPACE_DIR").is_err() {
+                if let Some(workspace_root) = detect_workspace_root() {
+                    // SAFETY: this `set_var` runs in the main
+                    // thread before any agent task is spawned.
+                    // Tauri's setup hook is single-threaded at this
+                    // point — the async runtime hasn't started
+                    // task spawning yet. Setting an env var is a
+                    // documented no-panic pattern when the main
+                    // thread holds no locks the runtime waits on.
+                    std::env::set_var("MEW_WORKSPACE_DIR", &workspace_root);
+                    eprintln!(
+                        "[mew-ui] Phase 16.3: set MEW_WORKSPACE_DIR={} (inferred from exe path)",
+                        workspace_root
+                    );
+                }
+            }
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
 
 /// Infer the workspace root from the running executable's

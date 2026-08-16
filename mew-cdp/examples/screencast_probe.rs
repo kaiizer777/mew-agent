@@ -6,9 +6,8 @@ use std::time::{Duration, Instant};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let binary_path = Some(
-        "c:\\Users\\bari2\\Desktop\\mew-agent\\stealth-browser\\chrome.exe".to_string(),
-    );
+    let binary_path =
+        Some("c:\\Users\\bari2\\Desktop\\mew-agent\\stealth-browser\\chrome.exe".to_string());
     println!("[probe] launching headless Chrome...");
     let launch = tokio::time::timeout(
         Duration::from_secs(20),

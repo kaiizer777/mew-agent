@@ -56,20 +56,16 @@ use serde::{Deserialize, Serialize};
 /// already carries the full tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Verbosity {
     /// One short sentence per action. The default. Examples:
     /// "Opened instagram.com", "Sent a message".
+    #[default]
     Concise,
     /// The same sentence plus a one-phrase arg snippet.
     /// Examples: 'Opened instagram.com ("instagram")',
     /// 'Typed "hi" into @e4 ("Message field")'.
     Detailed,
-}
-
-impl Default for Verbosity {
-    fn default() -> Self {
-        Verbosity::Concise
-    }
 }
 
 impl Verbosity {
@@ -95,6 +91,7 @@ pub enum ProgressKind {
     PressKey,
     Snapshot,
     VisionInspect,
+    ExtractFields,
     Declare,
     MarkDone,
     MarkSkipped,
@@ -113,6 +110,7 @@ impl ProgressKind {
             ProgressKind::PressKey => "press_key",
             ProgressKind::Snapshot => "snapshot",
             ProgressKind::VisionInspect => "vision_inspect",
+            ProgressKind::ExtractFields => "extract_fields",
             ProgressKind::Declare => "declare",
             ProgressKind::MarkDone => "mark_done",
             ProgressKind::MarkSkipped => "mark_skipped",
@@ -144,7 +142,12 @@ pub struct ProgressLine {
 }
 
 impl ProgressLine {
-    pub fn new(kind: ProgressKind, text: impl Into<String>, timestamp_secs: u64, success: bool) -> Self {
+    pub fn new(
+        kind: ProgressKind,
+        text: impl Into<String>,
+        timestamp_secs: u64,
+        success: bool,
+    ) -> Self {
         Self {
             kind,
             text: text.into(),
@@ -233,13 +236,51 @@ pub fn summarize(
                 "Looked at a region visually".to_string()
             }
         }
+        "extract_fields" => {
+            // Phase 33: the tool result is a JSON object with
+            // field -> value. We render a one-liner like
+            //   "Extracted: name=Luxe Salon | phone=+91-22-1234-5678 | rating=4.3 | website=none"
+            // so the user sees a per-listing summary without
+            // the LLM needing to narrate. Missing fields
+            // become "none" (the "did the agent look but find
+            // nothing" case is a useful signal, not an error).
+            //
+            // Parse the result string as JSON; if it doesn't
+            // parse (e.g. an error message), fall back to a
+            // short one-liner.
+            let parsed: std::collections::HashMap<String, Option<String>> =
+                serde_json::from_str(result).unwrap_or_default();
+            if parsed.is_empty() {
+                "Extracted fields (parse failed)".to_string()
+            } else {
+                // Stable order: walk the parsed map sorted by
+                // key so the line is deterministic across runs.
+                let mut entries: Vec<(&String, &Option<String>)> = parsed.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let parts: Vec<String> = entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let rhs = match v {
+                            Some(s) => s.clone(),
+                            None => "none".to_string(),
+                        };
+                        format!("{}={}", k, rhs)
+                    })
+                    .collect();
+                format!("Extracted: {}", parts.join(" | "))
+            }
+        }
         "declare_subtasks" => {
             let n = args
                 .get("items")
                 .and_then(|v| v.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
-            format!("Split task into {} sub-item{}", n, if n == 1 { "" } else { "s" })
+            format!(
+                "Split task into {} sub-item{}",
+                n,
+                if n == 1 { "" } else { "s" }
+            )
         }
         "mark_subtask_done" => {
             let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -283,6 +324,7 @@ pub fn summarize(
         "press_key" => ProgressKind::PressKey,
         "snapshot" => ProgressKind::Snapshot,
         "vision_inspect" => ProgressKind::VisionInspect,
+        "extract_fields" => ProgressKind::ExtractFields,
         "declare_subtasks" => ProgressKind::Declare,
         "mark_subtask_done" => ProgressKind::MarkDone,
         "mark_subtask_skipped" => ProgressKind::MarkSkipped,
@@ -449,7 +491,11 @@ fn default_true() -> bool {
 /// than dump the whole history.
 pub fn more_steps_suffix(total: usize, shown: usize) -> Option<String> {
     if total > shown {
-        Some(format!("…and {} more step{}", total - shown, if total - shown == 1 { "" } else { "s" }))
+        Some(format!(
+            "…and {} more step{}",
+            total - shown,
+            if total - shown == 1 { "" } else { "s" }
+        ))
     } else {
         None
     }
@@ -465,7 +511,8 @@ mod tests {
     #[test]
     fn navigate_concise_strips_scheme() {
         let args = json!({ "url": "https://www.instagram.com/explore/" });
-        let (kind, line, _success) = summarize("navigate", &args, "ok", Verbosity::Concise).unwrap();
+        let (kind, line, _success) =
+            summarize("navigate", &args, "ok", Verbosity::Concise).unwrap();
         assert_eq!(kind, ProgressKind::Navigate);
         assert!(line.contains("instagram.com"), "got: {line}");
         assert!(!line.contains("https://"), "got: {line}");
@@ -492,7 +539,11 @@ mod tests {
         let args = json!({ "ref": "@e4", "text": long });
         let (_, line, _) = summarize("type", &args, "ok", Verbosity::Concise).unwrap();
         // concise truncates at 40
-        assert!(line.chars().count() < 80, "line too long: {} chars", line.chars().count());
+        assert!(
+            line.chars().count() < 80,
+            "line too long: {} chars",
+            line.chars().count()
+        );
     }
 
     #[test]
@@ -513,14 +564,21 @@ mod tests {
     fn scroll_direction_normalized() {
         let up = json!({ "direction": "up" });
         let down = json!({ "direction": "down" });
-        assert!(summarize("scroll", &up, "ok", Verbosity::Concise).unwrap().1.contains("up"));
-        assert!(summarize("scroll", &down, "ok", Verbosity::Concise).unwrap().1.contains("down"));
+        assert!(summarize("scroll", &up, "ok", Verbosity::Concise)
+            .unwrap()
+            .1
+            .contains("up"));
+        assert!(summarize("scroll", &down, "ok", Verbosity::Concise)
+            .unwrap()
+            .1
+            .contains("down"));
     }
 
     #[test]
     fn mark_subtask_done_concise() {
         let args = json!({ "id": "send_msg" });
-        let (kind, line, _) = summarize("mark_subtask_done", &args, "ok", Verbosity::Concise).unwrap();
+        let (kind, line, _) =
+            summarize("mark_subtask_done", &args, "ok", Verbosity::Concise).unwrap();
         assert_eq!(kind, ProgressKind::MarkDone);
         assert!(line.contains("Marked"));
         assert!(!line.contains("send_msg"), "concise should not show id");
@@ -529,7 +587,8 @@ mod tests {
     #[test]
     fn mark_subtask_done_detailed_includes_id() {
         let args = json!({ "id": "send_msg" });
-        let (_, line, _) = summarize("mark_subtask_done", &args, "ok", Verbosity::Detailed).unwrap();
+        let (_, line, _) =
+            summarize("mark_subtask_done", &args, "ok", Verbosity::Detailed).unwrap();
         assert!(line.contains("send_msg"), "got: {line}");
     }
 
@@ -539,14 +598,90 @@ mod tests {
         assert!(summarize("no_such_tool", &args, "ok", Verbosity::Concise).is_none());
     }
 
+    // Phase 33: extract_fields summarizer template.
+    // The arm parses the tool-result JSON object and renders
+    // a deterministic one-liner: the per-listing progress
+    // line the UI shows in the task card.
+
+    #[test]
+    fn extract_fields_renders_one_liner_with_sorted_keys() {
+        // The dispatch site serializes the HashMap as a JSON
+        // object string. Insertion order is not guaranteed, so
+        // the summarizer sorts by key for a stable line.
+        let args = json!({ "fields": ["phone", "rating", "website"] });
+        // Result is a JSON object — keys intentionally out of
+        // alphabetical order to prove the sort runs.
+        let result = r#"{"website":"https://x.example","phone":"+91-22-1234-5678","rating":"4.3"}"#;
+        let (kind, text, success) =
+            summarize("extract_fields", &args, result, Verbosity::Concise).unwrap();
+        assert_eq!(kind, ProgressKind::ExtractFields);
+        assert!(success);
+        // Sorted: phone, rating, website.
+        assert_eq!(
+            text,
+            "Extracted: phone=+91-22-1234-5678 | rating=4.3 | website=https://x.example"
+        );
+    }
+
+    #[test]
+    fn extract_fields_renders_none_for_missing_fields() {
+        // Acceptance #4: the page may have any subset of
+        // fields. Missing ones become "none" in the line, so
+        // the user can see "the agent looked, found nothing
+        // for this field" instead of an empty space that
+        // would parse as "the agent didn't try".
+        let args = json!({ "fields": ["phone", "rating"] });
+        let result = r#"{"phone":"+1-555-0100","rating":null}"#;
+        let (_, text, _) =
+            summarize("extract_fields", &args, result, Verbosity::Concise).unwrap();
+        assert_eq!(text, "Extracted: phone=+1-555-0100 | rating=none");
+    }
+
+    #[test]
+    fn extract_fields_handles_unparseable_result() {
+        // If the dispatcher emitted an error string instead
+        // of a JSON object (e.g. the page was in a
+        // degenerate state), the summarizer falls back to a
+        // short one-liner instead of panicking on
+        // `serde_json::from_str`.
+        let args = json!({ "fields": ["phone"] });
+        let (_, text, _) = summarize(
+            "extract_fields",
+            &args,
+            "ERROR: page evaluate errored",
+            Verbosity::Concise,
+        )
+        .unwrap();
+        assert!(text.contains("parse failed") || text.is_empty());
+        // The summarize() arm specifically returns a
+        // "parse failed" marker when the result isn't a
+        // JSON object — confirm the success flag is false
+        // (this is the convention the loop uses to mark
+        // failure lines red in the UI).
+        // (We re-call with a known-bad payload to assert
+        // the success flag.)
+        let (_, _, success) = summarize(
+            "extract_fields",
+            &args,
+            "ERROR: page evaluate errored",
+            Verbosity::Concise,
+        )
+        .unwrap();
+        assert!(!success, "ERROR: prefix should mark the line failed");
+    }
+
     #[test]
     fn error_result_does_not_change_text_but_marks_not_success_in_caller() {
         // The summarize() function itself does not look at success
         // for the text. The caller (loop) uses `success` from the
         // string check. We just assert the text is still produced.
         let args = json!({ "url": "https://x.com" });
-        let (_, line, success) = summarize("navigate", &args, "ERROR: boom", Verbosity::Concise).unwrap();
-        assert!(!success, "ERROR-prefixed result should be flagged as failure");
+        let (_, line, success) =
+            summarize("navigate", &args, "ERROR: boom", Verbosity::Concise).unwrap();
+        assert!(
+            !success,
+            "ERROR-prefixed result should be flagged as failure"
+        );
         assert!(line.contains("x.com"), "got: {line}");
     }
 
@@ -554,8 +689,14 @@ mod tests {
 
     #[test]
     fn short_url_strips_scheme_and_query() {
-        assert_eq!(short_url("https://www.instagram.com/explore/?x=1"), "www.instagram.com/explore/");
-        assert_eq!(short_url("http://example.com/path#frag"), "example.com/path");
+        assert_eq!(
+            short_url("https://www.instagram.com/explore/?x=1"),
+            "www.instagram.com/explore/"
+        );
+        assert_eq!(
+            short_url("http://example.com/path#frag"),
+            "example.com/path"
+        );
     }
 
     // ---- truncate ----
@@ -620,21 +761,35 @@ mod tests {
     fn live_progress_recent_text_limits_to_at_most() {
         let mut buf = LiveProgress::new(10);
         for i in 0..10 {
-            buf.push(ProgressLine::new(ProgressKind::Other, format!("s{i}"), 0, true));
+            buf.push(ProgressLine::new(
+                ProgressKind::Other,
+                format!("s{i}"),
+                0,
+                true,
+            ));
         }
         let text = buf.recent_text(3);
         assert!(text.contains("s9"));
         assert!(text.contains("s8"));
         assert!(text.contains("s7"));
-        assert!(!text.contains("s6"), "should not include s6 with at_most=3: {text}");
+        assert!(
+            !text.contains("s6"),
+            "should not include s6 with at_most=3: {text}"
+        );
     }
 
     // ---- more_steps_suffix ----
 
     #[test]
     fn more_steps_suffix_only_when_collapsed() {
-        assert_eq!(more_steps_suffix(10, 5), Some("…and 5 more steps".to_string()));
-        assert_eq!(more_steps_suffix(6, 5), Some("…and 1 more step".to_string()));
+        assert_eq!(
+            more_steps_suffix(10, 5),
+            Some("…and 5 more steps".to_string())
+        );
+        assert_eq!(
+            more_steps_suffix(6, 5),
+            Some("…and 1 more step".to_string())
+        );
         assert_eq!(more_steps_suffix(5, 5), None);
         assert_eq!(more_steps_suffix(3, 5), None);
     }
@@ -679,12 +834,25 @@ mod tests {
     #[test]
     fn end_of_task_prompt_includes_recent_lines() {
         let mut buf = LiveProgress::new(5);
-        buf.push(ProgressLine::new(ProgressKind::Navigate, "Opened instagram.com", 0, true));
-        buf.push(ProgressLine::new(ProgressKind::Type, "Typed \"hi\"", 0, true));
+        buf.push(ProgressLine::new(
+            ProgressKind::Navigate,
+            "Opened instagram.com",
+            0,
+            true,
+        ));
+        buf.push(ProgressLine::new(
+            ProgressKind::Type,
+            "Typed \"hi\"",
+            0,
+            true,
+        ));
         let prompt = end_of_task_prompt("send a message to alice", &buf.recent_text(5));
         assert!(prompt.contains("instagram.com"));
         assert!(prompt.contains("hi"));
-        assert!(prompt.contains("alice"), "must include the task description");
+        assert!(
+            prompt.contains("alice"),
+            "must include the task description"
+        );
     }
 
     // ---- progress kind string ----
@@ -698,6 +866,12 @@ mod tests {
         assert_eq!(ProgressKind::Click.as_str(), "click");
         assert_eq!(ProgressKind::Type.as_str(), "type");
         assert_eq!(ProgressKind::Finish.as_str(), "finish");
+        // Phase 33: the new extract_fields kind. The
+        // frontend uses this as a key to pick an icon —
+        // "data extraction" — so the string is part of the
+        // contract. Locked in here so a future rename is
+        // caught in CI.
+        assert_eq!(ProgressKind::ExtractFields.as_str(), "extract_fields");
     }
 }
 
@@ -712,4 +886,74 @@ pub fn end_of_task_prompt(task_description: &str, recent_progress: &str) -> Stri
         task = task_description,
         steps = if recent_progress.is_empty() { "(no recent steps recorded)".to_string() } else { recent_progress.to_string() },
     )
+}
+
+/// Phase 23: Build the system prompt for combined end-of-task summary + lesson distillation.
+pub fn end_of_task_and_lesson_prompt(
+    task_description: &str,
+    recent_progress: &str,
+    outcome_str: &str,
+    resilience_events: &[String],
+) -> String {
+    format!(
+        "You are an agent summarizer and verbal reinforcement learning distiller.\n\
+        Given the user's task, task outcome ({outcome}), recent browser steps, and resilience detector events, write:\n\
+        1. A single short user-facing reply (1-2 sentences) describing what was accomplished.\n\
+        2. 0 to 3 reusable lessons distilled from friction/failure moments (especially any resilience detector events: ref drift, modal interrupts, session loss, rate limit, vision ambiguity, captchas). If this was a routine clean success without friction, return 0 lessons.\n\n\
+        Return ONLY valid JSON matching this schema:\n\
+        {{\n  \"summary\": \"user-facing reply\",\n  \"lessons\": [\n    {{\n      \"platform\": \"optional domain/platform name or null\",\n      \"situation\": \"short description of what was encountered\",\n      \"lesson_text\": \"reusable insight, under 40 words\"\n    }}\n  ]\n}}\n\n\
+        TASK: {task}\n\n\
+        RESILIENCE DETECTORS FIRED:\n{resilience}\n\n\
+        RECENT STEPS:\n{steps}",
+        outcome = outcome_str,
+        task = task_description,
+        resilience = if resilience_events.is_empty() { "(none)".to_string() } else { resilience_events.join("\n") },
+        steps = if recent_progress.is_empty() { "(no recent steps recorded)".to_string() } else { recent_progress.to_string() },
+    )
+}
+
+/// Phase 28: Build low-token prompt for distilling worker failure context on respawn.
+pub fn respawn_failure_context_prompt(
+    task_description: &str,
+    respawn_reason_str: &str,
+    recent_progress: &str,
+    resilience_events: &[String],
+) -> String {
+    format!(
+        "You are an agent diagnostic summarizer. The browser agent experienced a failure/loop requiring a process restart.\n\
+        Given the task, the restart reason, recent browser steps, and resilience events, write a single concise warning sentence (under 30 words) describing what specific action failed or caused the loop, so the next worker can avoid repeating it.\n\n\
+        TASK: {task}\n\
+        RESTART REASON: {reason}\n\
+        RESILIENCE EVENTS: {resilience}\n\
+        RECENT STEPS: {steps}\n\n\
+        WARNING NOTE:",
+        task = task_description,
+        reason = respawn_reason_str,
+        resilience = if resilience_events.is_empty() { "(none)".to_string() } else { resilience_events.join("\n") },
+        steps = if recent_progress.is_empty() { "(no recent steps recorded)".to_string() } else { recent_progress.to_string() },
+    )
+}
+
+/// Phase 28: Distills failure context note with deterministic fallback for mock/no-LLM modes.
+pub fn distill_respawn_failure_context(
+    task_description: &str,
+    respawn_reason_str: &str,
+    recent_progress: &str,
+    resilience_events: &[String],
+) -> String {
+    if !resilience_events.is_empty() {
+        format!(
+            "Worker stalled due to {} after resilience event: {}",
+            respawn_reason_str,
+            resilience_events.last().unwrap()
+        )
+    } else if !recent_progress.trim().is_empty() {
+        format!(
+            "Worker encountered {} during task execution on step: {}",
+            respawn_reason_str,
+            recent_progress.lines().last().unwrap_or(task_description)
+        )
+    } else {
+        format!("Worker encountered {} during execution", respawn_reason_str)
+    }
 }

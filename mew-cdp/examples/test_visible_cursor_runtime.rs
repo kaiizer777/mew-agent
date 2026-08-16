@@ -14,8 +14,8 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
+use chromiumoxide::Page;
 use mew_cdp::{click_ref, launch, shutdown};
 
 fn parse_args() -> Result<bool> {
@@ -39,10 +39,17 @@ fn read_browser_binary_path() -> Option<String> {
             let mut in_browser = false;
             for line in s.lines() {
                 let trimmed = line.trim_start();
-                if trimmed.starts_with('#') || trimmed.is_empty() { continue; }
-                if line.starts_with("browser:") { in_browser = true; continue; }
+                if trimmed.starts_with('#') || trimmed.is_empty() {
+                    continue;
+                }
+                if line.starts_with("browser:") {
+                    in_browser = true;
+                    continue;
+                }
                 if in_browser {
-                    if !line.starts_with(' ') && !line.starts_with('\t') { break; }
+                    if !line.starts_with(' ') && !line.starts_with('\t') {
+                        break;
+                    }
                     if let Some(rest) = trimmed.strip_prefix("binary_path:") {
                         return Some(rest.trim().trim_matches('"').to_string());
                     }
@@ -50,7 +57,9 @@ fn read_browser_binary_path() -> Option<String> {
             }
             return None;
         }
-        if !dir.pop() { break; }
+        if !dir.pop() {
+            break;
+        }
     }
     None
 }
@@ -59,7 +68,8 @@ async fn exists(page: &Page, expr: &str) -> bool {
     // Note: `value()` returns Some for both `true` and `false` boolean
     // results. We need to check the *actual* boolean, not just whether
     // a value came back.
-    page.evaluate(expr).await
+    page.evaluate(expr)
+        .await
         .ok()
         .and_then(|r| r.value().and_then(|v| v.as_bool()))
         .unwrap_or(false)
@@ -86,14 +96,15 @@ async fn main() -> Result<()> {
         nonce
     );
     // Encode manually for data: URL (only safe chars used in body).
-    let data_url = format!("data:text/html,{}", body
-        .replace(' ', "%20")
-        .replace('"', "%22")
-        .replace('#', "%23")
-        .replace('{', "%7B")
-        .replace('}', "%7D")
-        .replace('<', "%3C")
-        .replace('>', "%3E")
+    let data_url = format!(
+        "data:text/html,{}",
+        body.replace(' ', "%20")
+            .replace('"', "%22")
+            .replace('#', "%23")
+            .replace('{', "%7B")
+            .replace('}', "%7D")
+            .replace('<', "%3C")
+            .replace('>', "%3E")
     );
     page.goto(&data_url).await?.wait_for_navigation().await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -109,10 +120,19 @@ async fn main() -> Result<()> {
     let backend_id: BackendNodeId = desc.backend_node_id;
     click_ref(&page, backend_id).await?;
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let clicked = exists(&page, "document.getElementById('out').textContent === 'CLICKED'").await;
+    let clicked = exists(
+        &page,
+        "document.getElementById('out').textContent === 'CLICKED'",
+    )
+    .await;
 
     // Stealth patch should ALWAYS be in place regardless of cursor flag.
-    let webdriver_hidden = page.evaluate("navigator.webdriver === false").await.ok().and_then(|r| r.value().and_then(|v| v.as_bool())).unwrap_or(false);
+    let webdriver_hidden = page
+        .evaluate("navigator.webdriver === false")
+        .await
+        .ok()
+        .and_then(|r| r.value().and_then(|v| v.as_bool()))
+        .unwrap_or(false);
 
     println!("[{}] api present          = {}", label, api_present);
     println!("[{}] cursor dom present   = {}", label, dom_present);
@@ -122,16 +142,43 @@ async fn main() -> Result<()> {
 
     let mut pass = true;
     if on {
-        if !api_present { eprintln!("FAIL: cursor should be present when flag on"); pass = false; }
-        if !dom_present { eprintln!("FAIL: cursor DOM should be present when flag on"); pass = false; }
-        if !clicked { eprintln!("FAIL: real click did not register"); pass = false; }
-        if !webdriver_hidden { eprintln!("FAIL: stealth patch missing"); pass = false; }
+        if !api_present {
+            eprintln!("FAIL: cursor should be present when flag on");
+            pass = false;
+        }
+        if !dom_present {
+            eprintln!("FAIL: cursor DOM should be present when flag on");
+            pass = false;
+        }
+        if !clicked {
+            eprintln!("FAIL: real click did not register");
+            pass = false;
+        }
+        if !webdriver_hidden {
+            eprintln!("FAIL: stealth patch missing");
+            pass = false;
+        }
     } else {
-        if api_present { eprintln!("FAIL: cursor API should NOT be present when flag off"); pass = false; }
-        if dom_present { eprintln!("FAIL: cursor DOM should NOT be present when flag off"); pass = false; }
-        if ripple_present { eprintln!("FAIL: ripple DOM should NOT be present when flag off"); pass = false; }
-        if !clicked { eprintln!("FAIL: real click did not register (off mode)"); pass = false; }
-        if !webdriver_hidden { eprintln!("FAIL: stealth patch missing (off mode)"); pass = false; }
+        if api_present {
+            eprintln!("FAIL: cursor API should NOT be present when flag off");
+            pass = false;
+        }
+        if dom_present {
+            eprintln!("FAIL: cursor DOM should NOT be present when flag off");
+            pass = false;
+        }
+        if ripple_present {
+            eprintln!("FAIL: ripple DOM should NOT be present when flag off");
+            pass = false;
+        }
+        if !clicked {
+            eprintln!("FAIL: real click did not register (off mode)");
+            pass = false;
+        }
+        if !webdriver_hidden {
+            eprintln!("FAIL: stealth patch missing (off mode)");
+            pass = false;
+        }
     }
 
     let _ = shutdown(browser, handle, job).await;
@@ -156,14 +203,21 @@ async fn main() -> Result<()> {
         let p1 = format!("data:text/html,<html><body><span id=n>{}</span><button id=b1>btn1</button><div id=o1></div><script>document.getElementById('b1').onclick=function(){{document.getElementById('o1').textContent='A';}};</script></body></html>", nonce1);
         page2.goto(&p1).await?.wait_for_navigation().await?;
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let p1_api = exists(&page2, "!!(window.__mewCursor && window.__mewCursor.moveTo)").await;
+        let p1_api = exists(
+            &page2,
+            "!!(window.__mewCursor && window.__mewCursor.moveTo)",
+        )
+        .await;
         let p1_dom = exists(&page2, "!!document.getElementById('__mew-cursor')").await;
         let btn1 = page2.find_element("#b1").await?;
         let d1 = btn1.description().await?;
         click_ref(&page2, d1.backend_node_id).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let p1_clicked = exists(&page2, "document.getElementById('o1').textContent === 'A'").await;
-        println!("[PAGE1] api={} dom={} click landed={}", p1_api, p1_dom, p1_clicked);
+        println!(
+            "[PAGE1] api={} dom={} click landed={}",
+            p1_api, p1_dom, p1_clicked
+        );
 
         // Page 2: navigate again. The script should be re-injected.
         let nonce2 = std::time::SystemTime::now()
@@ -173,14 +227,21 @@ async fn main() -> Result<()> {
         let p2 = format!("data:text/html,<html><body><span id=n>{}</span><button id=b2>btn2</button><div id=o2></div><script>document.getElementById('b2').onclick=function(){{document.getElementById('o2').textContent='B';}};</script></body></html>", nonce2);
         page2.goto(&p2).await?.wait_for_navigation().await?;
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let p2_api = exists(&page2, "!!(window.__mewCursor && window.__mewCursor.moveTo)").await;
+        let p2_api = exists(
+            &page2,
+            "!!(window.__mewCursor && window.__mewCursor.moveTo)",
+        )
+        .await;
         let p2_dom = exists(&page2, "!!document.getElementById('__mew-cursor')").await;
         let btn2 = page2.find_element("#b2").await?;
         let d2 = btn2.description().await?;
         click_ref(&page2, d2.backend_node_id).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let p2_clicked = exists(&page2, "document.getElementById('o2').textContent === 'B'").await;
-        println!("[PAGE2] api={} dom={} click landed={}", p2_api, p2_dom, p2_clicked);
+        println!(
+            "[PAGE2] api={} dom={} click landed={}",
+            p2_api, p2_dom, p2_clicked
+        );
 
         let multi_pass = p1_api && p1_dom && p1_clicked && p2_api && p2_dom && p2_clicked;
         if multi_pass {

@@ -1,6 +1,5 @@
-use std::env;
-use std::fs;
 use serde_json::json;
+use std::fs;
 
 #[tokio::main]
 async fn main() {
@@ -21,7 +20,7 @@ async fn main() {
         json!({
             "role": "user",
             "content": "Hello!"
-        })
+        }),
     ];
 
     println!("Sending request 1...");
@@ -30,7 +29,8 @@ async fn main() {
         "messages": messages
     });
 
-    let res1 = client.post(&url)
+    let res1 = client
+        .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&body1)
         .send()
@@ -38,7 +38,10 @@ async fn main() {
         .unwrap();
 
     let json1: serde_json::Value = res1.json().await.unwrap();
-    println!("Response 1 usage: {}", serde_json::to_string_pretty(&json1["usage"]).unwrap());
+    println!(
+        "Response 1 usage: {}",
+        serde_json::to_string_pretty(&json1["usage"]).unwrap()
+    );
 
     messages.push(json1["choices"][0]["message"].clone());
     messages.push(json!({
@@ -52,7 +55,8 @@ async fn main() {
         "messages": messages
     });
 
-    let res2 = client.post(&url)
+    let res2 = client
+        .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&body2)
         .send()
@@ -60,5 +64,8 @@ async fn main() {
         .unwrap();
 
     let json2: serde_json::Value = res2.json().await.unwrap();
-    println!("Response 2 usage: {}", serde_json::to_string_pretty(&json2["usage"]).unwrap());
+    println!(
+        "Response 2 usage: {}",
+        serde_json::to_string_pretty(&json2["usage"]).unwrap()
+    );
 }

@@ -42,16 +42,18 @@
 
 use crate::agent::Agent;
 use crate::chat_agent::ChatAgent;
-use crate::handoff::{BrowserResult, BrowserStatus, Handoff};
+use crate::exporter::{self, AnyFinding};
+use crate::handoff::{BrowserResult, BrowserStatus, Handoff, MapsFinding};
 use crate::router::{ConversationMessage, Intent};
-use crate::ProviderConfig;
 pub use crate::todo::EvidenceMismatch;
+use crate::{ExportConfig, ProviderConfig};
 // Phase 3: use the re-exported `Page` from `mew-cdp` rather
 // than depending on `chromiumoxide` directly. Keeps the
 // orchestrator's public surface free of the
 // `chromiumoxide` dep — downstream crates (like the Tauri
 // `mew-ui` crate) can implement `BrowserAgentFactory` without
 // adding `chromiumoxide` to their own `Cargo.toml`.
+use mew_cdp::ReExportedBrowser as Browser;
 use mew_cdp::ReExportedPage as Page;
 use std::sync::Arc;
 
@@ -60,7 +62,7 @@ use std::sync::Arc;
 /// the outside world — the actual `app.emit` calls and the Tauri
 /// Channel live behind a `TurnSink` implementation, which makes
 /// the orchestrator testable without Tauri.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum OrchestratorEvent {
     /// A "browser task started" notice. Frontend renders this as
@@ -143,6 +145,18 @@ pub enum OrchestratorEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Phase 29: worker process was respawned following a stuck, token limit, or crash episode.
+    /// Frontend renders a task_recovered event card / notice.
+    TaskRecovered {
+        originating_message_id: String,
+        reason_note: String,
+        attempt: usize,
+    },
+    /// Phase 2: live partial finding emitted as soon as deduplicated and verified.
+    PartialFinding {
+        originating_message_id: String,
+        finding: crate::research::ResearchFinding,
+    },
 }
 
 /// The thing the orchestrator pushes events to. Production
@@ -189,6 +203,51 @@ pub trait BrowserAgentFactory: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<BrowserResult>> + Send + 'a>,
     >;
+
+    /// Phase 37: optional hook for parallel-Maps dispatch.
+    /// The default impl returns `None` (single-factory
+    /// path runs). `AgentFactory` overrides it to open a
+    /// fresh Chrome tab via `Browser::new_page()` and run
+    /// the per-category handoff on it.
+    ///
+    /// We use a callback (returning a `'static` future)
+    /// instead of returning a `Browser` because
+    /// `chromiumoxide::Browser` is `!Clone` and `!Sync` —
+    /// the orchestrator can't hold a `&Browser` across the
+    /// parallel `JoinSet::spawn` boundary. The factory
+    /// owns the `Browser` and runs the per-worker dispatch
+    /// on its own task, returning a future that resolves
+    /// when that worker finishes.
+    fn run_parallel_category<'a>(
+        &'a self,
+        handoff: Handoff,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<BrowserResult>>
+                + Send
+                + 'a,
+        >,
+    > {
+        // Default: re-use the single-factory path. This is
+        // a safe fallback — the parallel dispatcher in
+        // `dispatch_browser_task` won't call this unless
+        // the factory opts in via `supports_parallel`,
+        // but we still need a real implementation so
+        // the trait is object-safe.
+        let _ = handoff;
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "factory does not support parallel dispatch; use run_browser_task"
+            ))
+        })
+    }
+
+    /// Phase 37: signal whether `run_parallel_category` is
+    /// implemented and the factory can serve parallel
+    /// workers. Default `false`.
+    fn supports_parallel(&self) -> bool {
+        false
+    }
 }
 
 /// Run a single user turn end-to-end. The function is the
@@ -229,7 +288,7 @@ pub async fn run_turn(
         originating_message_id = %message_id,
         intent = match &intent {
             Intent::Chat(_) => "chat",
-            Intent::BrowserTask(_) => "browser_task",
+            Intent::BrowserTask { .. } => "browser_task",
         },
         "user turn classified"
     );
@@ -246,38 +305,45 @@ pub async fn run_turn(
             });
             Ok(reply)
         }
-        Intent::BrowserTask(task) => {
+        Intent::BrowserTask {
+            task,
+            shape,
+            job_query,
+            lead_query,
+            confidence,
+            is_ambiguous,
+        } => {
             // Browser intent: build the typed Handoff, dispatch
             // to the browser agent, wait for the typed Result,
             // synthesize the chat reply.
-            //
-            // The orchestrator does not assume the Handoff has
-            // been pre-planned; the ChatAgent::build_handoff
-            // call below runs the deterministic planner. The
-            // browser agent's pre-flight decomposition is a
-            // no-op when the tracker is already seeded (the
-            // constructor's `run_preflight_plan` calls
-            // `tracker.declare(...)` which accepts the
-            // orchestrator's subtask list wholesale).
             let page = page.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "orchestrator: browser_task intent requires a &Page, got None"
-                )
+                anyhow::anyhow!("orchestrator: browser_task intent requires a &Page, got None")
             })?;
-            let handoff = chat_agent.build_handoff(
+            let handoffs = chat_agent.build_compound_handoffs(
                 &task,
                 &message_id,
                 Vec::new(), // constraints: future work — sensitive platforms surface here
+                shape,
+                job_query,
+                lead_query,
+                confidence.as_deref(),
+                is_ambiguous,
             );
-            // Delegate to `dispatch_browser_task` so the
-            // Tauri command (which classifies synchronously
-            // in `send_message` and dispatches the browser
-            // half in a spawned task) reuses the same
-            // protocol. `run_turn` and
-            // `dispatch_browser_task` must stay in lockstep
-            // on the event sequence — see the doc on
-            // `dispatch_browser_task` for the canonical
-            dispatch_browser_task(chat_agent, factory, pool, sink, page, handoff, history).await
+
+            let mut last_reply = String::new();
+            for handoff in handoffs {
+                last_reply = dispatch_browser_task(
+                    chat_agent,
+                    factory.clone(),
+                    pool.clone(),
+                    sink.clone(),
+                    page,
+                    handoff,
+                    history,
+                )
+                .await?;
+            }
+            Ok(last_reply)
         }
     }
 }
@@ -321,6 +387,72 @@ pub async fn dispatch_browser_task(
         subtask_count = handoff.subtasks.len(),
         "ChatAgent -> BrowserAgent handoff dispatched"
     );
+
+    // Phase 37: parallel-Maps short-circuit. If the handoff
+    // is a multi-category Maps task (`maps_query.parallelism
+    // > 1` and a non-empty `categories` list) AND the
+    // factory supports parallel dispatch
+    // (`supports_parallel() == true`), we dispatch
+    // per-category Handoffs concurrently. The merged
+    // `BrowserResult` is what we synthesize into a chat
+    // reply — the existing Maps synthesizer path renders
+    // the merged `maps_findings` as the user-facing table.
+    //
+    // We do NOT short-circuit the `planner_enabled` path
+    // here. The Phase 13/16 planner is for single-todo
+    // decomposition, not multi-category fan-out; mixing
+    // the two would tangle evidence-gate semantics with
+    // parallel-Maps dispatch. The `parallelism > 1` check
+    // alone is the gate.
+    if let Some(mq) = handoff.maps_query.as_ref() {
+        if mq.parallelism > 1 && mq.categories.len() > 1 && factory.supports_parallel() {
+            tracing::info!(
+                event = "parallel_maps_dispatch",
+                originating_message_id = %handoff.originating_message_id,
+                category_count = mq.categories.len(),
+                "dispatching multi-category Maps task in parallel"
+            );
+            let parallel_result =
+                run_parallel_maps(handoff.clone(), factory.clone()).await?;
+            sink.emit(OrchestratorEvent::BrowserResultReady {
+                originating_message_id: handoff.originating_message_id.clone(),
+                result: parallel_result.clone(),
+            });
+            let reply = chat_agent.synthesize_reply(&parallel_result, history, &handoff);
+            // Phase 41: same export pass as the
+            // single-category path. Multi-category Maps
+            // tasks produce the same `MapsFinding` shape,
+            // so the export label is the search query
+            // (just like the single-category case).
+            let task_label = handoff
+                .maps_query
+                .as_ref()
+                .map(|mq| mq.search_query.clone())
+                .unwrap_or_else(|| handoff.task_description.clone());
+            let (reply, _export_path) = maybe_export_and_append_trailer(
+                reply,
+                &parallel_result.maps_findings,
+                &chat_agent.config().agent.export,
+                &task_label,
+                &handoff.originating_message_id,
+            );
+            sink.emit(OrchestratorEvent::ChatReply {
+                originating_message_id: handoff.originating_message_id.clone(),
+                text: reply.clone(),
+            });
+            sink.emit(OrchestratorEvent::TaskCompleted {
+                originating_message_id: handoff.originating_message_id.clone(),
+                status: parallel_result.status,
+                step_count: parallel_result.key_findings.len() as u32,
+                summary: if parallel_result.summary.is_empty() {
+                    reply.clone()
+                } else {
+                    parallel_result.summary.clone()
+                },
+            });
+            return Ok(reply);
+        }
+    }
 
     // Dispatch. The factory owns the browser agent and
     // returns a `Future<Output = BrowserResult>` that we
@@ -385,13 +517,45 @@ pub async fn dispatch_browser_task(
                     originating_message_id = %handoff.originating_message_id,
                     "BrowserAgentFactory returned an error; converting to Failed BrowserResult"
                 );
-                BrowserResult::failure(
-                    "unknown-session",
-                    user_msg,
-                    None,
-                )
+                BrowserResult::failure("unknown-session", user_msg, None)
             }
         }
+    };
+    // Phase 39: if the handoff is a single-category Maps
+    // task (or a non-Maps task), `result` came straight
+    // from the factory and has not been through
+    // `LocalLeadScorer::rank_and_filter` yet. The parallel
+    // Maps path (above) already calls it inside
+    // `run_parallel_maps`; for the non-parallel path, we
+    // apply the same pass here so the chat synthesizer
+    // always sees a ranked, deduped, filtered list.
+    //
+    // This is a synchronous pure-Rust pass — no LLM
+    // calls. Cost is O(n) for n = total findings, which
+    // is bounded by `listing_count` (≤ 50). For a
+    // non-Maps task (`handoff.maps_query == None` or
+    // `result.maps_findings.is_empty()`), the call is a
+    // no-op.
+    let result = if let Some(mq) = handoff.maps_query.as_ref() {
+        if !result.maps_findings.is_empty() {
+            let mut ranked = result.clone();
+            crate::lead_scorer::LocalLeadScorer::rank_and_filter(
+                &mut ranked.maps_findings,
+                mq,
+            );
+            // Re-rank is now contiguous, and the score
+            // ordering matches the spec ("no-website +
+            // high-rating first"). The
+            // `BrowserResult` summary is left as-is
+            // (the LLM's own one-liner is the better
+            // user-facing header than anything we could
+            // synthesize here).
+            ranked
+        } else {
+            result
+        }
+    } else {
+        result
     };
     sink.emit(OrchestratorEvent::BrowserResultReady {
         originating_message_id: handoff.originating_message_id.clone(),
@@ -410,6 +574,34 @@ pub async fn dispatch_browser_task(
     // uses templating (no LLM call) by default; the
     // orchestrator does not care.
     let reply = chat_agent.synthesize_reply(&result, history, &handoff);
+    // Phase 41: if the result is a Maps task and the
+    // operator enabled lead-gen export, write the
+    // findings to disk and append the
+    // `📁 Full results saved to: ...` trailer to the
+    // chat reply. The trailer is the clickable
+    // `file://` link the Tauri webview renders in the
+    // chat bubble. Non-fatal — a write error degrades
+    // to the pre-Phase-41 byte-equivalent reply.
+    //
+    // The task label is the `MapsQuery::search_query`
+    // when present (e.g. "salons in Mumbai" ->
+    // `salons_in_mumbai_<timestamp>.csv`). When the
+    // handoff has no `maps_query` (a non-Maps task)
+    // we fall back to the raw `task_description` so
+    // a future vertical export still gets a sane
+    // label.
+    let task_label = handoff
+        .maps_query
+        .as_ref()
+        .map(|mq| mq.search_query.clone())
+        .unwrap_or_else(|| handoff.task_description.clone());
+    let (reply, _export_path) = maybe_export_and_append_trailer(
+        reply,
+        &result.maps_findings,
+        &chat_agent.config().agent.export,
+        &task_label,
+        &handoff.originating_message_id,
+    );
     sink.emit(OrchestratorEvent::ChatReply {
         originating_message_id: handoff.originating_message_id.clone(),
         text: reply.clone(),
@@ -476,11 +668,7 @@ pub async fn dispatch_browser_task(
 /// `UserMessage` into the agent's mpsc bus, so the chat list
 /// shows the user's message and a system "Got it, the agent
 /// will adjust" line in the right order.
-pub fn acknowledge_steering(
-    sink: &Arc<dyn TurnSink>,
-    originating_message_id: &str,
-    text: &str,
-) {
+pub fn acknowledge_steering(sink: &Arc<dyn TurnSink>, originating_message_id: &str, text: &str) {
     sink.emit(OrchestratorEvent::SteeringAcknowledged {
         originating_message_id: originating_message_id.to_string(),
         text: text.to_string(),
@@ -501,6 +689,15 @@ pub struct AgentFactory {
     pub config: ProviderConfig,
     pub transcript_dir: Option<std::path::PathBuf>,
     pub page: Page,
+    /// Phase 37: optional shared `Browser` for parallel
+    /// Maps dispatch. When `Some`, the orchestrator's
+    /// parallel-Maps path can call `Browser::new_page()` to
+    /// spawn one tab per category. When `None` (the
+    /// default), `shared_browser()` returns `None` and the
+    /// single-factory path runs. Existing callers don't
+    /// need to update — they get the pre-Phase-37 behavior
+    /// unless they explicitly pass a `Browser`.
+    pub browser: Option<Browser>,
 }
 
 impl BrowserAgentFactory for AgentFactory {
@@ -561,16 +758,14 @@ impl BrowserAgentFactory for AgentFactory {
             // idempotent when called twice with the same
             // items).
             let task_description = handoff.task_description.clone();
-            let mut agent = Agent::new(
-                config,
-                &task_description,
-                transcript_dir.clone(),
-            );
+            let mut agent = Agent::new(config, &task_description, transcript_dir.clone());
+            if let Some(respawn_h) = handoff.respawn_handoff.clone() {
+                agent.set_respawn_handoff(respawn_h);
+            }
             let session_id = agent.session_id().to_string();
             // Mirror the agent's constructor: `transcript_dir` or
             // the default "transcripts" subfolder.
-            let dir = transcript_dir
-                .unwrap_or_else(|| std::path::PathBuf::from("transcripts"));
+            let dir = transcript_dir.unwrap_or_else(|| std::path::PathBuf::from("transcripts"));
             let transcript_ref = Some(
                 dir.join(format!("transcript_{}.log", session_id))
                     .to_string_lossy()
@@ -592,6 +787,486 @@ impl BrowserAgentFactory for AgentFactory {
                 )),
             }
         })
+    }
+
+    fn run_parallel_category<'a>(
+        &'a self,
+        handoff: Handoff,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<BrowserResult>>
+                + Send
+                + 'a,
+        >,
+    > {
+        // Phase 37: open a fresh tab for this parallel
+        // worker, then run the per-category handoff on it.
+        // The factory owns the `Browser`; the per-worker
+        // `Page` is held in `ParallelMapsFactory` for the
+        // duration of the worker's run. When the future
+        // resolves, the `Page` (and the `ParallelMapsFactory`
+        // holding it) is dropped; chromiumoxide's
+        // `Page::Drop` closes the tab.
+        let browser = self.browser.as_ref();
+        let config = self.config.clone();
+        let transcript_dir = self.transcript_dir.clone();
+        Box::pin(async move {
+            let browser = match browser {
+                Some(b) => b,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "AgentFactory::run_parallel_category called without a shared Browser"
+                    ));
+                }
+            };
+            // Open a fresh tab. ~200ms typical, not 3-5s.
+            let page = browser.new_page("about:blank").await.map_err(|e| {
+                anyhow::anyhow!("Browser::new_page failed for parallel worker: {e}")
+            })?;
+            let factory = ParallelMapsFactory::new(config, transcript_dir, page);
+            factory.run_browser_task(handoff).await
+        })
+    }
+
+    fn supports_parallel(&self) -> bool {
+        self.browser.is_some()
+    }
+}
+
+// ----------------------------------------------------------------------
+// Phase 37: ParallelMapsFactory — tab-per-worker for multi-category Maps.
+//
+// The single-tab `AgentFactory` borrows the original
+// `&Page` Chrome handed us. For a multi-category Maps task
+// ("salons and gyms and clinics in Mumbai, 15 each") we
+// want N parallel workers, each on its own Chrome tab. The
+// `Browser` is `Clone` in chromiumoxide and is cheap to
+// share — calling `Browser::new_page()` is ~200ms, not the
+// 3-5s a full `Browser::launch` costs.
+//
+// The orchestrator's parallel-dispatch path constructs one
+// `ParallelMapsFactory` per parallel worker (each gets a
+// fresh tab). The factory's contract is identical to
+// `AgentFactory` — a `BrowserAgentFactory` impl that takes a
+// `Handoff` and returns a `Future<Output = BrowserResult>` —
+// so the parallel-dispatch path can call it through the
+// existing `BrowserAgentFactory` trait without changes.
+// ----------------------------------------------------------------------
+
+pub struct ParallelMapsFactory {
+    pub config: ProviderConfig,
+    pub transcript_dir: Option<std::path::PathBuf>,
+    pub page: Page,
+}
+
+impl ParallelMapsFactory {
+    pub fn new(
+        config: ProviderConfig,
+        transcript_dir: Option<std::path::PathBuf>,
+        page: Page,
+    ) -> Self {
+        Self {
+            config,
+            transcript_dir,
+            page,
+        }
+    }
+}
+
+impl BrowserAgentFactory for ParallelMapsFactory {
+    fn run_browser_task<'a>(
+        &'a self,
+        handoff: Handoff,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<BrowserResult>> + Send + 'a>,
+    > {
+        let config = self.config.clone();
+        let transcript_dir = self.transcript_dir.clone();
+        let page = self.page.clone();
+        Box::pin(async move {
+            let task_description = handoff.task_description.clone();
+            let mut agent = Agent::new(config, &task_description, transcript_dir.clone());
+            if let Some(respawn_h) = handoff.respawn_handoff.clone() {
+                agent.set_respawn_handoff(respawn_h);
+            }
+            let session_id = agent.session_id().to_string();
+            let dir = transcript_dir.unwrap_or_else(|| std::path::PathBuf::from("transcripts"));
+            let transcript_ref = Some(
+                dir.join(format!("transcript_{}.log", session_id))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            let result = agent.run(&page).await;
+            match result {
+                Ok(text) => Ok(BrowserResult::done(
+                    session_id,
+                    text,
+                    Vec::new(),
+                    None,
+                    transcript_ref,
+                )),
+                Err(e) => Ok(BrowserResult::failure(
+                    session_id,
+                    format!("{e}"),
+                    transcript_ref,
+                )),
+            }
+        })
+    }
+}
+
+/// Phase 37: dispatch a multi-category Maps task in
+/// parallel. Builds one `Handoff` per category, each
+/// running on its own Chrome tab, and merges the per-worker
+/// `maps_findings` lists into a single deduplicated,
+/// rating-sorted list.
+///
+/// Inputs:
+///   * `handoff` — the original typed Handoff with
+///     `maps_query.parallelism > 1` and a non-empty
+///     `maps_query.categories`. Each entry in
+///     `categories` is a fully-scoped per-category search
+///     query (e.g. "salons in Mumbai").
+///   * `factory` — the existing `BrowserAgentFactory`
+///     (already used for the single-factory path). The
+///     factory must `supports_parallel()` for this path
+///     to be reachable; we don't double-check here.
+///
+/// Returns a `BrowserResult` whose `maps_findings` is the
+/// merged list. The chat synthesizer's existing Maps path
+/// renders this list as the user-facing table; the
+/// per-category labels are preserved in the `key_findings`
+/// summary so a reviewer can see which listings came from
+/// which worker.
+///
+/// Failure mode: if any worker's `run_parallel_category`
+/// fails, that category's slot in the merged list is
+/// empty (the worker's transcript captures the error). We
+/// don't fail the whole task — the other categories'
+/// findings still surface in the user-facing table. This
+/// is the right tradeoff for a parallel task: one stuck
+/// worker shouldn't kill the result the user is waiting
+/// for.
+pub async fn run_parallel_maps(
+    handoff: Handoff,
+    factory: Arc<dyn BrowserAgentFactory>,
+) -> anyhow::Result<BrowserResult> {
+    use crate::handoff::MapsQuery;
+
+    let maps_query = handoff
+        .maps_query
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("run_parallel_maps: handoff has no maps_query"))?;
+
+    if maps_query.parallelism <= 1 || maps_query.categories.len() <= 1 {
+        // Defensive: the caller should have short-circuited
+        // before reaching here. If we got a single-category
+        // task on this path, return a `Done` with no
+        // findings so the synthesizer renders a clean
+        // "no parallel dispatch needed" reply.
+        return Ok(BrowserResult::done_maps(
+            handoff.originating_message_id.clone(),
+            handoff.task_description.clone(),
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        ));
+    }
+
+    let cap = maps_query.parallelism.max(1);
+    let categories: Vec<String> = maps_query
+        .categories
+        .iter()
+        .take(cap)
+        .cloned()
+        .collect();
+
+    // Spawn one task per category. Each task calls
+    // `factory.run_parallel_category(sub_handoff)`,
+    // which the production `AgentFactory` implements
+    // by opening a fresh tab and running the per-category
+    // handoff on it.
+    let mut join_set: tokio::task::JoinSet<(String, anyhow::Result<BrowserResult>)> =
+        tokio::task::JoinSet::new();
+    for (idx, category_query) in categories.iter().enumerate() {
+        let sub_id = format!("{}:cat-{}", handoff.originating_message_id, idx + 1);
+        // Build a per-category Handoff with a single-
+        // category maps_query. The worker's agent sees the
+        // scoped query and produces scoped findings.
+        let sub_mq = MapsQuery {
+            search_query: category_query.clone(),
+            city: maps_query.city.clone(),
+            listing_count: maps_query.listing_count,
+            min_rating: maps_query.min_rating,
+            require_no_website: maps_query.require_no_website,
+            require_phone: maps_query.require_phone,
+            parallelism: 1,
+            categories: vec![category_query.clone()],
+        };
+        let sub_handoff = Handoff {
+            task_description: category_query.clone(),
+            subtasks: vec![crate::handoff::HandoffSubTask::new(
+                format!("cat-{}", idx + 1),
+                category_query.clone(),
+            )],
+            constraints: handoff.constraints.clone(),
+            originating_message_id: sub_id.clone(),
+            research_plan: None,
+            job_query: handoff.job_query.clone(),
+            lead_query: handoff.lead_query.clone(),
+            task_shape: handoff.task_shape.clone(),
+            respawn_handoff: None,
+            maps_query: Some(sub_mq),
+        };
+        let category = category_query.clone();
+        // Clone the `Arc<dyn BrowserAgentFactory>` for
+        // each spawned task. The trait method
+        // `run_parallel_category` borrows `&self`; the
+        // owned Arc keeps the factory alive for the
+        // duration of the spawned future.
+        let factory_for_task = factory.clone();
+        join_set.spawn(async move {
+            let res = factory_for_task.run_parallel_category(sub_handoff).await;
+            (category, res)
+        });
+    }
+
+    // Collect results in arrival order. Each one is a
+    // (category, Result<BrowserResult, anyhow>) tuple.
+    let mut per_category: Vec<(String, BrowserResult)> = Vec::with_capacity(categories.len());
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok((cat, res)) => match res {
+                Ok(b) => per_category.push((cat, b)),
+                Err(e) => per_category.push((
+                    cat,
+                    BrowserResult::failure(
+                        format!("parallel-maps-worker"),
+                        format!("{e}"),
+                        None,
+                    ),
+                )),
+            },
+            Err(e) => {
+                // JoinError: a task panicked. We don't know
+                // which category, so we just keep going.
+                tracing::error!(error = %e, "parallel maps worker panicked");
+            }
+        }
+    }
+
+    // Merge: collect all maps_findings into a single
+    // deduped, sorted list. Per-category labels go into
+    // key_findings so a reviewer can see the partition.
+    let mut merged_findings: Vec<crate::handoff::MapsFinding> = Vec::new();
+    let mut key_findings = Vec::new();
+    let mut any_failure = false;
+    for (idx, (cat, res)) in per_category.iter().enumerate() {
+        let status = if matches!(res.status, BrowserStatus::Failed) {
+            any_failure = true;
+            "failed"
+        } else if matches!(res.status, BrowserStatus::Partial) {
+            "partial"
+        } else {
+            "done"
+        };
+        let reason = if res.failure_reason.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", res.failure_reason)
+        };
+        key_findings.push(crate::handoff::KeyFinding {
+            id: format!("cat-{}", idx + 1),
+            description: cat.clone(),
+            status: status.to_string(),
+            reason: reason.trim().to_string(),
+            evidence_signature: res.final_snapshot_signature.clone(),
+        });
+        merged_findings.extend(res.maps_findings.iter().cloned());
+    }
+    let merged_findings = crate::handoff::merge_maps_findings(merged_findings);
+
+    // Phase 39: rank, dedup, and filter the merged findings
+    // before they reach the chat synthesizer. The cross-worker
+    // merge above already dedups by `(name, address)` with a
+    // "richer wins" rule; `LocalLeadScorer::rank_and_filter`
+    // is the lead-quality pass that:
+    //   * re-dedups on the spec's normalized `(name, city)`
+    //     key (catches duplicates that escaped the
+    //     cross-worker merge — e.g. a salon whose name
+    //     drifted to "The Beauty Salon" in worker A's
+    //     snapshot and "Beauty Salon" in worker B's),
+    //   * drops non-qualified findings from the
+    //     `is_qualified_lead(query)` filter into a second
+    //     "Other findings" partition,
+    //   * re-sorts both partitions by lead-quality score
+    //     desc,
+    //   * re-ranks 1..=N so the chat table renders a clean
+    //     `| Rank | ... |` column.
+    //
+    // This is a synchronous pure-Rust pass — no LLM calls,
+    // no network, no async. Cost is O(n) for n = total
+    // findings, which is bounded by `listing_count` (≤ 50).
+    let mut ranked_findings = merged_findings;
+    crate::lead_scorer::LocalLeadScorer::rank_and_filter(
+        &mut ranked_findings,
+        &maps_query,
+    );
+    let merged_findings = ranked_findings;
+
+    let summary = if any_failure {
+        format!(
+            "Found {} listings across {} categories (one or more workers reported partial results; see the table below).",
+            merged_findings.len(),
+            per_category.len()
+        )
+    } else {
+        format!(
+            "Found {} listings across {} categories.",
+            merged_findings.len(),
+            per_category.len()
+        )
+    };
+
+    let status = if any_failure {
+        BrowserStatus::Partial
+    } else {
+        BrowserStatus::Done
+    };
+
+    Ok(BrowserResult {
+        status,
+        summary,
+        key_findings,
+        final_snapshot_signature: None,
+        raw_transcript_ref: None,
+        session_id: handoff.originating_message_id,
+        failure_reason: String::new(),
+        findings: Vec::new(),
+        job_findings: Vec::new(),
+        lead_findings: Vec::new(),
+        respawn_count: 0,
+        respawn_reasons: Vec::new(),
+        maps_findings: merged_findings,
+        freelance_findings: Vec::new(),
+    })
+}
+
+// ----------------------------------------------------------------------
+// Phase 41: lead-gen result export.
+//
+// The Maps completion path (both the single-category
+// `dispatch_browser_task` branch and the multi-category
+// `run_parallel_maps` branch) calls into this helper after
+// `LocalLeadScorer::rank_and_filter` has produced the final
+// ranked, deduped, qualified `MapsFinding` list. The helper
+//
+//   1. short-circuits when `export.enabled` is false (the
+//      pre-Phase-41 default — no file written, no link in
+//      the chat reply, byte-identical to the old reply),
+//   2. short-circuits when the findings list is empty (a
+//      "no listings matched" task has nothing to export),
+//   3. otherwise calls `exporter::export_findings` and,
+//      on success, appends the
+//      `📁 Full results saved to: [filename](file:///...)`
+//      trailer to the chat reply.
+//
+// Failures here are **non-fatal** — a write error logs a
+// warning and the chat reply is returned unchanged
+// (modulo any pre-trailer content). The Phase 41 spec
+// says "`export.enabled: false` skips the export entirely
+// — no file written, no link in chat reply" and we
+// extend that to "any write error skips the link too."
+//
+// The `task_label` argument is the human-readable label
+// used in the export filename (e.g. `salons_mumbai_*.csv`).
+// We pull it from the `MapsQuery::search_query` when
+// available (the Maps completion path's natural choice),
+// and fall back to the `Handoff::task_description` so a
+// future non-Maps vertical export still gets a sane
+// label.
+
+/// Phase 41: post-synthesis export pass. Returns the chat
+/// reply (possibly with the `file://` export trailer
+/// appended) and the export path (so the caller can log
+/// it / surface it in a `TaskCompleted` event).
+///
+/// `findings` is the post-rank-and-filter
+/// `MapsFinding` slice (the chat synthesizer will see
+/// the same slice). `export_config` is the
+/// `AgentConfig::export` block. `task_label` is the
+/// user-facing label that becomes the filename stem
+/// (sanitized for filesystem safety by the exporter).
+fn maybe_export_and_append_trailer(
+    reply: String,
+    findings: &[MapsFinding],
+    export_config: &ExportConfig,
+    task_label: &str,
+    originating_message_id: &str,
+) -> (String, Option<std::path::PathBuf>) {
+    // Short-circuit 1: export disabled. Matches the
+    // pre-Phase-41 byte-equivalent behavior exactly.
+    if !export_config.enabled {
+        return (reply, None);
+    }
+    // Short-circuit 2: no findings to export. The
+    // empty-findings case is a "no matches" task; an
+    // empty CSV / JSON / Markdown file would be a
+    // confusing artifact, so we skip the write.
+    if findings.is_empty() {
+        tracing::debug!(
+            event = "export_skipped_empty_findings",
+            originating_message_id = %originating_message_id,
+            "Phase 41 export skipped: findings list is empty"
+        );
+        return (reply, None);
+    }
+
+    // Convert to `AnyFinding` for the exporter. Phase 41
+    // only wires the `Maps` path; the exporter's
+    // `Lead` / `Job` variants are scaffolding for
+    // future phases (per the spec's generalization
+    // requirement).
+    let any_findings: Vec<AnyFinding> = findings
+        .iter()
+        .cloned()
+        .map(AnyFinding::Maps)
+        .collect();
+
+    match exporter::export_findings(&any_findings, export_config, task_label) {
+        Ok(path) => {
+            let trailer = exporter::build_export_trailer(&path);
+            tracing::info!(
+                event = "lead_gen_export_written",
+                originating_message_id = %originating_message_id,
+                path = %path.display(),
+                format = %export_config.format,
+                count = findings.len(),
+                "Phase 41: wrote lead-gen results to disk"
+            );
+            // Append the trailer to the existing reply.
+            // The trailer is `\n\n📁 ...` so the user
+            // sees the export info as a separate line
+            // from the markdown table.
+            let mut out = reply;
+            out.push_str(&trailer);
+            (out, Some(path))
+        }
+        Err(e) => {
+            // Non-fatal: log and degrade to the
+            // pre-Phase-41 reply. The user sees a
+            // successful Maps table with no link, and
+            // the trace log explains why.
+            tracing::warn!(
+                event = "lead_gen_export_failed",
+                originating_message_id = %originating_message_id,
+                error = %e,
+                "Phase 41: failed to write lead-gen export; \
+                 continuing without the file:// trailer"
+            );
+            (reply, None)
+        }
     }
 }
 
@@ -847,9 +1522,17 @@ mod tests {
         });
 
         let events = sink_impl.events();
-        assert_eq!(events.len(), 4, "expected exactly 4 events, got {}: {events:?}", events.len());
+        assert_eq!(
+            events.len(),
+            4,
+            "expected exactly 4 events, got {}: {events:?}",
+            events.len()
+        );
         assert!(matches!(events[0], OrchestratorEvent::TaskStarted { .. }));
-        assert!(matches!(events[1], OrchestratorEvent::BrowserResultReady { .. }));
+        assert!(matches!(
+            events[1],
+            OrchestratorEvent::BrowserResultReady { .. }
+        ));
         assert!(matches!(events[2], OrchestratorEvent::ChatReply { .. }));
         // The fourth is the new Phase 4 lifecycle event. We
         // assert its fields here so a future refactor that

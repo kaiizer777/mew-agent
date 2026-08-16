@@ -271,6 +271,9 @@ mod tests {
         // crop before giving up.
         let v = score("I think it's a button", Some((0.0, 0.0, 500.0, 400.0)));
         assert!(v.confidence.score < 0.5);
-        assert!(v.tighten_crop.is_some(), "tighten suggestion should be present for large boxes");
+        assert!(
+            v.tighten_crop.is_some(),
+            "tighten suggestion should be present for large boxes"
+        );
     }
 }

@@ -439,10 +439,7 @@ mod tests {
         assert_eq!(snap.len(), 2);
         let ig = snap.iter().find(|r| r.host == "instagram.com").unwrap();
         assert_eq!(ig.counts.get("recaptcha_v2").copied(), Some(2));
-        assert_eq!(
-            ig.counts.get("cloudflare_turnstile").copied(),
-            Some(1)
-        );
+        assert_eq!(ig.counts.get("cloudflare_turnstile").copied(), Some(1));
         assert_eq!(ig.counts.get("hcaptcha").copied(), Some(0));
         assert_eq!(ig.total(), 3);
     }

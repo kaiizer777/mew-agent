@@ -30,7 +30,10 @@ use mew_cdp::{launch, navigate, wait_for_page_settled};
 
 const PAGES: &[(&str, &str)] = &[
     ("https://example.com", "Example Domain"),
-    ("https://en.wikipedia.org/wiki/Rust_(programming_language)", "Rust"),
+    (
+        "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+        "Rust",
+    ),
 ];
 
 #[tokio::main]
@@ -43,11 +46,8 @@ async fn main() -> anyhow::Result<()> {
     let mut failures: u32 = 0;
     for (idx, (url, must_contain)) in PAGES.iter().enumerate() {
         println!("\n[e2e] === nav {}/{}: {} ===", idx + 1, PAGES.len(), url);
-        let nav = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            navigate(&page, url),
-        )
-        .await;
+        let nav =
+            tokio::time::timeout(std::time::Duration::from_secs(20), navigate(&page, url)).await;
         match nav {
             Ok(Ok(_)) => println!("[e2e] navigation returned"),
             Ok(Err(e)) => eprintln!("[e2e] navigation error: {}", e),
@@ -56,8 +56,10 @@ async fn main() -> anyhow::Result<()> {
 
         // The fixed settle path.
         let settle = wait_for_page_settled(&page).await;
-        println!("[e2e] settled in {}ms ({} polls, settled={})",
-                 settle.elapsed_ms, settle.polls, settle.settled);
+        println!(
+            "[e2e] settled in {}ms ({} polls, settled={})",
+            settle.elapsed_ms, settle.polls, settle.settled
+        );
 
         let obs = match mew_perception::extract_tree(&page, true).await {
             Ok((root, _refs, _dur)) => mew_perception::diff::serialize_full_tree(&root),
@@ -69,8 +71,10 @@ async fn main() -> anyhow::Result<()> {
         };
         let bytes = obs.len();
         let contains = obs.contains(must_contain);
-        println!("[e2e] observation: {} bytes, contains {:?}: {}",
-                 bytes, must_contain, contains);
+        println!(
+            "[e2e] observation: {} bytes, contains {:?}: {}",
+            bytes, must_contain, contains
+        );
         if bytes < 200 {
             println!("[e2e] FAIL: observation too small (<200 bytes)");
             failures += 1;

@@ -30,6 +30,9 @@
 // `then` / `,` is enough to break that into 2 sub-items. Heavier
 // semantic decomposition (e.g. a real planner) is Phase 7.
 
+use std::collections::{HashMap, VecDeque};
+use tokio::task::JoinSet;
+
 use crate::completeness::DeclareItem;
 use crate::todo::{AcceptanceCriterion, AcceptanceKind, Todo, TodoBudget, TodoId, TodoStatus};
 
@@ -57,6 +60,11 @@ pub struct Plan {
 /// Deterministic decomposition. Splits the input on common
 /// compound-instruction conjunctions, normalizes whitespace, and
 /// produces one `SubTask` per clause with a slugified id.
+///
+/// Phase 21: TaskShape Aware. The planner and router classify tasks
+/// into four distinct shapes: `JobSearch` (Phase 19 job/internship pack),
+/// `LeadGen` (Phase 20 B2B lead pack), `GenericResearch` (multi-source research),
+/// and `GenericBrowse` (single-page or direct navigation).
 ///
 /// Rules (in priority order):
 ///   1. Empty / whitespace-only input → empty plan with rationale
@@ -144,6 +152,12 @@ pub fn plan(task: &str) -> Plan {
 /// Reuses the existing deterministic split (`and` / `then` / `,`),
 /// matching each `Todo` id to the corresponding subtask id.
 pub fn decompose_to_todos(handoff: &crate::handoff::Handoff) -> Vec<Todo> {
+    let is_research = handoff
+        .research_plan
+        .as_ref()
+        .map(|p| p.is_research)
+        .unwrap_or(false);
+
     let subtasks = if !handoff.subtasks.is_empty() {
         handoff
             .subtasks
@@ -161,7 +175,7 @@ pub fn decompose_to_todos(handoff: &crate::handoff::Handoff) -> Vec<Todo> {
     let mut todos: Vec<Todo> = Vec::with_capacity(subtasks.len());
     for (i, (id, description)) in subtasks.into_iter().enumerate() {
         let acceptance = infer_acceptance(&description);
-        let depends_on = if i > 0 {
+        let depends_on = if !is_research && i > 0 {
             vec![todos[i - 1].id.clone()]
         } else {
             Vec::new()
@@ -186,9 +200,15 @@ fn infer_acceptance(intent: &str) -> Option<AcceptanceCriterion> {
     if lower.starts_with("navigate") || lower.starts_with("go to") || lower.starts_with("open") {
         Some(AcceptanceCriterion::new(AcceptanceKind::UrlAt, intent))
     } else if lower.starts_with("type") || lower.starts_with("send") || lower.starts_with("text") {
-        Some(AcceptanceCriterion::new(AcceptanceKind::ElementPresent, intent))
+        Some(AcceptanceCriterion::new(
+            AcceptanceKind::ElementPresent,
+            intent,
+        ))
     } else {
-        Some(AcceptanceCriterion::new(AcceptanceKind::AnySnapshot, intent))
+        Some(AcceptanceCriterion::new(
+            AcceptanceKind::AnySnapshot,
+            intent,
+        ))
     }
 }
 
@@ -213,7 +233,7 @@ pub(crate) fn split_compound(task: &str) -> Vec<&str> {
             // way a sentence with two different markers splits
             // at the first boundary, not the one our marker list
             // happened to hit first.
-            if best.map_or(true, |(bp, _)| pos < bp) {
+            if best.is_none_or(|(bp, _)| pos < bp) {
                 best = Some((pos, marker));
             }
         }
@@ -279,6 +299,153 @@ pub fn slugify(description: &str, index: usize) -> String {
     out.push('-');
     out.push_str(&format!("{}", index + 1));
     out
+}
+
+/// Phase 35: detect an enumeration task from a free-text task
+/// string. Returns the count of items the user wants the agent
+/// to walk through, or `None` if no enumeration pattern is
+/// found.
+///
+/// This is a *pure-Rust* function — no LLM, no regex crate
+/// (the project deliberately avoids `regex` for the same
+/// reason `split_compound` does: a handful of `str::find` /
+/// `str::parse` calls is cheaper and removes a dependency).
+///
+/// Recognized patterns (case-insensitive, matched in priority
+/// order so a more specific pattern wins on ties):
+///   * `"first (\d+)"`           — e.g. `"first 20 results"`
+///   * `"top (\d+)"`             — e.g. `"top 15 listings"`
+///   * `"check (\d+)"`           — e.g. `"check 15 listings"`
+///   * `"each of the (\d+)"`     — e.g. `"each of the 10 businesses"`
+///   * `"(\d+) listings"`        — e.g. `"15 listings"`
+///   * `"(\d+) results"`         — e.g. `"30 results in Mumbai"`
+///   * `"(\d+) businesses"`      — e.g. `"25 businesses"`
+///
+/// The function returns `Some(N)` only when `N ∈ [2, 100]`:
+///   * `N < 2` is rejected because "check 1 listing" is not
+///     an enumeration — a single item has no risk of context
+///     loss from the per-iteration history trim, so the
+///     detection should be a no-op.
+///   * `N > 100` is rejected because "check 1000 listings"
+///     is almost certainly a user mistake (the agent will run
+///     out of budget / time well before then) and we don't
+///     want the auto-cap to balloon to 55.
+pub fn detect_enumeration_task(task: &str) -> Option<usize> {
+    // Early-out: empty / whitespace-only input has no count.
+    if task.trim().is_empty() {
+        return None;
+    }
+
+    // Lowercased once so each pattern match can search a single
+    // canonical string. The original `task` is *not* used for
+    // matching — only the lowercased view — so the function is
+    // case-insensitive without duplicating pattern lists.
+    let lower = task.to_lowercase();
+
+    // Patterns are (literal_marker, parse_direction). Direction:
+    //   * `After` — the digits follow the marker; e.g. "first 15"
+    //   * `Before` — the digits precede the marker; e.g. "15 listings"
+    //
+    // We scan in priority order (most specific first) and
+    // return the first hit. Patterns are anchored by spaces
+    // where it matters ("first 15" should not match "firstest 15"),
+    // so we use a small helper that walks whitespace and
+    // digit boundaries rather than a bare `find`.
+    const AFTER_PATTERNS: &[&str] = &[
+        "each of the ",
+        "first ",
+        "top ",
+        "check ",
+    ];
+    for marker in AFTER_PATTERNS {
+        if let Some(n) = parse_number_after(&lower, marker) {
+            if (2..=100).contains(&n) {
+                return Some(n);
+            }
+            // Out-of-range number matched the pattern but the
+            // value is not a real enumeration (e.g. "check 1
+            // listing" or "check 1000 listings"). Keep scanning
+            // — a *later* pattern might still hit a valid
+            // count. (Returning None here would short-circuit
+            // on a stray number; the spec wants the function
+            // to return the *first valid* enumeration count.)
+        }
+    }
+
+    const BEFORE_PATTERNS: &[&str] = &[" listings", " results", " businesses"];
+    for marker in BEFORE_PATTERNS {
+        if let Some(n) = parse_number_before(&lower, marker) {
+            if (2..=100).contains(&n) {
+                return Some(n);
+            }
+        }
+    }
+
+    None
+}
+
+/// Walk `s` looking for `marker`, then parse the contiguous
+/// ASCII digits that follow the marker (skipping at most one
+/// space). Returns `None` if the marker isn't present, if no
+/// digits follow, or if the digits don't parse as `usize`.
+///
+/// Example: `parse_number_after("first 20 results", "first ")`
+/// returns `Some(20)`. `parse_number_after("firstest 20", "first ")`
+/// returns `None` because we require either an end-of-string
+/// or a non-alphanumeric char after the marker (so "firstest"
+/// is not confused for "first").
+fn parse_number_after(s: &str, marker: &str) -> Option<usize> {
+    let start = s.find(marker)?;
+    let after_marker = start + marker.len();
+    // The character right after the marker must be a digit or
+    // a single separating space before digits. This stops
+    // "firstest" from matching "first " (the 'e' is the
+    // boundary). "first " is marker len 6 = "first" + ' '.
+    let rest = &s[after_marker..];
+    let digits_start = rest
+        .strip_prefix(' ')
+        .unwrap_or(rest);
+    let mut end = 0;
+    for (i, ch) in digits_start.char_indices() {
+        if ch.is_ascii_digit() {
+            end = i + 1;
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    digits_start[..end].parse::<usize>().ok()
+}
+
+/// Walk `s` looking for `marker`, then parse the contiguous
+/// ASCII digits that *precede* the marker (skipping at most
+/// one space). Returns `None` if the marker isn't present, if
+/// no digits precede, or if the digits don't parse as `usize`.
+///
+/// Example: `parse_number_before("check 15 listings", " listings")`
+/// returns `Some(15)`. The marker includes the leading space
+/// so "listingss" doesn't match.
+fn parse_number_before(s: &str, marker: &str) -> Option<usize> {
+    let marker_pos = s.find(marker)?;
+    // The character just before the marker must be a digit or
+    // a single separating space before digits. We walk
+    // backwards collecting digits.
+    let head = &s[..marker_pos];
+    let trimmed = head.strip_suffix(' ').unwrap_or(head);
+    let mut start = trimmed.len();
+    for (i, ch) in trimmed.char_indices().rev() {
+        if ch.is_ascii_digit() {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    if start == trimmed.len() {
+        return None;
+    }
+    trimmed[start..].parse::<usize>().ok()
 }
 
 #[cfg(test)]
@@ -449,6 +616,292 @@ mod tests {
             assert_eq!(s.id, format!("step-{}", i + 1));
         }
     }
+
+    // -------- Phase 35: detect_enumeration_task tests --------
+
+    #[test]
+    fn detect_enumeration_task_matches_check_n_listings() {
+        // Spec test (a): "check 15 listings" → Some(15).
+        assert_eq!(detect_enumeration_task("check 15 listings"), Some(15));
+    }
+
+    #[test]
+    fn detect_enumeration_task_matches_first_n_results() {
+        // Spec test (b): "first 20 results in Mumbai" → Some(20).
+        // The trailing text after the count is fine — the marker
+        // pattern stops at the first non-digit char.
+        assert_eq!(
+            detect_enumeration_task("first 20 results in Mumbai"),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn detect_enumeration_task_returns_none_for_unstructured_query() {
+        // Spec test (c): "salons in Mumbai" → None. No enumeration
+        // marker ("first", "top", "check", "each of the", "N listings",
+        // "N results", "N businesses") is present.
+        assert_eq!(detect_enumeration_task("salons in Mumbai"), None);
+    }
+
+    #[test]
+    fn detect_enumeration_task_matches_each_of_the_n() {
+        // Spec test (d): "each of the 10 businesses" → Some(10).
+        assert_eq!(
+            detect_enumeration_task("each of the 10 businesses"),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn detect_enumeration_task_returns_none_for_empty_input() {
+        // Spec test (e): "" → None. Empty input has no count to
+        // detect — the function early-outs before any pattern
+        // matching.
+        assert_eq!(detect_enumeration_task(""), None);
+    }
+
+    // -------- Phase 35: detect_enumeration_task edge cases ----
+    //
+    // The 5 spec tests are above. These additional cases cover
+    // the numeric range guard ([2, 100]), case-insensitivity,
+    // and the priority order between pattern types. They are
+    // not in the spec but are cheap regression coverage — if a
+    // future refactor breaks the guard rails, the spec tests
+    // alone wouldn't catch it.
+
+    #[test]
+    fn detect_enumeration_task_rejects_n_below_2() {
+        // "check 1 listing" is not an enumeration — a single
+        // item has no context-loss risk. The function returns
+        // None rather than Some(1).
+        assert_eq!(detect_enumeration_task("check 1 listing"), None);
+    }
+
+    #[test]
+    fn detect_enumeration_task_rejects_n_above_100() {
+        // "check 1000 listings" is almost certainly a user
+        // mistake; we don't want the auto-cap to balloon to
+        // 55. Returns None.
+        assert_eq!(detect_enumeration_task("check 1000 listings"), None);
+    }
+
+    #[test]
+    fn detect_enumeration_task_is_case_insensitive() {
+        // The function lowercases the input, so "CHECK 15" and
+        // "First 7" both work.
+        assert_eq!(detect_enumeration_task("CHECK 15"), Some(15));
+        assert_eq!(detect_enumeration_task("First 7"), Some(7));
+    }
+
+    #[test]
+    fn detect_enumeration_task_does_not_match_substring_prefix() {
+        // "firstest 15" should NOT match the "first " marker —
+        // the parse_number_after helper requires the char right
+        // after the marker to be a digit (or space+digit), so
+        // 'e' breaks the match. The whole input is constructed
+        // so no *other* enumeration pattern (N listings, N
+        // results, N businesses, each of the, top, check) can
+        // fire either — the digit sits at the start of the
+        // string, not in any "N <word>" position.
+        assert_eq!(detect_enumeration_task("firstest 15"), None);
+    }
+
+    #[test]
+    fn detect_enumeration_task_matches_top_n() {
+        // "top N" is an explicit spec pattern. Verifies the
+        // "top " marker fires (priority order: "each of the "
+        // > "first " > "top " > "check "; here only "top " is
+        // present so it wins on its own).
+        assert_eq!(detect_enumeration_task("top 8 results"), Some(8));
+    }
+}
+
+fn get_todo_domain(todo: &Todo, task: &crate::handoff::Handoff) -> String {
+    if let Some(ref plan) = task.research_plan {
+        if let Some(p) = plan.platforms.iter().find(|p| p.id == todo.id.0) {
+            return p.domain.to_lowercase();
+        }
+    }
+    String::new()
+}
+
+async fn execute_single_todo(
+    mut todo: Todo,
+    task: crate::handoff::Handoff,
+    pool: std::sync::Arc<crate::worker_pool::WorkerPool>,
+    sink: std::sync::Arc<dyn crate::orchestrator::TurnSink>,
+) -> (
+    Todo,
+    Option<String>,
+    Vec<crate::research::ResearchFinding>,
+    Vec<crate::handoff::JobFinding>,
+    Vec<crate::handoff::LeadFinding>,
+) {
+    let mut last_snapshot_sig = None;
+    let mut last_findings = Vec::new();
+    let mut last_job_findings = Vec::new();
+    let mut last_lead_findings = Vec::new();
+
+    sink.emit(crate::orchestrator::OrchestratorEvent::TodoStateChanged {
+        task_id: task.originating_message_id.clone(),
+        todo: todo.clone(),
+    });
+
+    loop {
+        crate::tracing_layer::trace_todo_lifecycle(
+            &task.originating_message_id,
+            &todo.id,
+            "submit",
+        );
+        let rx = match pool.submit(todo.clone(), task.clone()) {
+            Ok(rx) => rx,
+            Err(e) => {
+                todo.status = crate::todo::TodoStatus::Failed {
+                    reason: e.to_string(),
+                };
+                break;
+            }
+        };
+
+        let deadline =
+            tokio::time::sleep(std::time::Duration::from_secs(todo.budget.max_seconds));
+        tokio::pin!(deadline);
+
+        let result = tokio::select! {
+            r = rx => {
+                r.unwrap_or_else(|_| crate::handoff::TodoResult::failure(
+                    todo.id.clone(), "worker channel closed", "", "", 0
+                ))
+            }
+            _ = &mut deadline => {
+                pool.signal(crate::supervisor::SupervisorCommand::new(
+                    u64::MAX,
+                    crate::supervisor::SupervisorSignal::Cancel
+                ));
+                crate::handoff::TodoResult::failure(
+                    todo.id.clone(), "deadline exceeded", "", "", 0
+                )
+            }
+        };
+
+        last_findings = result.findings.clone();
+        last_job_findings = result.job_findings.clone();
+        last_lead_findings = result.lead_findings.clone();
+
+        if result.cancelled {
+            crate::tracing_layer::trace_todo_lifecycle(
+                &task.originating_message_id,
+                &todo.id,
+                "cancel",
+            );
+            todo.status = crate::todo::TodoStatus::Failed {
+                reason: "cancelled by user".into(),
+            };
+            sink.emit(crate::orchestrator::OrchestratorEvent::TodoRejected {
+                task_id: task.originating_message_id.clone(),
+                todo_id: todo.id.to_string(),
+                evidence: None,
+                reason: Some("cancelled by user".into()),
+            });
+            break;
+        }
+
+        if result.status == crate::todo::TodoStatus::Done {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let outcome = todo.mark_done(
+                &result.last_snapshot_signature,
+                &result.last_obs_text,
+                result.last_snapshot_iteration,
+                now_secs,
+                3, // max_attempts
+            );
+
+            match outcome {
+                crate::todo::MarkTodoOutcome::MarkedDone { evidence } => {
+                    crate::tracing_layer::trace_todo_lifecycle(
+                        &task.originating_message_id,
+                        &todo.id,
+                        "mark_done",
+                    );
+                    last_snapshot_sig = Some(evidence.planner_signature);
+                    break;
+                }
+                crate::todo::MarkTodoOutcome::StaleEvidence(mismatch) => {
+                    crate::tracing_layer::trace_todo_lifecycle(
+                        &task.originating_message_id,
+                        &todo.id,
+                        "mark_rejected",
+                    );
+                    sink.emit(crate::orchestrator::OrchestratorEvent::TodoRejected {
+                        task_id: task.originating_message_id.clone(),
+                        todo_id: todo.id.to_string(),
+                        evidence: Some(mismatch),
+                        reason: None,
+                    });
+
+                    if todo.attempts >= 3 {
+                        if let Some(ref acc) = todo.acceptance {
+                            if acc.kind == crate::todo::AcceptanceKind::AnySnapshot {
+                                crate::tracing_layer::trace_todo_lifecycle(
+                                    &task.originating_message_id,
+                                    &todo.id,
+                                    "mark_exhausted",
+                                );
+                                todo.status = crate::todo::TodoStatus::Failed {
+                                    reason: "evidence mismatched 3 times (exhausted)"
+                                        .into(),
+                                };
+                            } else {
+                                crate::tracing_layer::trace_todo_lifecycle(
+                                    &task.originating_message_id,
+                                    &todo.id,
+                                    "mark_failed",
+                                );
+                                todo.status = crate::todo::TodoStatus::Failed {
+                                    reason: "evidence mismatched 3 times (replan required)"
+                                        .into(),
+                                };
+                            }
+                        }
+                        break;
+                    }
+                }
+                crate::todo::MarkTodoOutcome::AlreadyTerminal { .. } => break,
+            }
+        } else {
+            todo.attempts += 1;
+            if todo.attempts >= 3 {
+                crate::tracing_layer::trace_todo_lifecycle(
+                    &task.originating_message_id,
+                    &todo.id,
+                    "mark_failed",
+                );
+                todo.status = crate::todo::TodoStatus::Failed {
+                    reason: result
+                        .failure_reason
+                        .unwrap_or_else(|| "unknown failure".into()),
+                };
+                break;
+            }
+        }
+    }
+
+    sink.emit(crate::orchestrator::OrchestratorEvent::TodoStateChanged {
+        task_id: task.originating_message_id.clone(),
+        todo: todo.clone(),
+    });
+
+    (
+        todo,
+        last_snapshot_sig,
+        last_findings,
+        last_job_findings,
+        last_lead_findings,
+    )
 }
 
 pub struct Planner;
@@ -459,134 +912,222 @@ impl Planner {
         pool: std::sync::Arc<crate::worker_pool::WorkerPool>,
         sink: std::sync::Arc<dyn crate::orchestrator::TurnSink>,
     ) -> crate::handoff::BrowserResult {
-        let mut todos = decompose_to_todos(&task);
-        let mut key_findings = Vec::new();
+        let todos = decompose_to_todos(&task);
+        let n = todos.len();
+        let mut todo_states: Vec<Option<Todo>> = (0..n).map(|_| None).collect();
         let mut final_status = crate::handoff::BrowserStatus::Done;
         let mut last_snapshot_sig = None;
 
-        for todo in todos.iter_mut() {
+        let mut finding_store = crate::research::FindingStore::new();
+        let stream_enabled = task
+            .research_plan
+            .as_ref()
+            .and_then(|p| p.stream_partial_findings)
+            .unwrap_or(true);
+        finding_store.set_emitter(
+            sink.clone(),
+            task.originating_message_id.clone(),
+            stream_enabled,
+        );
+
+        let (max_workers, max_per_domain) = if let Some(ref plan) = task.research_plan {
+            (
+                plan.max_concurrent_workers.unwrap_or(3).max(1),
+                plan.max_concurrent_per_domain.unwrap_or(1).max(1),
+            )
+        } else {
+            (3, 1)
+        };
+
+        let mut pending_indices: VecDeque<usize> = (0..n).collect();
+        let mut active_domains: HashMap<String, usize> = HashMap::new();
+        let mut in_flight: JoinSet<(
+            usize,
+            Todo,
+            Option<String>,
+            String,
+            Vec<crate::research::ResearchFinding>,
+            Vec<crate::handoff::JobFinding>,
+            Vec<crate::handoff::LeadFinding>,
+        )> = JoinSet::new();
+
+        while !pending_indices.is_empty() || !in_flight.is_empty() {
             if pool.is_shutting_down() {
                 final_status = crate::handoff::BrowserStatus::Failed;
-                key_findings.push(crate::handoff::KeyFinding {
-                    id: todo.id.to_string(),
-                    description: todo.intent.clone(),
-                    status: "failed".to_string(),
-                    reason: "pool shutting down".to_string(),
-                    evidence_signature: None,
+                for &idx in &pending_indices {
+                    let mut t = todos[idx].clone();
+                    t.status = crate::todo::TodoStatus::Failed {
+                        reason: "pool shutting down".into(),
+                    };
+                    todo_states[idx] = Some(t);
+                }
+                pending_indices.clear();
+                break;
+            }
+
+            // Try to schedule as many pending ready todos as concurrency and pool permits allow
+            let mut scheduled_any = false;
+            let mut deferred = VecDeque::new();
+
+            while let Some(idx) = pending_indices.pop_front() {
+                let todo = &todos[idx];
+
+                // Check dependencies
+                let deps_satisfied = todo.depends_on.iter().all(|dep_id| {
+                    todo_states
+                        .iter()
+                        .filter_map(|t| t.as_ref())
+                        .any(|t| &t.id == dep_id && matches!(t.status, crate::todo::TodoStatus::Done))
                 });
+
+                let any_dep_failed = todo.depends_on.iter().any(|dep_id| {
+                    todo_states
+                        .iter()
+                        .filter_map(|t| t.as_ref())
+                        .any(|t| &t.id == dep_id && !matches!(t.status, crate::todo::TodoStatus::Done))
+                });
+
+                if any_dep_failed {
+                    let mut failed_todo = todo.clone();
+                    failed_todo.status = crate::todo::TodoStatus::Skipped {
+                        reason: "dependency failed".into(),
+                    };
+                    todo_states[idx] = Some(failed_todo);
+                    scheduled_any = true;
+                    continue;
+                }
+
+                if !deps_satisfied {
+                    deferred.push_back(idx);
+                    continue;
+                }
+
+                let domain = get_todo_domain(todo, &task);
+                let domain_active = if !domain.is_empty() {
+                    *active_domains.get(&domain).unwrap_or(&0)
+                } else {
+                    0
+                };
+
+                // Check global concurrency cap, domain concurrency cap, and pool availability
+                let can_schedule = in_flight.len() < max_workers
+                    && (domain.is_empty() || domain_active < max_per_domain)
+                    && (pool.has_available_worker() || in_flight.is_empty());
+
+                if can_schedule {
+                    if !domain.is_empty() {
+                        *active_domains.entry(domain.clone()).or_insert(0) += 1;
+                    }
+
+                    let task_id = task.originating_message_id.clone();
+                    let todo_id = todo.id.to_string();
+                    crate::tracing_layer::trace_worker_timeline(
+                        &task_id,
+                        &todo_id,
+                        &domain,
+                        "worker_start",
+                        None,
+                    );
+
+                    let todo_clone = todo.clone();
+                    let task_clone = task.clone();
+                    let pool_clone = pool.clone();
+                    let sink_clone = sink.clone();
+                    let domain_clone = domain.clone();
+
+                    in_flight.spawn(async move {
+                        let (res_todo, sig, findings, job_findings, lead_findings) =
+                            execute_single_todo(todo_clone, task_clone, pool_clone, sink_clone).await;
+                        (
+                            idx,
+                            res_todo,
+                            sig,
+                            domain_clone,
+                            findings,
+                            job_findings,
+                            lead_findings,
+                        )
+                    });
+
+                    scheduled_any = true;
+                } else {
+                    deferred.push_back(idx);
+                }
+            }
+
+            pending_indices.extend(deferred);
+
+            if in_flight.is_empty() {
+                // If nothing is in flight and nothing was scheduled, we can't make progress
+                if !scheduled_any && !pending_indices.is_empty() {
+                    for &idx in &pending_indices {
+                        let mut t = todos[idx].clone();
+                        t.status = crate::todo::TodoStatus::Failed {
+                            reason: "dependencies could not be satisfied".into(),
+                        };
+                        todo_states[idx] = Some(t);
+                    }
+                    pending_indices.clear();
+                }
                 continue;
             }
 
-            sink.emit(crate::orchestrator::OrchestratorEvent::TodoStateChanged {
-                task_id: task.originating_message_id.clone(),
-                todo: todo.clone(),
-            });
-
-            loop {
-                crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "submit");
-                let rx = match pool.submit(todo.clone(), task.clone()) {
-                    Ok(rx) => rx,
-                    Err(e) => {
-                        final_status = crate::handoff::BrowserStatus::Failed;
-                        key_findings.push(crate::handoff::KeyFinding {
-                            id: todo.id.to_string(),
-                            description: todo.intent.clone(),
-                            status: "failed".to_string(),
-                            reason: e.to_string(),
-                            evidence_signature: None,
-                        });
-                        break;
-                    }
-                };
-
-                let deadline = tokio::time::sleep(std::time::Duration::from_secs(todo.budget.max_seconds));
-                tokio::pin!(deadline);
-
-                let result = tokio::select! {
-                    r = rx => {
-                        r.unwrap_or_else(|_| crate::handoff::TodoResult::failure(
-                            todo.id.clone(), "worker channel closed", "", "", 0
-                        ))
-                    }
-                    _ = &mut deadline => {
-                        pool.signal(crate::supervisor::SupervisorCommand::new(
-                            u64::MAX,
-                            crate::supervisor::SupervisorSignal::Cancel
-                        ));
-                        crate::handoff::TodoResult::failure(
-                            todo.id.clone(), "deadline exceeded", "", "", 0
-                        )
-                    }
-                };
-
-                if result.cancelled {
-                    crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "cancel");
-                    todo.status = crate::todo::TodoStatus::Failed { reason: "cancelled by user".into() };
-                    sink.emit(crate::orchestrator::OrchestratorEvent::TodoRejected {
-                        task_id: task.originating_message_id.clone(),
-                        todo_id: todo.id.to_string(),
-                        evidence: None,
-                        reason: Some("cancelled by user".into()),
-                    });
-                    break;
-                }
-
-                if result.status == crate::todo::TodoStatus::Done {
-                    let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                    let outcome = todo.mark_done(
-                        &result.last_snapshot_signature,
-                        &result.last_obs_text,
-                        result.last_snapshot_iteration,
-                        now_secs,
-                        3, // max_attempts
-                    );
-
-                    match outcome {
-                        crate::todo::MarkTodoOutcome::MarkedDone { evidence } => {
-                            crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_done");
-                            last_snapshot_sig = Some(evidence.planner_signature);
-                            break;
-                        }
-                        crate::todo::MarkTodoOutcome::StaleEvidence(mismatch) => {
-                            crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_rejected");
-                            sink.emit(crate::orchestrator::OrchestratorEvent::TodoRejected {
-                                task_id: task.originating_message_id.clone(),
-                                todo_id: todo.id.to_string(),
-                                evidence: Some(mismatch),
-                                reason: None,
-                            });
-
-                            if todo.attempts >= 3 {
-                                if let Some(ref acc) = todo.acceptance {
-                                    if acc.kind == crate::todo::AcceptanceKind::AnySnapshot {
-                                        crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_exhausted");
-                                        todo.status = crate::todo::TodoStatus::Failed { reason: "evidence mismatched 3 times (exhausted)".into() };
-                                    } else {
-                                        crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_failed");
-                                        // "otherwise Replan once" (in a real replan we might rebuild todos, here we just fail for now)
-                                        todo.status = crate::todo::TodoStatus::Failed { reason: "evidence mismatched 3 times (replan required)".into() };
-                                    }
-                                }
-                                break;
+            // Await next completing worker
+            if let Some(join_res) = in_flight.join_next().await {
+                match join_res {
+                    Ok((idx, completed_todo, sig, domain, findings, job_findings, lead_findings)) => {
+                        if !domain.is_empty() {
+                            if let Some(cnt) = active_domains.get_mut(&domain) {
+                                *cnt = cnt.saturating_sub(1);
                             }
                         }
-                        crate::todo::MarkTodoOutcome::AlreadyTerminal { .. } => break,
+
+                        let status_str = completed_todo.status.as_str().to_string();
+                        crate::tracing_layer::trace_worker_timeline(
+                            &task.originating_message_id,
+                            &completed_todo.id,
+                            &domain,
+                            "worker_end",
+                            Some(&status_str),
+                        );
+
+                        if sig.is_some() {
+                            last_snapshot_sig = sig;
+                        }
+
+                        if !matches!(completed_todo.status, crate::todo::TodoStatus::Done) {
+                            final_status = crate::handoff::BrowserStatus::Partial;
+                        }
+
+                        // Ingest findings into FindingStore (which automatically emits PartialFinding live)
+                        for jf in job_findings {
+                            finding_store.add_job_finding(jf);
+                        }
+                        for lf in lead_findings {
+                            finding_store.add_lead_finding(lf);
+                        }
+                        for f in findings {
+                            finding_store.insert(f);
+                        }
+
+                        todo_states[idx] = Some(completed_todo);
                     }
-                } else {
-                    todo.attempts += 1;
-                    if todo.attempts >= 3 {
-                        crate::tracing_layer::trace_todo_lifecycle(&task.originating_message_id, &todo.id, "mark_failed");
-                        todo.status = crate::todo::TodoStatus::Failed { 
-                            reason: result.failure_reason.unwrap_or_else(|| "unknown failure".into())
-                        };
-                        break;
+                    Err(e) => {
+                        final_status = crate::handoff::BrowserStatus::Failed;
+                        tracing::error!(error = %e, "planner worker join error");
                     }
                 }
             }
+        }
 
-            sink.emit(crate::orchestrator::OrchestratorEvent::TodoStateChanged {
-                task_id: task.originating_message_id.clone(),
-                todo: todo.clone(),
+        let mut key_findings = Vec::with_capacity(n);
+        for (i, state) in todo_states.into_iter().enumerate() {
+            let todo = state.unwrap_or_else(|| {
+                let mut t = todos[i].clone();
+                t.status = crate::todo::TodoStatus::Failed {
+                    reason: "did not execute".into(),
+                };
+                t
             });
 
             key_findings.push(crate::handoff::KeyFinding {
@@ -600,10 +1141,6 @@ impl Planner {
                 },
                 evidence_signature: todo.evidence.as_ref().map(|e| e.planner_signature.clone()),
             });
-
-            if !matches!(todo.status, crate::todo::TodoStatus::Done) {
-                final_status = crate::handoff::BrowserStatus::Partial;
-            }
         }
 
         crate::handoff::BrowserResult {
@@ -614,7 +1151,13 @@ impl Planner {
             raw_transcript_ref: None,
             session_id: "planner-session".to_string(),
             failure_reason: String::new(),
-            findings: Vec::new(),
+            findings: finding_store.findings().to_vec(),
+            job_findings: finding_store.job_findings().to_vec(),
+            lead_findings: finding_store.lead_findings().to_vec(),
+            respawn_count: 0,
+            respawn_reasons: Vec::new(),
+            maps_findings: Vec::new(),
+            freelance_findings: Vec::new(),
         }
     }
 }

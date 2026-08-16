@@ -177,6 +177,11 @@ impl Scenario {
             constraints: Vec::new(),
             originating_message_id: originating_message_id.to_string(),
             research_plan: None,
+            job_query: None,
+            lead_query: None,
+            task_shape: None,
+            respawn_handoff: None,
+            maps_query: None,
         }
     }
 
@@ -290,6 +295,13 @@ pub fn default_scenarios() -> Vec<Scenario> {
         //     unit test layer (Phase 6's
         //     `ref_recovery::attempt_recovery`).
         ref_drift_arrival(),
+        // 11. Phase 34 — Google Maps local-lead-gen. The
+        //     scenario mocks a 5-listing Maps page state and
+        //     asserts the Maps vertical pack (LocalLeadGen
+        //     shape, MapsQuery::parse, MapsFinding filtering)
+        //     end-to-end via deterministic data. No live
+        //     Maps, no live LLM.
+        crate::eval::scenarios::maps_lead_gen::maps_lead_gen_scenario(),
     ]
 }
 
@@ -601,12 +613,18 @@ mod tests {
     use mew_resilience::ResilienceFinding;
 
     #[test]
-    fn default_scenarios_has_ten_rows() {
+    fn default_scenarios_has_eleven_rows() {
         // The regression suite must not silently shrink. A
         // future scenario-removal that drops the count
-        // below 10 is caught here.
+        // below 11 is caught here. (Phase 34 added the
+        // Google Maps local-lead-gen scenario.)
         let set = default_scenarios();
-        assert_eq!(set.len(), 10, "expected 10 default scenarios, got {}", set.len());
+        assert_eq!(
+            set.len(),
+            11,
+            "expected 11 default scenarios, got {}",
+            set.len()
+        );
     }
 
     #[test]
@@ -616,7 +634,11 @@ mod tests {
         ids.sort();
         let original_len = ids.len();
         ids.dedup();
-        assert_eq!(ids.len(), original_len, "duplicate scenario id in default_scenarios()");
+        assert_eq!(
+            ids.len(),
+            original_len,
+            "duplicate scenario id in default_scenarios()"
+        );
     }
 
     #[test]
@@ -634,7 +656,11 @@ mod tests {
         // `task_description`.
         for s in default_scenarios() {
             let h = s.build_handoff("test:0");
-            assert!(!h.task_description.is_empty(), "scenario {}: empty handoff task", s.id);
+            assert!(
+                !h.task_description.is_empty(),
+                "scenario {}: empty handoff task",
+                s.id
+            );
             // The planner's decomposition is reflected in
             // the handoff's subtask list.
             assert_eq!(
@@ -654,10 +680,16 @@ mod tests {
         // failure modes is keyed on these. Changing one is a
         // wire-format break.
         assert_eq!(FailureMode::RefDrift.as_str(), "ref_drift");
-        assert_eq!(FailureMode::ModalInterruption.as_str(), "modal_interruption");
+        assert_eq!(
+            FailureMode::ModalInterruption.as_str(),
+            "modal_interruption"
+        );
         assert_eq!(FailureMode::SessionLoss.as_str(), "session_loss");
         assert_eq!(FailureMode::RateLimit.as_str(), "rate_limit");
-        assert_eq!(FailureMode::IrreversibleAction.as_str(), "irreversible_action");
+        assert_eq!(
+            FailureMode::IrreversibleAction.as_str(),
+            "irreversible_action"
+        );
         assert_eq!(FailureMode::VisionAmbiguity.as_str(), "vision_ambiguity");
         assert_eq!(FailureMode::CaptchaChallenge.as_str(), "captcha_challenge");
     }

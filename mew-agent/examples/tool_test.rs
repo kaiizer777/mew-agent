@@ -38,7 +38,10 @@ async fn main() -> anyhow::Result<()> {
 
     let res = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", config.opencode_zen.api_key))
+        .header(
+            "Authorization",
+            format!("Bearer {}", config.opencode_zen.api_key),
+        )
         .json(&body)
         .send()
         .await

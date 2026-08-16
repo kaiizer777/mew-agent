@@ -81,7 +81,11 @@ async fn run_browser_task_real(
 
     let (browser, page, handler_task, job) = mew_cdp::launch(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
-        config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
+        config
+            .browser
+            .as_ref()
+            .map(|b| b.visible_cursor)
+            .unwrap_or(false),
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to launch Chrome: {e}"))?;
@@ -143,7 +147,9 @@ async fn try_route_to_running_session(
         match session.tx.send(msg).await {
             Ok(()) => Ok(format!("[Routed to running agent] {}", text)),
             Err(_) => {
-                println!("[ui-wiring] Sender.send() returned Err — agent loop is dead. Clearing slot.");
+                println!(
+                    "[ui-wiring] Sender.send() returned Err — agent loop is dead. Clearing slot."
+                );
                 *lock = None;
                 Err("dead_session")
             }
@@ -154,15 +160,10 @@ async fn try_route_to_running_session(
 }
 
 fn read_transcript(session_id: &str) -> String {
-    let path = std::path::PathBuf::from("transcripts")
-        .join(format!("transcript_{}.log", session_id));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        format!(
-            "<could not read transcript at {}: {}>",
-            path.display(),
-            e
-        )
-    })
+    let path =
+        std::path::PathBuf::from("transcripts").join(format!("transcript_{}.log", session_id));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| format!("<could not read transcript at {}: {}>", path.display(), e))
 }
 
 /// List all transcript files in the transcripts/ directory, sorted
@@ -206,8 +207,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Read environment-driven knobs so the same harness can replay
     // different steer messages without a code change.
-    let baseline_task = std::env::var("BASELINE_TASK")
-        .unwrap_or_else(|_| "Navigate to https://example.com and report the main heading text.".to_string());
+    let baseline_task = std::env::var("BASELINE_TASK").unwrap_or_else(|_| {
+        "Navigate to https://example.com and report the main heading text.".to_string()
+    });
     let redirect_text = std::env::var("REDIRECT_TEXT").unwrap_or_else(|_| {
         "Actually, switch tasks: navigate to https://www.rust-lang.org and report the page's main heading text."
             .to_string()
@@ -257,7 +259,10 @@ async fn main() -> anyhow::Result<()> {
         slot_populated,
         "agent never installed its ActiveSession in the slot"
     );
-    println!("[harness] session running; waiting {}ms before pushing redirect", redirect_after_ms);
+    println!(
+        "[harness] session running; waiting {}ms before pushing redirect",
+        redirect_after_ms
+    );
 
     // Sleep so the agent is genuinely "mid-task" (past the first
     // navigate), not pre-navigate.
@@ -321,7 +326,9 @@ async fn main() -> anyhow::Result<()> {
         let only_sid = &new_sids[0];
         let body = read_transcript(only_sid);
         let has_baseline_task = body.contains(&baseline_task)
-            || body.lines().any(|l| l.contains("Task:") && l.contains(&baseline_task));
+            || body
+                .lines()
+                .any(|l| l.contains("Task:") && l.contains(&baseline_task));
         let has_user_redirect = body
             .lines()
             .any(|l| l.contains("USER:") && l.contains(&redirect_text));

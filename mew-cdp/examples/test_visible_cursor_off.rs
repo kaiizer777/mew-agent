@@ -15,9 +15,9 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
 use chromiumoxide::Page;
 use mew_cdp::{click_ref, compute_element_center, launch, move_cursor_and_ripple, shutdown};
-use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
 
 /// Tiny self-contained config parser. We only need the binary path out
 /// of config.yaml — the full `mew_agent::load_config` would pull in
@@ -35,10 +35,17 @@ fn read_browser_binary_path() -> Option<String> {
             let mut in_browser = false;
             for line in s.lines() {
                 let trimmed = line.trim_start();
-                if trimmed.starts_with('#') || trimmed.is_empty() { continue; }
-                if line.starts_with("browser:") { in_browser = true; continue; }
+                if trimmed.starts_with('#') || trimmed.is_empty() {
+                    continue;
+                }
+                if line.starts_with("browser:") {
+                    in_browser = true;
+                    continue;
+                }
                 if in_browser {
-                    if !line.starts_with(' ') && !line.starts_with('\t') { break; }
+                    if !line.starts_with(' ') && !line.starts_with('\t') {
+                        break;
+                    }
                     if let Some(rest) = trimmed.strip_prefix("binary_path:") {
                         return Some(rest.trim().trim_matches('"').to_string());
                     }
@@ -46,13 +53,18 @@ fn read_browser_binary_path() -> Option<String> {
             }
             return None;
         }
-        if !dir.pop() { break; }
+        if !dir.pop() {
+            break;
+        }
     }
     None
 }
 
 async fn exists(page: &Page, expr: &str) -> bool {
-    page.evaluate(expr).await.map(|r| r.value().is_some()).unwrap_or(false)
+    page.evaluate(expr)
+        .await
+        .map(|r| r.value().is_some())
+        .unwrap_or(false)
 }
 
 async fn click_button_and_check(page: &Page, btn_selector: &str) -> Result<(bool, Duration)> {
@@ -69,7 +81,11 @@ async fn click_button_and_check(page: &Page, btn_selector: &str) -> Result<(bool
     // tiny backoff because classList.add is synchronous but the page
     // rendering can take a tick.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let sent = exists(page, "document.querySelector('#thread-alice').classList.contains('sent')").await;
+    let sent = exists(
+        page,
+        "document.querySelector('#thread-alice').classList.contains('sent')",
+    )
+    .await;
     Ok((sent, click_dur))
 }
 
@@ -105,20 +121,28 @@ async fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
     // Read the fixture from tests-output/fixtures/ where it now lives
     // (project root is kept clean).
-    let html_path = cwd.join("tests-output").join("fixtures").join("test_15_2_full.html");
+    let html_path = cwd
+        .join("tests-output")
+        .join("fixtures")
+        .join("test_15_2_full.html");
     let url = format!("file://{}", html_path.display());
     page.goto(&url).await?.wait_for_navigation().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Confirm the cursor API is installed on this real page.
     let api_present = exists(&page, "!!(window.__mewCursor && window.__mewCursor.moveTo)").await;
-    println!("[{}] cursor API installed on real page", if api_present { "PASS" } else { "FAIL" });
+    println!(
+        "[{}] cursor API installed on real page",
+        if api_present { "PASS" } else { "FAIL" }
+    );
 
     // Move cursor to the Alice Send button before clicking. Use the real
     // compute_element_center path the agent uses.
     let alice_btn = page.find_element("#thread-alice button").await?;
     let alice_desc = alice_btn.description().await?;
-    if let Ok(Some((cx, cy))) = compute_element_center(&page, alice_desc.backend_node_id.clone()).await {
+    if let Ok(Some((cx, cy))) =
+        compute_element_center(&page, alice_desc.backend_node_id.clone()).await
+    {
         move_cursor_and_ripple(&page, cx, cy).await;
         println!("[INFO] moved cursor to ({:.1}, {:.1}) before click", cx, cy);
     }
@@ -131,13 +155,20 @@ async fn main() -> Result<()> {
     // visible-slide delay + 500ms post-click wait, so the click path here
     // is identical to the agent's.
     let (sent, click_dur) = click_button_and_check(&page, "#thread-alice button").await?;
-    println!("[{}] real click landed on real page ({}ms) — thread-alice .sent = {}",
-        if sent { "PASS" } else { "FAIL" }, click_dur.as_millis(), sent);
+    println!(
+        "[{}] real click landed on real page ({}ms) — thread-alice .sent = {}",
+        if sent { "PASS" } else { "FAIL" },
+        click_dur.as_millis(),
+        sent
+    );
 
     // Confirm the cursor is still there after the click (script survives
     // synthetic JS click).
     let cursor_after = exists(&page, "!!document.getElementById('__mew-cursor')").await;
-    println!("[{}] cursor overlay still present after real click", if cursor_after { "PASS" } else { "FAIL" });
+    println!(
+        "[{}] cursor overlay still present after real click",
+        if cursor_after { "PASS" } else { "FAIL" }
+    );
 
     let _ = shutdown(browser, handle, job).await;
 
@@ -154,12 +185,25 @@ async fn main() -> Result<()> {
     page2.goto(&url).await?.wait_for_navigation().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let api_off = exists(&page2, "!!(window.__mewCursor && window.__mewCursor.moveTo)").await;
+    let api_off = exists(
+        &page2,
+        "!!(window.__mewCursor && window.__mewCursor.moveTo)",
+    )
+    .await;
     let dom_off = exists(&page2, "!!document.getElementById('__mew-cursor')").await;
     let ripple_off = exists(&page2, "!!document.getElementById('__mew-cursor-ripple')").await;
-    println!("[{}] cursor API absent when flag off", if !api_off { "PASS" } else { "FAIL" });
-    println!("[{}] cursor DOM absent when flag off", if !dom_off { "PASS" } else { "FAIL" });
-    println!("[{}] ripple DOM absent when flag off", if !ripple_off { "PASS" } else { "FAIL" });
+    println!(
+        "[{}] cursor API absent when flag off",
+        if !api_off { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "[{}] cursor DOM absent when flag off",
+        if !dom_off { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "[{}] ripple DOM absent when flag off",
+        if !ripple_off { "PASS" } else { "FAIL" }
+    );
 
     // Real click still works with flag off (this is also the off-state
     // baseline for the latency comparison).
@@ -169,9 +213,17 @@ async fn main() -> Result<()> {
     click_ref(&page2, bob_desc.backend_node_id).await?;
     let off_click_dur = t0.elapsed();
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let sent_off = exists(&page2, "document.querySelector('#thread-bob').classList.contains('sent')").await;
-    println!("[{}] real click still works with flag off ({}ms) — thread-bob .sent = {}",
-        if sent_off { "PASS" } else { "FAIL" }, off_click_dur.as_millis(), sent_off);
+    let sent_off = exists(
+        &page2,
+        "document.querySelector('#thread-bob').classList.contains('sent')",
+    )
+    .await;
+    println!(
+        "[{}] real click still works with flag off ({}ms) — thread-bob .sent = {}",
+        if sent_off { "PASS" } else { "FAIL" },
+        off_click_dur.as_millis(),
+        sent_off
+    );
 
     let _ = shutdown(browser2, handle2, job2).await;
 
@@ -181,7 +233,9 @@ async fn main() -> Result<()> {
     // real click runs. We report the *additional* latency the feature
     // adds when on, so the user can see the cost is bounded.
     println!("\nLatency note:");
-    println!("  click with cursor ON: includes compute_element_center + 200ms slide sleep + ripple");
+    println!(
+        "  click with cursor ON: includes compute_element_center + 200ms slide sleep + ripple"
+    );
     println!("  click with cursor OFF: just the real click_ref");
     println!("  The cursor-induced extra latency is the compute + 200ms slide.");
 
@@ -195,16 +249,38 @@ async fn main() -> Result<()> {
         println!("[SKIP] no stealth binary in config — cannot run bullet 5");
     } else {
         let (browser3, page3, handle3, job3) = launch(binary_path.clone(), true).await?;
-        page3.goto("data:text/html,<html><body>x</body></html>").await?.wait_for_navigation().await?;
+        page3
+            .goto("data:text/html,<html><body>x</body></html>")
+            .await?
+            .wait_for_navigation()
+            .await?;
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let webdriver_hidden = page3.evaluate("navigator.webdriver === false").await.ok().and_then(|r| r.value().and_then(|v| v.as_bool())).unwrap_or(false);
+        let webdriver_hidden = page3
+            .evaluate("navigator.webdriver === false")
+            .await
+            .ok()
+            .and_then(|r| r.value().and_then(|v| v.as_bool()))
+            .unwrap_or(false);
         let chrome_runtime_deleted = page3.evaluate("(typeof window.chrome === 'undefined') || (window.chrome && !window.chrome.runtime)").await.ok().and_then(|r| r.value().and_then(|v| v.as_bool())).unwrap_or(false);
         let cursor_present = exists(&page3, "!!document.getElementById('__mew-cursor')").await;
 
-        println!("[{}] stealth patch 1: navigator.webdriver === false", if webdriver_hidden { "PASS" } else { "FAIL" });
-        println!("[{}] stealth patch 2: window.chrome.runtime removed", if chrome_runtime_deleted { "PASS" } else { "FAIL" });
-        println!("[{}] cursor script still injected alongside stealth", if cursor_present { "PASS" } else { "FAIL" });
+        println!(
+            "[{}] stealth patch 1: navigator.webdriver === false",
+            if webdriver_hidden { "PASS" } else { "FAIL" }
+        );
+        println!(
+            "[{}] stealth patch 2: window.chrome.runtime removed",
+            if chrome_runtime_deleted {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        );
+        println!(
+            "[{}] cursor script still injected alongside stealth",
+            if cursor_present { "PASS" } else { "FAIL" }
+        );
 
         let _ = shutdown(browser3, handle3, job3).await;
     }

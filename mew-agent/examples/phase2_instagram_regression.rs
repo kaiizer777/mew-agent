@@ -41,17 +41,14 @@
 // Run with:
 //   cargo run --example phase2_instagram_regression -p mew-agent
 
-use mew_nav::SensitivePlatforms;
 use mew_agent::planner::plan;
+use mew_nav::SensitivePlatforms;
 
 const FAILING_PROMPT: &str = "go to instagram and text my friend hi";
-const WORKING_PROMPT: &str =
-    "go to google, search instagram, then text my friend hi";
+const WORKING_PROMPT: &str = "go to google, search instagram, then text my friend hi";
 
 fn main() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     // Build the same sensitive-platforms table the agent
     // loads in production. We re-parse
@@ -62,9 +59,7 @@ fn main() -> anyhow::Result<()> {
     )) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!(
-                "[phase2] could not load config/sensitive_platforms.toml: {e}"
-            );
+            eprintln!("[phase2] could not load config/sensitive_platforms.toml: {e}");
             eprintln!("[phase2] falling back to the empty table");
             SensitivePlatforms::default()
         }
@@ -97,18 +92,18 @@ fn main() -> anyhow::Result<()> {
     // originally failed.)
     let first_nav_input = "instagram";
 
-    let failing_resolution =
-        mew_nav::resolve_without_probe_sensitive(first_nav_input, &sensitive);
-    let working_resolution =
-        mew_nav::resolve_without_probe_sensitive(first_nav_input, &sensitive);
+    let failing_resolution = mew_nav::resolve_without_probe_sensitive(first_nav_input, &sensitive);
+    let working_resolution = mew_nav::resolve_without_probe_sensitive(first_nav_input, &sensitive);
 
     println!(
         "[phase2] FAILING prompt first nav -> {} (via {})",
-        failing_resolution.url, failing_resolution.path.as_str()
+        failing_resolution.url,
+        failing_resolution.path.as_str()
     );
     println!(
         "[phase2] WORKING prompt first nav -> {} (via {})",
-        working_resolution.url, working_resolution.path.as_str()
+        working_resolution.url,
+        working_resolution.path.as_str()
     );
 
     // Assertion 1: both must be a via-search resolution.
@@ -116,8 +111,7 @@ fn main() -> anyhow::Result<()> {
         assert!(
             matches!(
                 res.path,
-                mew_nav::ResolutionPath::ViaSearch
-                    | mew_nav::ResolutionPath::ViaSearchConfirm
+                mew_nav::ResolutionPath::ViaSearch | mew_nav::ResolutionPath::ViaSearchConfirm
             ),
             "[{label}] expected ViaSearch or ViaSearchConfirm, got {:?} (url={})",
             res.path,
@@ -132,19 +126,18 @@ fn main() -> anyhow::Result<()> {
     // "instagram" in the query. (Equivalent first-navigation
     // target — both end up on a Google search results page
     // for instagram.)
-    let assert_google_instagram =
-        |label: &str, res: &mew_nav::ResolutionResult| {
-            assert!(
-                res.url.contains("google.com/search"),
-                "[{label}] expected google.com/search, got {}",
-                res.url
-            );
-            assert!(
-                res.url.contains("instagram"),
-                "[{label}] expected query to contain 'instagram', got {}",
-                res.url
-            );
-        };
+    let assert_google_instagram = |label: &str, res: &mew_nav::ResolutionResult| {
+        assert!(
+            res.url.contains("google.com/search"),
+            "[{label}] expected google.com/search, got {}",
+            res.url
+        );
+        assert!(
+            res.url.contains("instagram"),
+            "[{label}] expected query to contain 'instagram', got {}",
+            res.url
+        );
+    };
     assert_google_instagram("FAILING", &failing_resolution);
     assert_google_instagram("WORKING", &working_resolution);
     println!("[phase2] ✓ both phrasings land on google.com/search?q=instagram");
@@ -210,22 +203,29 @@ fn main() -> anyhow::Result<()> {
     // subtask that mentions "text" / "message" / "friend"
     // (the second action). We accept a few synonyms because
     // the split is on a marker, not on semantics.
-    let assert_plan_has_navigate_and_action =
-        |label: &str, p: &mew_agent::planner::Plan| {
-            let has_navigate = p.subtasks.iter().any(|s| {
-                let d = s.description.to_lowercase();
-                d.contains("instagram") || d.contains("google")
-            });
-            let has_action = p.subtasks.iter().any(|s| {
-                let d = s.description.to_lowercase();
-                d.contains("text")
-                    || d.contains("message")
-                    || d.contains("friend")
-                    || d.contains("search")
-            });
-            assert!(has_navigate, "[{label}] plan has no navigate-style subtask: {:#?}", p.subtasks);
-            assert!(has_action, "[{label}] plan has no action-style subtask: {:#?}", p.subtasks);
-        };
+    let assert_plan_has_navigate_and_action = |label: &str, p: &mew_agent::planner::Plan| {
+        let has_navigate = p.subtasks.iter().any(|s| {
+            let d = s.description.to_lowercase();
+            d.contains("instagram") || d.contains("google")
+        });
+        let has_action = p.subtasks.iter().any(|s| {
+            let d = s.description.to_lowercase();
+            d.contains("text")
+                || d.contains("message")
+                || d.contains("friend")
+                || d.contains("search")
+        });
+        assert!(
+            has_navigate,
+            "[{label}] plan has no navigate-style subtask: {:#?}",
+            p.subtasks
+        );
+        assert!(
+            has_action,
+            "[{label}] plan has no action-style subtask: {:#?}",
+            p.subtasks
+        );
+    };
     assert_plan_has_navigate_and_action("FAILING", &failing_plan);
     assert_plan_has_navigate_and_action("WORKING", &working_plan);
     println!("[phase2] ✓ both phrasings cover navigate + action in the plan");
@@ -236,7 +236,11 @@ fn main() -> anyhow::Result<()> {
     println!();
     println!("[phase2] regression fixture PASSED");
     println!("[phase2] both instagram phrasings now:");
-    println!("[phase2]   - resolve to {} ({})", failing_resolution.url, failing_resolution.path.as_str());
+    println!(
+        "[phase2]   - resolve to {} ({})",
+        failing_resolution.url,
+        failing_resolution.path.as_str()
+    );
     println!(
         "[phase2]   - decompose into {} (failing) / {} (working) subtask(s)",
         failing_plan.subtasks.len(),

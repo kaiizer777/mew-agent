@@ -32,9 +32,9 @@
 // shape is the standard "LLM decides, code decides truth" pattern from
 // the Completeness Verifier research.
 
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Deserialize, Serialize};
 
 /// Why a subtask ended in the state it's in now. The end-of-session
 /// summary includes this so a "skipped on purpose" is reported, not
@@ -112,7 +112,7 @@ impl SubTaskStatus {
 /// where a fresh snapshot was taken; the value is a small opaque signature
 /// derived from the page state, not the full state, so the per-subtask
 /// summary stays compact.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubTask {
     pub id: String,
     pub description: String,
@@ -149,7 +149,10 @@ pub enum MarkOutcome {
     /// No such id in the tracker.
     UnknownId,
     /// Evidence was rejected: no fresh snapshot since the last mark.
-    StaleEvidence { last_snapshot_iteration: usize, current_iteration: usize },
+    StaleEvidence {
+        last_snapshot_iteration: usize,
+        current_iteration: usize,
+    },
     /// The subtask is already in a terminal status.
     AlreadyTerminal { current: SubTaskStatus },
 }
@@ -213,7 +216,11 @@ impl CompletenessTracker {
     /// If any subtask is already terminal, the declaration is rejected
     /// so a re-declare can't quietly wipe evidence.
     pub fn declare(&mut self, items: Vec<DeclareItem>) -> Result<usize, &'static str> {
-        if self.subtasks.iter().any(|s| !matches!(s.status, SubTaskStatus::Pending)) {
+        if self
+            .subtasks
+            .iter()
+            .any(|s| !matches!(s.status, SubTaskStatus::Pending))
+        {
             return Err("cannot re-declare subtasks after any have been resolved");
         }
         let n = items.len();
@@ -229,6 +236,12 @@ impl CompletenessTracker {
             })
             .collect();
         Ok(n)
+    }
+
+    /// Phase 28: Seed completeness tracker from a cross-worker handoff.
+    pub fn seed_from_handoff(&mut self, completed: Vec<SubTask>, remaining: Vec<SubTask>) {
+        self.subtasks = completed;
+        self.subtasks.extend(remaining);
     }
 
     /// Record that a fresh snapshot was taken on the given iteration
@@ -247,11 +260,7 @@ impl CompletenessTracker {
     /// invent a signature) and `last_snapshot_iteration` must be set
     /// and not stale. Returns `MarkOutcome::StaleEvidence` if the
     /// caller needs to call `snapshot()` first.
-    pub fn mark_done(
-        &mut self,
-        id: &str,
-        snapshot_signature: &str,
-    ) -> MarkOutcome {
+    pub fn mark_done(&mut self, id: &str, snapshot_signature: &str) -> MarkOutcome {
         let Some(sub) = self.subtasks.iter_mut().find(|s| s.id == id) else {
             return MarkOutcome::UnknownId;
         };
@@ -320,7 +329,9 @@ impl CompletenessTracker {
             }
             SubTaskStatus::Pending => {}
         }
-        sub.status = SubTaskStatus::Skipped { reason: reason.clone() };
+        sub.status = SubTaskStatus::Skipped {
+            reason: reason.clone(),
+        };
         sub.decided_at_secs = Some(now_secs());
         MarkOutcome::MarkedSkipped { reason }
     }
@@ -343,7 +354,9 @@ impl CompletenessTracker {
             }
             SubTaskStatus::Pending => {}
         }
-        sub.status = SubTaskStatus::Failed { reason: reason.clone() };
+        sub.status = SubTaskStatus::Failed {
+            reason: reason.clone(),
+        };
         sub.decided_at_secs = Some(now_secs());
         MarkOutcome::MarkedSkipped { reason }
     }
@@ -373,7 +386,9 @@ impl CompletenessTracker {
             }
             SubTaskStatus::Pending => {}
         }
-        sub.status = SubTaskStatus::Exhausted { reason: reason.clone() };
+        sub.status = SubTaskStatus::Exhausted {
+            reason: reason.clone(),
+        };
         sub.decided_at_secs = Some(now_secs());
         MarkOutcome::MarkedExhausted { reason }
     }
@@ -475,13 +490,11 @@ impl CompletenessTracker {
                     ts, session_id
                 ));
             } else {
-                out.push_str(&format!(
-                    "[{}] [{}] gate_triggered: no\n",
-                    ts, session_id
-                ));
+                out.push_str(&format!("[{}] [{}] gate_triggered: no\n", ts, session_id));
             }
             for (i, sub) in self.subtasks.iter().enumerate() {
-                let evidence = match (&sub.status, sub.evidence_iteration, &sub.evidence_signature) {
+                let evidence = match (&sub.status, sub.evidence_iteration, &sub.evidence_signature)
+                {
                     (SubTaskStatus::Done, Some(it), Some(sig)) => {
                         format!("evidence=iter:{} sig:{}", it, sig)
                     }
@@ -494,12 +507,15 @@ impl CompletenessTracker {
                     .unwrap_or_default();
                 out.push_str(&format!(
                     "[{}] [{}]   [{:>2}] id={} status={}{} desc=\"{}\"\n",
-                    ts, session_id, i + 1, sub.id, sub.status.as_str(), reason, sub.description
+                    ts,
+                    session_id,
+                    i + 1,
+                    sub.id,
+                    sub.status.as_str(),
+                    reason,
+                    sub.description
                 ));
-                out.push_str(&format!(
-                    "[{}] [{}]        {}\n",
-                    ts, session_id, evidence
-                ));
+                out.push_str(&format!("[{}] [{}]        {}\n", ts, session_id, evidence));
             }
         }
         out.push_str(&format!(
@@ -510,7 +526,7 @@ impl CompletenessTracker {
         if let Some(mut f) = file {
             let _ = f.write_all(out.as_bytes());
         }
-        
+
         out
     }
 
@@ -589,20 +605,32 @@ mod tests {
         let mut t = CompletenessTracker::new();
         let n = t
             .declare(vec![
-                DeclareItem { id: "a".into(), description: "first".into() },
-                DeclareItem { id: "b".into(), description: "second".into() },
+                DeclareItem {
+                    id: "a".into(),
+                    description: "first".into(),
+                },
+                DeclareItem {
+                    id: "b".into(),
+                    description: "second".into(),
+                },
             ])
             .unwrap();
         assert_eq!(n, 2);
         assert_eq!(t.subtasks.len(), 2);
-        assert!(t.subtasks.iter().all(|s| matches!(s.status, SubTaskStatus::Pending)));
+        assert!(t
+            .subtasks
+            .iter()
+            .all(|s| matches!(s.status, SubTaskStatus::Pending)));
     }
 
     #[test]
     fn mark_done_requires_fresh_snapshot() {
         let mut t = CompletenessTracker::new();
-        t.declare(vec![DeclareItem { id: "a".into(), description: "first".into() }])
-            .unwrap();
+        t.declare(vec![DeclareItem {
+            id: "a".into(),
+            description: "first".into(),
+        }])
+        .unwrap();
 
         // No snapshot recorded yet — must reject.
         match t.mark_done("a", &sig("")) {
@@ -613,7 +641,9 @@ mod tests {
         // Now record a snapshot and mark.
         t.record_snapshot(3, sig("page-sig-1"));
         match t.mark_done("a", &sig("page-sig-1")) {
-            MarkOutcome::MarkedDone { evidence_iteration, .. } => {
+            MarkOutcome::MarkedDone {
+                evidence_iteration, ..
+            } => {
                 assert_eq!(evidence_iteration, 3);
             }
             other => panic!("expected MarkedDone, got {:?}", other),
@@ -631,8 +661,11 @@ mod tests {
     #[test]
     fn mark_done_rejects_wrong_signature() {
         let mut t = CompletenessTracker::new();
-        t.declare(vec![DeclareItem { id: "a".into(), description: "x".into() }])
-            .unwrap();
+        t.declare(vec![DeclareItem {
+            id: "a".into(),
+            description: "x".into(),
+        }])
+        .unwrap();
         t.record_snapshot(2, sig("snap-A"));
         match t.mark_done("a", &sig("snap-B")) {
             MarkOutcome::StaleEvidence { .. } => {}
@@ -644,8 +677,14 @@ mod tests {
     fn gate_open_only_when_all_terminal() {
         let mut t = CompletenessTracker::new();
         t.declare(vec![
-            DeclareItem { id: "a".into(), description: "x".into() },
-            DeclareItem { id: "b".into(), description: "y".into() },
+            DeclareItem {
+                id: "a".into(),
+                description: "x".into(),
+            },
+            DeclareItem {
+                id: "b".into(),
+                description: "y".into(),
+            },
         ])
         .unwrap();
         assert!(!t.gate_open(), "fresh declaration should not be open");
@@ -659,11 +698,17 @@ mod tests {
     #[test]
     fn re_declare_rejected_after_any_resolution() {
         let mut t = CompletenessTracker::new();
-        t.declare(vec![DeclareItem { id: "a".into(), description: "x".into() }])
-            .unwrap();
+        t.declare(vec![DeclareItem {
+            id: "a".into(),
+            description: "x".into(),
+        }])
+        .unwrap();
         t.record_snapshot(1, sig("s1"));
         t.mark_done("a", &sig("s1")).unwrap_marker_done();
-        let res = t.declare(vec![DeclareItem { id: "a".into(), description: "y".into() }]);
+        let res = t.declare(vec![DeclareItem {
+            id: "a".into(),
+            description: "y".into(),
+        }]);
         assert!(res.is_err(), "redeclare after Done must be rejected");
     }
 
@@ -684,8 +729,14 @@ mod tests {
         // can run and the user sees the consolidated answer.
         let mut t = CompletenessTracker::new();
         t.declare(vec![
-            DeclareItem { id: "a".into(), description: "platform A".into() },
-            DeclareItem { id: "b".into(), description: "platform B".into() },
+            DeclareItem {
+                id: "a".into(),
+                description: "platform A".into(),
+            },
+            DeclareItem {
+                id: "b".into(),
+                description: "platform B".into(),
+            },
         ])
         .unwrap();
         // mark_exhausted doesn't need a snapshot.
@@ -695,7 +746,11 @@ mod tests {
             }
             other => panic!("expected MarkedExhausted, got {:?}", other),
         }
-        assert_eq!(t.incomplete_count(), 1, "exhausted should not be incomplete");
+        assert_eq!(
+            t.incomplete_count(),
+            1,
+            "exhausted should not be incomplete"
+        );
         assert!(!t.gate_open(), "one pending should keep gate closed");
         t.mark_exhausted("b", "time budget exhausted: 90s".to_string());
         assert!(t.gate_open(), "two exhausted should open the gate");
@@ -707,10 +762,16 @@ mod tests {
         // must include Exhausted in "any" — the same reason as
         // Skipped/Failed: a re-declare would erase evidence.
         let mut t = CompletenessTracker::new();
-        t.declare(vec![DeclareItem { id: "a".into(), description: "x".into() }])
-            .unwrap();
+        t.declare(vec![DeclareItem {
+            id: "a".into(),
+            description: "x".into(),
+        }])
+        .unwrap();
         t.mark_exhausted("a", "no result".to_string());
-        let res = t.declare(vec![DeclareItem { id: "a".into(), description: "y".into() }]);
+        let res = t.declare(vec![DeclareItem {
+            id: "a".into(),
+            description: "y".into(),
+        }]);
         assert!(res.is_err(), "redeclare after Exhausted must be rejected");
     }
 
@@ -735,8 +796,11 @@ mod tests {
         // Exhausted too — the LLM can't "rescue" a subtask the
         // budget guard already closed.
         let mut t = CompletenessTracker::new();
-        t.declare(vec![DeclareItem { id: "a".into(), description: "x".into() }])
-            .unwrap();
+        t.declare(vec![DeclareItem {
+            id: "a".into(),
+            description: "x".into(),
+        }])
+        .unwrap();
         t.mark_exhausted("a", "no result".to_string());
         t.record_snapshot(1, sig("s1"));
         match t.mark_done("a", &sig("s1")) {
@@ -754,16 +818,31 @@ mod tests {
         // user-visible rendering depends on this.
         let mut t = CompletenessTracker::new();
         t.declare(vec![
-            DeclareItem { id: "a".into(), description: "x".into() },
-            DeclareItem { id: "b".into(), description: "y".into() },
-            DeclareItem { id: "c".into(), description: "z".into() },
+            DeclareItem {
+                id: "a".into(),
+                description: "x".into(),
+            },
+            DeclareItem {
+                id: "b".into(),
+                description: "y".into(),
+            },
+            DeclareItem {
+                id: "c".into(),
+                description: "z".into(),
+            },
         ])
         .unwrap();
         t.mark_exhausted("a", "no listings matched".to_string());
         t.mark_exhausted("b", "step budget exhausted".to_string());
         let s = t.inline_status();
-        assert!(s.contains("2 exhausted"), "inline_status should report the exhausted bucket, got: {s}");
-        assert!(s.contains("1 pending"), "inline_status should still report the remaining pending, got: {s}");
+        assert!(
+            s.contains("2 exhausted"),
+            "inline_status should report the exhausted bucket, got: {s}"
+        );
+        assert!(
+            s.contains("1 pending"),
+            "inline_status should still report the remaining pending, got: {s}"
+        );
     }
 
     // Tiny test helpers to keep the assertions above readable.

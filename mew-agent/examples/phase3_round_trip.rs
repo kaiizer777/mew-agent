@@ -90,14 +90,17 @@ fn factory_simulation_result() -> BrowserResult {
 // ---- Main -------------------------------------------------------------
 
 fn main() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
-    println!("[phase3] Phase 3: typed Handoff -> BrowserAgent -> typed Result -> ChatAgent round trip\n");
+    println!(
+        "[phase3] Phase 3: typed Handoff -> BrowserAgent -> typed Result -> ChatAgent round trip\n"
+    );
 
     for planner_enabled in [false, true] {
-        println!("\n[phase3] Running tests with planner_enabled = {}", planner_enabled);
+        println!(
+            "\n[phase3] Running tests with planner_enabled = {}",
+            planner_enabled
+        );
         let mut config = dummy_config();
         config.agent.planner_enabled = planner_enabled;
         let chat_agent = ChatAgent::new(config);
@@ -132,7 +135,8 @@ fn main() -> anyhow::Result<()> {
         );
         assert!(!failed_reply.is_empty(), "failed reply must be non-empty");
         assert!(
-            failed_reply.contains("Chrome failed to launch") || failed_reply.contains("I couldn't complete the task"),
+            failed_reply.contains("Chrome failed to launch")
+                || failed_reply.contains("I couldn't complete the task"),
             "failed reply must include the reason or generic fallback, got: {failed_reply}",
         );
         println!("[phase3] PART 2 OK: failed result still produces a chat reply");
@@ -164,10 +168,18 @@ fn main() -> anyhow::Result<()> {
             "go to instagram and text Alice hi",
             "chat:phase3:0",
             vec!["enter via search".to_string()],
+            None,
+            None,
         );
-        assert!(handoff.subtasks.len() >= 2,
-            "compound task must produce >= 2 subtasks, got {:?}", handoff.subtasks);
-        assert_eq!(handoff.task_description, "go to instagram and text Alice hi");
+        assert!(
+            handoff.subtasks.len() >= 2,
+            "compound task must produce >= 2 subtasks, got {:?}",
+            handoff.subtasks
+        );
+        assert_eq!(
+            handoff.task_description,
+            "go to instagram and text Alice hi"
+        );
         assert_eq!(handoff.constraints, vec!["enter via search".to_string()]);
         assert_eq!(handoff.originating_message_id, "chat:phase3:0");
         println!("[phase3] PART 4 OK: handoff decomposes compound tasks into subtasks");

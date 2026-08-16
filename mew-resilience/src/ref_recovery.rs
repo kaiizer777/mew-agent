@@ -118,16 +118,35 @@ pub enum RefRecoveryOutcome {
     Retry {
         new_ref: String,
         attempts_so_far: u32,
+        force_full_snapshot: bool,
     },
     /// The loop should surface a typed failure to the LLM. The LLM
     /// gets a tool result explaining what happened and can choose
     /// to re-issue with a different target or finish the task.
-    EscalateToLLM { reason: &'static str, attempts_so_far: u32 },
+    EscalateToLLM {
+        reason: &'static str,
+        attempts_so_far: u32,
+        force_full_snapshot: bool,
+    },
     /// The action cannot be safely retried (e.g. the target is gone
     /// and the user-visible state matters). The LLM gets an
     /// `Abort` outcome with a clear reason; the loop continues
     /// rather than retrying.
-    AbortWithReason { reason: String, attempts_so_far: u32 },
+    AbortWithReason {
+        reason: String,
+        attempts_so_far: u32,
+        force_full_snapshot: bool,
+    },
+}
+
+impl RefRecoveryOutcome {
+    pub fn force_full_snapshot(&self) -> bool {
+        match self {
+            Self::Retry { force_full_snapshot, .. }
+            | Self::EscalateToLLM { force_full_snapshot, .. }
+            | Self::AbortWithReason { force_full_snapshot, .. } => *force_full_snapshot,
+        }
+    }
 }
 
 /// Inputs to `attempt_recovery`. The `target_desc` is whatever the
@@ -155,6 +174,10 @@ pub struct RefRecoveryInputs<'a> {
     /// specific action this iteration. Bumped by the caller after
     /// each `Retry` decision.
     pub attempts_so_far: u32,
+    /// Phase 3: Cheap check indicating whether a real page navigation occurred.
+    /// When false (transient local DOM re-render / attribute change), the diff
+    /// cache remains valid and does not require forcing an expensive full re-snapshot.
+    pub page_navigated: bool,
 }
 
 /// Attempt to recover from a stale `@eN` failure. The function is
@@ -185,11 +208,15 @@ pub fn attempt_recovery(
     cfg: &RefRecoveryConfig,
     inputs: &RefRecoveryInputs<'_>,
 ) -> RefRecoveryOutcome {
+    // Only force a full snapshot if the diff cache is invalid (navigation occurred)
+    let force_full = inputs.page_navigated || inputs.current_ref_map.is_empty();
+
     // Step 1: budget check. Hard cap, no exceptions.
     if inputs.attempts_so_far >= cfg.max_auto_retries {
         return RefRecoveryOutcome::EscalateToLLM {
             reason: "ref recovery budget exhausted; the agent retried but the element is still not where you remembered. Take a fresh snapshot and pick a new ref.",
             attempts_so_far: inputs.attempts_so_far,
+            force_full_snapshot: force_full,
         };
     }
 
@@ -203,6 +230,7 @@ pub fn attempt_recovery(
         return RefRecoveryOutcome::AbortWithReason {
             reason: "type action hit a stale ref AND the page is now empty of interactive elements; aborting to avoid a re-target misfire. Take a fresh snapshot and pick a new ref.".to_string(),
             attempts_so_far: inputs.attempts_so_far,
+            force_full_snapshot: true,
         };
     }
 
@@ -212,6 +240,7 @@ pub fn attempt_recovery(
         return RefRecoveryOutcome::Retry {
             new_ref: inputs.supplied_ref.to_string(),
             attempts_so_far: inputs.attempts_so_far + 1,
+            force_full_snapshot: force_full,
         };
     }
 
@@ -224,6 +253,7 @@ pub fn attempt_recovery(
                     return RefRecoveryOutcome::Retry {
                         new_ref: found.clone(),
                         attempts_so_far: inputs.attempts_so_far + 1,
+                        force_full_snapshot: force_full,
                     };
                 }
             }
@@ -234,8 +264,10 @@ pub fn attempt_recovery(
     RefRecoveryOutcome::EscalateToLLM {
         reason: "ref not present in the current tree and no description-based re-resolution matched. Take a fresh snapshot and pick a new ref.",
         attempts_so_far: inputs.attempts_so_far,
+        force_full_snapshot: force_full,
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -263,9 +295,10 @@ mod tests {
             description_index: None,
             action: RefActionKind::Click,
             attempts_so_far: 0,
+            page_navigated: false,
         };
         let out = attempt_recovery(&cfg, &inputs);
-        assert!(matches!(out, RefRecoveryOutcome::Retry { ref new_ref, .. } if new_ref == "@e42"));
+        assert!(matches!(out, RefRecoveryOutcome::Retry { ref new_ref, force_full_snapshot, .. } if new_ref == "@e42" && !force_full_snapshot));
     }
 
     #[test]
@@ -284,9 +317,10 @@ mod tests {
             description_index: Some(&desc_idx),
             action: RefActionKind::Click,
             attempts_so_far: 0,
+            page_navigated: false,
         };
         let out = attempt_recovery(&cfg, &inputs);
-        assert!(matches!(out, RefRecoveryOutcome::Retry { ref new_ref, .. } if new_ref == "@e7"));
+        assert!(matches!(out, RefRecoveryOutcome::Retry { ref new_ref, force_full_snapshot, .. } if new_ref == "@e7" && !force_full_snapshot));
     }
 
     #[test]
@@ -302,6 +336,7 @@ mod tests {
             description_index: None,
             action: RefActionKind::Click,
             attempts_so_far: 1,
+            page_navigated: false,
         };
         let out = attempt_recovery(&cfg, &inputs);
         assert!(matches!(out, RefRecoveryOutcome::EscalateToLLM { .. }));
@@ -320,9 +355,10 @@ mod tests {
             description_index: None,
             action: RefActionKind::Type,
             attempts_so_far: 0,
+            page_navigated: false,
         };
         let out = attempt_recovery(&cfg, &inputs);
-        assert!(matches!(out, RefRecoveryOutcome::AbortWithReason { .. }));
+        assert!(matches!(out, RefRecoveryOutcome::AbortWithReason { force_full_snapshot, .. } if force_full_snapshot));
     }
 
     #[test]
@@ -337,6 +373,7 @@ mod tests {
             description_index: None,
             action: RefActionKind::Click,
             attempts_so_far: 0,
+            page_navigated: false,
         };
         let out = attempt_recovery(&cfg, &inputs);
         assert!(matches!(out, RefRecoveryOutcome::EscalateToLLM { .. }));
@@ -360,6 +397,7 @@ mod tests {
             description_index: Some(&desc_idx),
             action: RefActionKind::Click,
             attempts_so_far: 0,
+            page_navigated: false,
         };
         let out = attempt_recovery(&cfg, &inputs);
         assert!(matches!(out, RefRecoveryOutcome::EscalateToLLM { .. }));
@@ -380,6 +418,7 @@ mod tests {
             description_index: Some(&desc_idx),
             action: RefActionKind::Click,
             attempts_so_far: 0,
+            page_navigated: false,
         };
         let out = attempt_recovery(&cfg, &inputs);
         assert!(matches!(out, RefRecoveryOutcome::EscalateToLLM { .. }));
@@ -397,12 +436,6 @@ mod tests {
 
     #[test]
     fn success_after_recovery_resets_budget() {
-        // Scenario: a click fails with a stale ref,
-        // recovery auto-retries (attempts=1), then the
-        // next click (different target) is a clean
-        // success. The next stale-ref event on a later
-        // iteration should get a *fresh* budget — the
-        // recovery state is per-event, not per-session.
         let cfg = RefRecoveryConfig::default();
         let mut refs = std::collections::HashMap::new();
         refs.insert("@e7".to_string(), ());
@@ -413,8 +446,47 @@ mod tests {
             description_index: None,
             action: RefActionKind::Click,
             attempts_so_far: 0, // a fresh budget
+            page_navigated: false,
         };
         let outcome = attempt_recovery(&cfg, &inputs);
         assert!(matches!(outcome, RefRecoveryOutcome::Retry { .. }));
     }
+
+    #[test]
+    fn local_dom_change_does_not_force_full_resnapshot() {
+        // Phase 3: When DOM change is local (small attribute change, no navigation),
+        // recovery should NOT force a full AX-tree re-snapshot.
+        let cfg = RefRecoveryConfig::default();
+        let current = ref_map(&["@e1", "@e2", "@e42"]);
+        let inputs = RefRecoveryInputs {
+            supplied_ref: "@e42",
+            current_ref_map: &current,
+            target_desc: None,
+            description_index: None,
+            action: RefActionKind::Click,
+            attempts_so_far: 0,
+            page_navigated: false,
+        };
+        let outcome = attempt_recovery(&cfg, &inputs);
+        assert_eq!(outcome.force_full_snapshot(), false);
+    }
+
+    #[test]
+    fn navigation_forces_full_resnapshot() {
+        // Phase 3: When the page navigated, diff cache is invalid so full re-snapshot MUST be forced.
+        let cfg = RefRecoveryConfig::default();
+        let current = ref_map(&["@e1", "@e2", "@e42"]);
+        let inputs = RefRecoveryInputs {
+            supplied_ref: "@e42",
+            current_ref_map: &current,
+            target_desc: None,
+            description_index: None,
+            action: RefActionKind::Click,
+            attempts_so_far: 0,
+            page_navigated: true,
+        };
+        let outcome = attempt_recovery(&cfg, &inputs);
+        assert_eq!(outcome.force_full_snapshot(), true);
+    }
 }
+

@@ -12,6 +12,11 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror = "2.0.19"
+# Phase 31: SPA navigation detection uses `url::Url::host_str` to
+# extract the bare host from each iteration's URL. `url` is already
+# a workspace dep (mew-nav uses it) so this just re-declares the
+# same version at the leaf.
+url.workspace = true
 
 # Phase 3.3 (Bug 2): Windows Job Object support to ensure the
 # chromiumoxide-launched Chromium process is killed when this crate's

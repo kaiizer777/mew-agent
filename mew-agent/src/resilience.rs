@@ -74,9 +74,9 @@
 
 use mew_perception::TreeNode;
 use mew_resilience::{
-    Challenge, categorize as categorize_findings,
-    classify_irreversible, detect_captcha, detect_modal, detect_rate_limit,
-    detect_session_loss, score_vision, SessionLossInputs, VisionVerdict,
+    categorize as categorize_findings, classify_irreversible, detect_captcha, detect_modal,
+    detect_rate_limit, detect_session_loss, score_vision, Challenge, SessionLossInputs,
+    VisionVerdict,
 };
 use serde_json::Value;
 
@@ -119,6 +119,12 @@ pub enum ResilienceHookOutcome {
     /// `display_name()` for the user-facing label and
     /// `user_action_hint()` for the actionable prompt.
     PauseForCaptcha { challenge: Challenge },
+    /// Phase 4: session loss was detected and Google credentials
+    /// are available. The agent should attempt to log in via
+    /// "Sign in with Google" automatically instead of surfacing
+    /// the loss to the user. The `domain` is the platform where
+    /// the session was lost (e.g. "linkedin.com").
+    AttemptGoogleLogin { domain: String },
 }
 
 /// The aggregated view of every detector on the current
@@ -143,11 +149,23 @@ pub struct ResilienceHookReport {
 /// on a page that was a dashboard is a session-loss event but
 /// a login form on a fresh navigation to /login is not.
 ///
+/// `google_credentials_available` signals whether the user has
+/// configured Google credentials in config.yaml. When true and
+/// a session loss is detected, the adapter returns
+/// `AttemptGoogleLogin` instead of `SurfaceAsFinding`, so the
+/// agent loop can attempt automatic re-authentication.
+///
+/// `current_domain` is the bare hostname of the current page
+/// (e.g. "linkedin.com"). Passed through to `AttemptGoogleLogin`
+/// so the auth module knows which platform to re-authenticate on.
+///
 /// The function is pure-Rust and synchronous; the agent loop
 /// wraps it without `await`.
 pub fn evaluate_page(
     tree: &TreeNode,
     prior_was_dashboard_like: bool,
+    google_credentials_available: bool,
+    current_domain: &str,
 ) -> ResilienceHookReport {
     let mut findings = Vec::new();
 
@@ -194,11 +212,27 @@ pub fn evaluate_page(
     // user-actionable "you got logged out, sign in again"
     // message is more useful than a generic "dismiss this
     // overlay" prompt.
+    //
+    // Phase 4: when Google credentials are configured, attempt
+    // automatic re-authentication instead of surfacing the loss.
     let session_inputs = SessionLossInputs {
         tree,
         prior_was_dashboard_like,
     };
     if let Some(report) = detect_session_loss(&session_inputs) {
+        if google_credentials_available {
+            let summary = format!(
+                "session loss detected on {}; attempting Google re-authentication",
+                current_domain
+            );
+            findings.push(format!("{}:{}", "SessionLoss", summary));
+            return ResilienceHookReport {
+                outcome: ResilienceHookOutcome::AttemptGoogleLogin {
+                    domain: current_domain.to_string(),
+                },
+                findings,
+            };
+        }
         let summary = format!("session loss: {} (hint: {})", report.reason, report.hint);
         findings.push(format!("{}:{}", "SessionLoss", summary));
         return ResilienceHookReport {
@@ -222,7 +256,9 @@ pub fn evaluate_page(
             if report.kind.can_auto_dismiss() {
                 findings.push(format!("{}:{}", "AutoDismiss", summary));
                 return ResilienceHookReport {
-                    outcome: ResilienceHookOutcome::AutoDismiss { dismiss_ref: dismiss },
+                    outcome: ResilienceHookOutcome::AutoDismiss {
+                        dismiss_ref: dismiss,
+                    },
                     findings,
                 };
             }
@@ -276,7 +312,10 @@ pub fn evaluate_dispatch(tool_name: &str, args: &Value) -> Option<ResilienceHook
 /// covered. Returns the typed verdict the agent uses to decide
 /// whether to act, re-shoot with a tighter crop, or surface a
 /// "I'm not sure" message to the user.
-pub fn evaluate_vision(description: &str, original_box: Option<(f64, f64, f64, f64)>) -> VisionVerdict {
+pub fn evaluate_vision(
+    description: &str,
+    original_box: Option<(f64, f64, f64, f64)>,
+) -> VisionVerdict {
     score_vision(description, original_box)
 }
 
@@ -357,13 +396,13 @@ mod tests {
 
     #[test]
     fn clean_homepage_continues() {
-        let report = evaluate_page(&mock_fixtures::clean_homepage(), false);
+        let report = evaluate_page(&mock_fixtures::clean_homepage(), false, false, "");
         assert_eq!(report.outcome, ResilienceHookOutcome::Continue);
     }
 
     #[test]
     fn cookie_banner_autodismisses() {
-        let report = evaluate_page(&mock_fixtures::cookie_banner_page(), false);
+        let report = evaluate_page(&mock_fixtures::cookie_banner_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::AutoDismiss { dismiss_ref } => {
                 assert_eq!(dismiss_ref, "@e1");
@@ -374,7 +413,7 @@ mod tests {
 
     #[test]
     fn http_429_triggers_backoff() {
-        let report = evaluate_page(&mock_fixtures::http_429_page(), false);
+        let report = evaluate_page(&mock_fixtures::http_429_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::Backoff { secs } => {
                 assert_eq!(secs, 30);
@@ -385,7 +424,7 @@ mod tests {
 
     #[test]
     fn cloudflare_triggers_backoff() {
-        let report = evaluate_page(&mock_fixtures::cloudflare_page(), false);
+        let report = evaluate_page(&mock_fixtures::cloudflare_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::Backoff { secs } => {
                 assert_eq!(secs, 15);
@@ -398,10 +437,7 @@ mod tests {
     fn login_wall_after_dashboard_surfaces_finding() {
         // The dashboard->login transition: prior was
         // dashboard-like, current is a login wall.
-        let report = evaluate_page(
-            &mock_fixtures::login_wall_page(),
-            true,
-        );
+        let report = evaluate_page(&mock_fixtures::login_wall_page(), true, false, "");
         match report.outcome {
             ResilienceHookOutcome::SurfaceAsFinding { kind, .. } => {
                 assert_eq!(kind, "session_loss");
@@ -422,7 +458,7 @@ mod tests {
         // hint ("Sign in to continue") is the same in both
         // cases. The LLM gets a session_loss finding and
         // decides whether to fill the form.
-        let report = evaluate_page(&mock_fixtures::login_wall_page(), false);
+        let report = evaluate_page(&mock_fixtures::login_wall_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::SurfaceAsFinding { kind, .. } => {
                 assert_eq!(kind, "session_loss");
@@ -436,7 +472,10 @@ mod tests {
         let args = serde_json::json!({ "to": "@alice", "text": "hi" });
         let outcome = evaluate_dispatch("send_message", &args).unwrap();
         match outcome {
-            ResilienceHookOutcome::PauseForUser { action_kind, target } => {
+            ResilienceHookOutcome::PauseForUser {
+                action_kind,
+                target,
+            } => {
                 assert_eq!(action_kind, "send");
                 assert!(target.contains("@alice"));
             }
@@ -479,10 +518,13 @@ mod tests {
 
     #[test]
     fn cloudflare_turnstile_triggers_pause_for_captcha() {
-        let report = evaluate_page(&mock_fixtures::cloudflare_turnstile_page(), false);
+        let report = evaluate_page(&mock_fixtures::cloudflare_turnstile_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::PauseForCaptcha { challenge } => {
-                assert_eq!(challenge.kind, mew_resilience::ChallengeKind::CloudflareTurnstile);
+                assert_eq!(
+                    challenge.kind,
+                    mew_resilience::ChallengeKind::CloudflareTurnstile
+                );
                 assert_eq!(challenge.domain_hint.as_deref(), Some("instagram.com"));
                 assert!(challenge.label.contains("Cloudflare"));
                 assert!(!challenge.kind.user_action_hint().is_empty());
@@ -493,7 +535,7 @@ mod tests {
 
     #[test]
     fn recaptcha_v2_triggers_pause_for_captcha() {
-        let report = evaluate_page(&mock_fixtures::recaptcha_v2_page(), false);
+        let report = evaluate_page(&mock_fixtures::recaptcha_v2_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::PauseForCaptcha { challenge } => {
                 assert_eq!(challenge.kind, mew_resilience::ChallengeKind::RecaptchaV2);
@@ -504,7 +546,7 @@ mod tests {
 
     #[test]
     fn recaptcha_v3_triggers_pause_for_captcha() {
-        let report = evaluate_page(&mock_fixtures::recaptcha_v3_page(), false);
+        let report = evaluate_page(&mock_fixtures::recaptcha_v3_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::PauseForCaptcha { challenge } => {
                 assert_eq!(challenge.kind, mew_resilience::ChallengeKind::RecaptchaV3);
@@ -515,7 +557,7 @@ mod tests {
 
     #[test]
     fn hcaptcha_triggers_pause_for_captcha() {
-        let report = evaluate_page(&mock_fixtures::hcaptcha_page(), false);
+        let report = evaluate_page(&mock_fixtures::hcaptcha_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::PauseForCaptcha { challenge } => {
                 assert_eq!(challenge.kind, mew_resilience::ChallengeKind::Hcaptcha);
@@ -529,13 +571,13 @@ mod tests {
         // Negative case: a normal homepage must NOT be classified
         // as a captcha. Otherwise every innocent "Verify you are
         // a human" copy in marketing pages would pause the agent.
-        let report = evaluate_page(&mock_fixtures::clean_homepage(), false);
+        let report = evaluate_page(&mock_fixtures::clean_homepage(), false, false, "");
         assert!(matches!(report.outcome, ResilienceHookOutcome::Continue));
     }
 
     #[test]
     fn dashboard_page_does_not_trigger_captcha() {
-        let report = evaluate_page(&mock_fixtures::dashboard_page(), false);
+        let report = evaluate_page(&mock_fixtures::dashboard_page(), false, false, "");
         assert!(matches!(report.outcome, ResilienceHookOutcome::Continue));
     }
 
@@ -552,7 +594,7 @@ mod tests {
             mock_fixtures::recaptcha_v3_page(),
             mock_fixtures::hcaptcha_page(),
         ] {
-            let report = evaluate_page(&fixture, false);
+            let report = evaluate_page(&fixture, false, false, "");
             match report.outcome {
                 ResilienceHookOutcome::PauseForCaptcha { challenge } => {
                     assert!(
@@ -563,6 +605,65 @@ mod tests {
                 }
                 _ => panic!("expected PauseForCaptcha"),
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 4: Google auto-login tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn session_loss_with_google_creds_attempts_login() {
+        // When Google credentials are available, session loss
+        // should trigger AttemptGoogleLogin instead of SurfaceAsFinding.
+        let report = evaluate_page(
+            &mock_fixtures::login_wall_page(),
+            true,
+            true,
+            "linkedin.com",
+        );
+        match report.outcome {
+            ResilienceHookOutcome::AttemptGoogleLogin { domain } => {
+                assert_eq!(domain, "linkedin.com");
+            }
+            other => panic!("expected AttemptGoogleLogin, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn session_loss_without_google_creds_surfaces_finding() {
+        // Without Google credentials, session loss should
+        // surface as a finding (existing behavior).
+        let report = evaluate_page(
+            &mock_fixtures::login_wall_page(),
+            true,
+            false,
+            "linkedin.com",
+        );
+        match report.outcome {
+            ResilienceHookOutcome::SurfaceAsFinding { kind, .. } => {
+                assert_eq!(kind, "session_loss");
+            }
+            other => panic!("expected SurfaceAsFinding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn session_loss_strong_signal_with_google_creds_attempts_login() {
+        // Even without prior_was_dashboard_like, the strong signal
+        // (password + sign-in heading) should trigger AttemptGoogleLogin
+        // when credentials are available.
+        let report = evaluate_page(
+            &mock_fixtures::login_wall_page(),
+            false,
+            true,
+            "indeed.com",
+        );
+        match report.outcome {
+            ResilienceHookOutcome::AttemptGoogleLogin { domain } => {
+                assert_eq!(domain, "indeed.com");
+            }
+            other => panic!("expected AttemptGoogleLogin, got {:?}", other),
         }
     }
 }

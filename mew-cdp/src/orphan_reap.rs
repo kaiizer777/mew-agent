@@ -127,22 +127,22 @@
 mod imp {
     use std::path::{Path, PathBuf};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, HANDLE, ERROR_INSUFFICIENT_BUFFER, ERROR_ACCESS_DENIED,
-        ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, GENERIC_READ, GENERIC_WRITE,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_LOCK_VIOLATION,
+        ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE,
     };
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
     };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, DeleteFileW, FILE_SHARE_NONE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::RestartManager::{
         RmEndSession, RmGetList, RmRegisterResources, RmStartSession, RM_PROCESS_INFO,
         RM_UNIQUE_PROCESS,
     };
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, DeleteFileW, FILE_SHARE_NONE, OPEN_EXISTING,
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
 
     /// State constant for a TCP row in LISTEN. From
@@ -231,10 +231,11 @@ mod imp {
                 pid = row.dwOwningPid,
                 "TCP row"
             );
-            if row.dwState == MIB_TCP_STATE_LISTEN && port == target_port {
-                if !candidate_pids.contains(&row.dwOwningPid) {
-                    candidate_pids.push(row.dwOwningPid);
-                }
+            if row.dwState == MIB_TCP_STATE_LISTEN
+                && port == target_port
+                && !candidate_pids.contains(&row.dwOwningPid)
+            {
+                candidate_pids.push(row.dwOwningPid);
             }
         }
 
@@ -339,13 +340,7 @@ mod imp {
         // with STATUS_ACCESS_VIOLATION. We never read the key —
         // it just needs to exist so the API has somewhere to write.
         let mut session_key = [0u16; 33];
-        let start_status = unsafe {
-            RmStartSession(
-                &mut session,
-                0,
-                session_key.as_mut_ptr(),
-            )
-        };
+        let start_status = unsafe { RmStartSession(&mut session, 0, session_key.as_mut_ptr()) };
         if start_status != 0 {
             tracing::warn!(
                 event = "orphan_reap_rm_start_failed",
@@ -695,7 +690,7 @@ mod imp {
                 0,
             )
         };
-        if status != ERROR_INSUFFICIENT_BUFFER as u32 && needed == 0 {
+        if status != ERROR_INSUFFICIENT_BUFFER && needed == 0 {
             return Err(format!(
                 "GetExtendedTcpTable returned {} and needed=0 (last_os_error: {})",
                 status,
@@ -726,8 +721,7 @@ mod imp {
         if buffer.len() < 4 {
             return Ok(Vec::new());
         }
-        let num_entries = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]])
-            as usize;
+        let num_entries = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
         let row_size = std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
         let rows_start = 4usize;
         let rows_available = (buffer.len().saturating_sub(rows_start)) / row_size;
@@ -736,9 +730,7 @@ mod imp {
         for i in 0..rows_to_read {
             let offset = rows_start + i * row_size;
             let row = unsafe {
-                std::ptr::read_unaligned(
-                    buffer.as_ptr().add(offset) as *const MIB_TCPROW_OWNER_PID,
-                )
+                std::ptr::read_unaligned(buffer.as_ptr().add(offset) as *const MIB_TCPROW_OWNER_PID)
             };
             out.push(row);
         }
@@ -808,9 +800,7 @@ mod imp {
     /// "killed because reaper" exit code. Returns
     /// `Ok(())` on success, `Err(msg)` on failure.
     fn terminate(pid: u32) -> Result<(), String> {
-        let handle: HANDLE = unsafe {
-            OpenProcess(PROCESS_TERMINATE, 0, pid)
-        };
+        let handle: HANDLE = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         if handle.is_null() {
             return Err(format!("OpenProcess(PROCESS_TERMINATE, {}) failed", pid));
         }
@@ -928,9 +918,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn reap_on_missing_profile_dir_is_zero_no_panic() {
-        let bogus = std::path::Path::new(
-            "C:\\definitely\\does\\not\\exist\\mew-test-profile",
-        );
+        let bogus = std::path::Path::new("C:\\definitely\\does\\not\\exist\\mew-test-profile");
         let n = super::imp::reap_orphaned_chromes(bogus, 9222);
         assert_eq!(n, 0, "missing profile dir must not kill anything");
     }
@@ -944,10 +932,7 @@ mod tests {
         // Use a temp dir we create just for this test,
         // so the lockfile-cleanup pass has something
         // to walk without touching a real profile.
-        let tmp = std::env::temp_dir().join(format!(
-            "mew-reap-clean-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("mew-reap-clean-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let n = super::imp::reap_orphaned_chromes(&tmp, 9222);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -978,10 +963,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn stale_lockfile_is_removed_by_pass_3() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mew-reap-lock-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("mew-reap-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("create temp dir");
 
@@ -1034,10 +1016,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn pass_3_does_not_touch_non_lockfile_files() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mew-reap-safe-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("mew-reap-safe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("create temp dir");
 

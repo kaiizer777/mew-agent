@@ -1,8 +1,9 @@
 pub mod diff;
+pub mod overrides;
 pub mod state;
-use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::accessibility::{AxNode, AxValue, GetFullAxTreeParams};
 use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
+use chromiumoxide::Page;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -26,20 +27,42 @@ pub struct TreeNode {
 }
 
 const INTERACTIVE_ROLES: &[&str] = &[
-    "button", "link", "textbox", "checkbox", "combobox", "radio", 
-    "menuitem", "tab", "switch", "slider", "spinbutton", "searchbox", 
-    "listbox", "option",
+    "button",
+    "link",
+    "textbox",
+    "checkbox",
+    "combobox",
+    "radio",
+    "menuitem",
+    "tab",
+    "switch",
+    "slider",
+    "spinbutton",
+    "searchbox",
+    "listbox",
+    "option",
 ];
 
 const CONTENT_ROLES: &[&str] = &[
-    "heading", "text", "cell", "paragraph", "image", "math", "statictext", 
-    "linebreak", "graphics-document", "graphics-symbol", "string", "inlinetextbox", "labeltext"
+    "heading",
+    "text",
+    "cell",
+    "paragraph",
+    "image",
+    "math",
+    "statictext",
+    "linebreak",
+    "graphics-document",
+    "graphics-symbol",
+    "string",
+    "inlinetextbox",
+    "labeltext",
 ];
 
 fn categorize_role(role: &str) -> NodeCategory {
     let lower_role = role.to_lowercase();
     let is_match = |roles: &[&str]| roles.iter().any(|&r| r == lower_role);
-    
+
     if is_match(INTERACTIVE_ROLES) {
         NodeCategory::Interactive
     } else if is_match(CONTENT_ROLES) {
@@ -63,34 +86,55 @@ fn extract_string(val: &Option<AxValue>) -> String {
     String::new()
 }
 
-pub fn build_tree(nodes: Vec<AxNode>, compact: bool) -> Option<(TreeNode, HashMap<String, BackendNodeId>)> {
+pub fn build_tree(
+    nodes: Vec<AxNode>,
+    compact: bool,
+) -> Option<(TreeNode, HashMap<String, BackendNodeId>)> {
+    build_tree_with_domain(nodes, compact, None)
+}
+
+pub fn build_tree_with_domain(
+    nodes: Vec<AxNode>,
+    compact: bool,
+    domain: Option<&str>,
+) -> Option<(TreeNode, HashMap<String, BackendNodeId>)> {
+    let overrides = overrides::PerceptionOverrides::load_default_or_fallback();
+    let rule = overrides.rule_for_domain(domain);
+    build_tree_with_rule(nodes, compact, &rule)
+}
+
+pub fn build_tree_with_rule(
+    nodes: Vec<AxNode>,
+    compact: bool,
+    rule: &overrides::PerceptionPruningRule,
+) -> Option<(TreeNode, HashMap<String, BackendNodeId>)> {
     let mut node_map = HashMap::new();
     let mut child_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut root_id = None;
     let mut ref_map = HashMap::new();
-    
+
     for node in nodes {
         let id = node.node_id.as_ref().to_string();
         let role = extract_string(&node.role);
-        
+
         // Skip some nodes that don't even have a meaningful role or are purely internal
         // unless they are explicitly roots.
-        
+
         let name = extract_string(&node.name);
         let value = extract_string(&node.value);
         let category = categorize_role(&role);
-        
+
         let mut ref_id = None;
         if category == NodeCategory::Interactive {
             if let Some(backend_id) = &node.backend_dom_node_id {
                 let id_val = format!("{:?}", backend_id);
                 let numbers: String = id_val.chars().filter(|c| c.is_ascii_digit()).collect();
                 let short_ref = format!("@e{}", numbers);
-                ref_map.insert(short_ref.clone(), backend_id.clone());
+                ref_map.insert(short_ref.clone(), *backend_id);
                 ref_id = Some(short_ref);
             }
         }
-        
+
         let t_node = TreeNode {
             id: id.clone(),
             role,
@@ -98,19 +142,22 @@ pub fn build_tree(nodes: Vec<AxNode>, compact: bool) -> Option<(TreeNode, HashMa
             value,
             category,
             ref_id,
-            backend_node_id: node.backend_dom_node_id.clone(),
+            backend_node_id: node.backend_dom_node_id,
             children: Vec::new(),
         };
-        
+
         node_map.insert(id.clone(), t_node);
-        
+
         if let Some(parent) = &node.parent_id {
-            child_map.entry(parent.as_ref().to_string()).or_default().push(id.clone());
+            child_map
+                .entry(parent.as_ref().to_string())
+                .or_default()
+                .push(id.clone());
         } else {
             root_id = Some(id.clone());
         }
     }
-    
+
     if root_id.is_none() {
         for (id, node) in &node_map {
             if node.role == "RootWebArea" {
@@ -119,19 +166,23 @@ pub fn build_tree(nodes: Vec<AxNode>, compact: bool) -> Option<(TreeNode, HashMa
             }
         }
     }
-    
+
     // In case no parent_id was None, and no RootWebArea was found, just pick the first node (rare fallback)
     if root_id.is_none() {
         if let Some(id) = node_map.keys().next() {
             root_id = Some(id.clone());
         }
     }
-    
+
     let root = root_id?;
-    
-    fn assemble(id: &str, node_map: &HashMap<String, TreeNode>, child_map: &HashMap<String, Vec<String>>) -> Option<TreeNode> {
+
+    fn assemble(
+        id: &str,
+        node_map: &HashMap<String, TreeNode>,
+        child_map: &HashMap<String, Vec<String>>,
+    ) -> Option<TreeNode> {
         let mut node = node_map.get(id)?.clone();
-        
+
         if let Some(children_ids) = child_map.get(id) {
             for child_id in children_ids {
                 if let Some(child_node) = assemble(child_id, node_map, child_map) {
@@ -139,45 +190,66 @@ pub fn build_tree(nodes: Vec<AxNode>, compact: bool) -> Option<(TreeNode, HashMa
                 }
             }
         }
-        
+
         Some(node)
     }
-    
+
     let mut root_node = assemble(&root, &node_map, &child_map)?;
-    
+
     if compact {
-        fn prune(mut node: TreeNode) -> Option<TreeNode> {
-            let children = std::mem::replace(&mut node.children, Vec::new());
+        fn prune(mut node: TreeNode, rule: &overrides::PerceptionPruningRule) -> Option<TreeNode> {
+            let children = std::mem::take(&mut node.children);
             let mut pruned_children = Vec::new();
-            
-            let is_static_text_with_name = node.role.eq_ignore_ascii_case("statictext") && !node.name.is_empty();
-            
+
+            let is_static_text_with_name =
+                node.role.eq_ignore_ascii_case("statictext") && !node.name.is_empty();
+
             for child in children {
                 if is_static_text_with_name && child.role.eq_ignore_ascii_case("inlinetextbox") {
                     continue;
                 }
-                
-                if let Some(pruned_child) = prune(child) {
+
+                if let Some(pruned_child) = prune(child, rule) {
                     pruned_children.push(pruned_child);
                 }
             }
-            
+
             node.children = pruned_children;
-            
-            if node.category == NodeCategory::Structural && node.name.is_empty() && node.value.is_empty() {
+
+            // Content text truncation if exceeding configured threshold
+            if rule.max_content_text_length > 0 && node.category == NodeCategory::Content {
+                if node.name.len() > rule.max_content_text_length {
+                    let mut s = node.name[..rule.max_content_text_length].to_string();
+                    s.push_str("...");
+                    node.name = s;
+                }
+                if node.value.len() > rule.max_content_text_length {
+                    let mut s = node.value[..rule.max_content_text_length].to_string();
+                    s.push_str("...");
+                    node.value = s;
+                }
+            }
+
+            let role_lower = node.role.to_lowercase();
+            let is_prune_role = rule.prune_roles.iter().any(|r| r.eq_ignore_ascii_case(&role_lower));
+
+            if node.category == NodeCategory::Structural
+                && (node.name.is_empty() || is_prune_role)
+                && node.value.is_empty()
+            {
                 if node.children.is_empty() {
                     return None;
                 } else if node.children.len() == 1 {
                     return Some(node.children.into_iter().next().unwrap());
                 }
             }
-            
+
             Some(node)
         }
-        
-        root_node = prune(root_node)?;
+
+        root_node = prune(root_node, rule)?;
     }
-    
+
     Some((root_node, ref_map))
 }
 
@@ -195,18 +267,39 @@ impl TreeNode {
             parts.push(format!("value: {:?}", self.value));
         }
         println!("{}{}", indent, parts.join(" | "));
-        
+
         for child in &self.children {
             child.print(depth + 1);
         }
     }
 }
 
-pub async fn extract_tree(page: &Page, compact: bool) -> anyhow::Result<(TreeNode, HashMap<String, BackendNodeId>, std::time::Duration)> {
+pub async fn extract_tree(
+    page: &Page,
+    compact: bool,
+) -> anyhow::Result<(
+    TreeNode,
+    HashMap<String, BackendNodeId>,
+    std::time::Duration,
+)> {
+    extract_tree_with_domain(page, compact, None).await
+}
+
+pub async fn extract_tree_with_domain(
+    page: &Page,
+    compact: bool,
+    domain: Option<&str>,
+) -> anyhow::Result<(
+    TreeNode,
+    HashMap<String, BackendNodeId>,
+    std::time::Duration,
+)> {
     let start = Instant::now();
     let res = page.execute(GetFullAxTreeParams::default()).await?;
     let duration = start.elapsed();
-    
-    let (root, ref_map) = build_tree(res.nodes.clone(), compact).ok_or_else(|| anyhow::anyhow!("Failed to build tree: no root found"))?;
+
+    let (root, ref_map) = build_tree_with_domain(res.nodes.clone(), compact, domain)
+        .ok_or_else(|| anyhow::anyhow!("Failed to build tree: no root found"))?;
     Ok((root, ref_map, duration))
 }
+

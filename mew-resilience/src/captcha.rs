@@ -159,8 +159,7 @@ pub fn detect(tree: &TreeNode) -> Option<Challenge> {
     if lower.contains("cf-turnstile")
         || lower.contains("challenges.cloudflare.com/turnstile")
         || lower.contains("turnstile")
-            && (lower.contains("verify you are human")
-                || lower.contains("checking your browser"))
+            && (lower.contains("verify you are human") || lower.contains("checking your browser"))
     {
         return Some(Challenge {
             kind: ChallengeKind::CloudflareTurnstile,
@@ -289,9 +288,7 @@ fn first_host_like_substring(s: &str) -> Option<String> {
         }
         // Walk forward through the first label's chars.
         let label_start = i;
-        while i < bytes.len()
-            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-')
-        {
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-') {
             i += 1;
         }
         // Need a '.' and another label to call this a host.
@@ -454,7 +451,11 @@ mod tests {
             "RootWebArea",
             "Example",
             vec![
-                node("script", "https://www.google.com/recaptcha/api.js?render=explicit", vec![]),
+                node(
+                    "script",
+                    "https://www.google.com/recaptcha/api.js?render=explicit",
+                    vec![],
+                ),
                 node("div", "grecaptcha-badge", vec![]),
             ],
         );
@@ -467,9 +468,7 @@ mod tests {
         let tree = node(
             "RootWebArea",
             "Example",
-            vec![
-                node("iframe", "hcaptcha.com/1/api", vec![]),
-            ],
+            vec![node("iframe", "hcaptcha.com/1/api", vec![])],
         );
         let c = detect(&tree).expect("hcaptcha must be detected");
         assert_eq!(c.kind, ChallengeKind::Hcaptcha);
@@ -498,7 +497,10 @@ mod tests {
         // tracing event payload. They are the user-visible
         // kind name and must not change without a coordinated
         // update of the frontend.
-        assert_eq!(ChallengeKind::CloudflareTurnstile.as_str(), "cloudflare_turnstile");
+        assert_eq!(
+            ChallengeKind::CloudflareTurnstile.as_str(),
+            "cloudflare_turnstile"
+        );
         assert_eq!(ChallengeKind::RecaptchaV2.as_str(), "recaptcha_v2");
         assert_eq!(ChallengeKind::RecaptchaV3.as_str(), "recaptcha_v3");
         assert_eq!(ChallengeKind::Hcaptcha.as_str(), "hcaptcha");

@@ -71,8 +71,10 @@ impl<'a> Visit for JsonVisitor<'a> {
         );
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.record.fields
-            .insert(field.name().to_string(), serde_json::Value::String(value.to_string()));
+        self.record.fields.insert(
+            field.name().to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
     fn record_i64(&mut self, field: &Field, value: i64) {
         self.record
@@ -127,10 +129,18 @@ impl SessionWriter {
 /// line on every event. Span names are folded into the `span` field on
 /// each event so the loop can be filtered after the fact by span
 /// (`SELECT span = "react_loop" AND event = "llm_response"`).
+///
+/// Phase 4: `redaction_targets` holds credential values (email,
+/// password) that must be scrubbed from every JSON line before
+/// writing. This ensures `GOOGLE_EMAIL` and `GOOGLE_PASSWORD`
+/// values never appear in `MEW_TRACING_DIR` output.
 #[derive(Clone)]
 pub struct SessionJsonLayer {
     writer: Arc<SessionWriter>,
     session_id: String,
+    /// Phase 4: values to redact from every trace line.
+    /// Each occurrence is replaced with `[REDACTED]`.
+    redaction_targets: Vec<String>,
 }
 
 impl SessionJsonLayer {
@@ -138,7 +148,15 @@ impl SessionJsonLayer {
         Ok(Self {
             writer: Arc::new(SessionWriter::new(&path)?),
             session_id: session_id.into(),
+            redaction_targets: Vec::new(),
         })
+    }
+
+    /// Phase 4: set credential values to redact from all trace output.
+    /// Call this after construction with values from
+    /// `auth::collect_redaction_targets`.
+    pub fn set_redaction_targets(&mut self, targets: Vec<String>) {
+        self.redaction_targets = targets;
     }
 }
 
@@ -148,14 +166,13 @@ where
 {
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let mut record = JsonRecord::default();
-        let mut visitor = JsonVisitor { record: &mut record };
+        let mut visitor = JsonVisitor {
+            record: &mut record,
+        };
         event.record(&mut visitor);
 
         let mut obj = serde_json::Map::new();
-        obj.insert(
-            "ts".to_string(),
-            serde_json::Value::String(now_iso8601()),
-        );
+        obj.insert("ts".to_string(), serde_json::Value::String(now_iso8601()));
         obj.insert(
             "level".to_string(),
             serde_json::Value::String(event.metadata().level().to_string()),
@@ -195,6 +212,16 @@ where
             Ok(s) => s,
             Err(_) => return,
         };
+        // Phase 4: redact credential values before writing to disk.
+        let line = if self.redaction_targets.is_empty() {
+            line
+        } else {
+            let mut redacted = line;
+            for target in &self.redaction_targets {
+                redacted = redacted.replace(target, "[REDACTED]");
+            }
+            redacted
+        };
         self.writer.write_line(&line);
     }
 
@@ -209,7 +236,9 @@ where
         // visitor above is what actually surfaces them to the file.
         let _span = ctx.span(id).expect("span must exist after on_new_span");
         let mut record = JsonRecord::default();
-        let mut visitor = JsonVisitor { record: &mut record };
+        let mut visitor = JsonVisitor {
+            record: &mut record,
+        };
         attrs.record(&mut visitor);
     }
 
@@ -280,8 +309,7 @@ pub fn try_install_global(layer: Arc<SessionJsonLayer>) -> Result<(), String> {
 /// reverts to the previous subscriber (usually the global fmt
 /// one). This is the right answer for "we have a global fmt
 /// subscriber AND we want a per-session JSONL side-channel."
-pub type SessionTraceGuard =
-    tracing::dispatcher::DefaultGuard;
+pub type SessionTraceGuard = tracing::dispatcher::DefaultGuard;
 
 /// Install the per-session JSON layer as a **thread-local
 /// subscriber override** for the current thread, in addition to
@@ -301,10 +329,7 @@ pub type SessionTraceGuard =
 /// The function name is `try_install_thread_local` for symmetry
 /// with `try_install_global`; it always succeeds because
 /// `set_default` does not conflict with the global subscriber.
-pub fn try_install_thread_local(
-    layer: Arc<SessionJsonLayer>,
-) -> SessionTraceGuard {
-
+pub fn try_install_thread_local(layer: Arc<SessionJsonLayer>) -> SessionTraceGuard {
     use tracing_subscriber::layer::SubscriberExt;
 
     // The thread-local default needs a `Subscriber` impl, not just
@@ -330,3 +355,42 @@ pub fn trace_todo_lifecycle(task_id: &str, todo_id: &str, phase: &str) {
         "todo lifecycle transition"
     );
 }
+
+/// Phase 1: Emit a trace event for concurrent worker timeline start/end.
+pub fn trace_worker_timeline(
+    task_id: &str,
+    todo_id: &str,
+    domain: &str,
+    event_type: &str,
+    status: Option<&str>,
+) {
+    let now_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0) as u64;
+
+    match status {
+        Some(st) => {
+            tracing::info!(
+                event = event_type,
+                task_id = task_id,
+                todo_id = todo_id,
+                domain = domain,
+                status = st,
+                ts_ms = now_ms,
+                "concurrent worker timeline event"
+            );
+        }
+        None => {
+            tracing::info!(
+                event = event_type,
+                task_id = task_id,
+                todo_id = todo_id,
+                domain = domain,
+                ts_ms = now_ms,
+                "concurrent worker timeline event"
+            );
+        }
+    }
+}
+

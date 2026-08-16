@@ -1,2 +1,0 @@
-[mew-ui] Phase 16.3: set MEW_WORKSPACE_DIR=C:\Users\bari2\Desktop\mew-agent (inferred from exe path)
-[mew-ui] Bug 3 fix: writing transcripts to C:\Users\bari2\AppData\Roaming\com.mew.ui\transcripts (outside src-tauri/)

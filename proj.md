@@ -1,6 +1,6 @@
 # mew — Project Documentation
 
-A Rust-native, visible, cost-controlled browser agent driven by a two-agent LLM harness. All ten phases of the work plan are shipped.
+A Rust-native, visible, cost-controlled browser agent driven by a two-agent LLM harness. All thirty phases of the work plan are shipped.
 
 ---
 
@@ -14,7 +14,7 @@ A Rust-native, visible, cost-controlled browser agent driven by a two-agent LLM 
 
 The architecture moved from a single blurred agent to a **two-agent split** in Phase 3: `ChatAgent` (intent routing + result synthesis) and `BrowserAgent` (the ReAct loop), connected by typed `Handoff` and `Result` structs. Every `ChatAgent → BrowserAgent → ChatAgent` round trip ends with a user-facing chat message — the orchestrator converts factory errors to `BrowserResult::failure` so even a Chrome-launch failure produces a chat reply. All error paths route through the `error_message` layer, so raw `Err` / panic / JSON surfaces never reach the user as-is.
 
-With v3 the project ships a Tauri 2 desktop shell, a `Channel<any>` for live events (State / Tool / Summary / ProgressLine), typed `OrchestratorEvent`s mapped to Tauri events by a `TauriSink`, and one chat surface instead of a separate transcript panel. Production hardening (Phase 10) is complete: tracing is quiet by default, the config schema is documented, and the three motivating scenarios all pass end-to-end.
+With v3 the project ships a Tauri 2 desktop shell, a `Channel<any>` for live events (State / Tool / Summary / ProgressLine), typed `OrchestratorEvent`s mapped to Tauri events by a `TauriSink`, and one chat surface instead of a separate transcript panel. Phases 19–30 extend the system with domain vertical packs (Jobs/Internships & SaaS Lead-Gen), single-call intent/shape routing, local result dedup & link verification, Reflexion-style episodic memory (read/write/decay), worker health heartbeats & stuck detection, supervisor respawn policy engines with cross-worker handoff context preservation, and user-facing respawn awareness.
 
 ---
 
@@ -330,6 +330,39 @@ The minimum code change that closes the user-visible "result computed but never 
   2. Any browser task shows a clean chat summary in the UI, never raw JSON.
   3. A multi-platform job-search task returns one consolidated list of roles + emails/URLs.
 
+### Phases 11 & 12 — Todo schema & Agent State Machine
+- **Todo schema.** Formalizes the `Todo` schema and decomposition contract, allowing clear tracking of individual tasks.
+- **Agent state machine.** Explicit state machine (`Stopped` → `Running` → `Paused` → `Done` | `Failed`), resolving ambiguous states.
+
+### Phases 13 & 14 — Supervisor Worker Pool & Cancellations
+- **Supervisor signal model.** Introduces `Pause`, `Resume`, `Cancel`, and `Replan` signals.
+- **Worker pool.** Browser Agent runs as a long-lived supervised worker, shaped for an N-worker pool in later phases.
+- **TodoRejectedEvent.** Handles user-cancel paths gracefully.
+
+### Phases 15, 16 & 17 — Completeness & Pacing
+- **Completeness tracker.** The agent now gates `finish()` calls against fresh snapshot evidence. If the claimed result isn't visibly in the DOM, the task remains pending.
+- **Pacing guards.** Site-specific pacing guards inject random delays between rapid repetitive actions to evade bot classifiers.
+- **Budget tracking.** Per-subtask budgets prevent infinite loops on confusing pages.
+
+### Phase 18 — Planner Defaults & N-Worker shape
+- **Planner enabled by default.** Deterministic task decomposition is now the default for improved stability and observability.
+- **N-worker pool architecture.** Completes the shaping for multiple concurrent tasks through the supervisor pool.
+
+### Phases 23, 24 & 25 — Episodic Memory & Self-Learning System (`mew-memory`)
+- **Reflexion Write Path (`LessonStore`).** Pure-Rust local storage for verbal lessons distilled from agent runs (`memory/lessons.jsonl`).
+- **Prompt Injection Read Path.** Before executing new tasks, relevant historical lessons are retrieved and injected into system prompts to prevent repeating past mistakes.
+- **Memory Curation, Decay & Contradiction Resolution.** Each lesson maintains a `confidence_score` (default 1.0). Opposing guidance across lessons is detected and withheld until resolved; under-performing lessons decay over time.
+
+### Phases 26, 27 & 28 — Worker Health & Supervisor Respawn Engine
+- **Worker Health Model (`WorkerHealth`).** Real-time monitoring of worker heartbeats, progress signals, and action-loop stuck detection.
+- **Supervisor Respawn Policy (`RespawnPolicy`).** Corrective prompt nudges issued on initial stalls; automatic process respawns triggered on persistent loops, proactive token budget warnings, or process crashes.
+- **Context Transplant on Respawn (`RespawnHandoff`).** Distilled state and completed subtasks are transferred to replacement workers, preventing duplicate work on fresh worker processes.
+
+### Phase 29 — Chat-Agent Awareness of Respawns & Self-Learning Surface
+- **Card State & Visual Accent.** Added `'task_recovered'` variant to `MessageKind` in `mew-ui` with a distinct cyan/teal left border accent (`#06b6d4`), presenting recoveries as "handled it" rather than alarming errors.
+- **Synthesized Chat Reply Notes.** `ChatAgent::synthesize_reply` appends a single plain-language sentence when respawns occur, maintaining zero internal Rust terms exposed to users and byte-identical behavior when no respawns occur.
+- **Read-Only Memory Surface.** Added `get_recent_lessons` Tauri command surfacing high-confidence learned insights to the UI without requiring debug CLI commands.
+
 ---
 
 ## 5. Configuration reference
@@ -350,15 +383,21 @@ browser:
   visible_cursor: false                            # ghost cursor overlay; default off
 
 agent:
-  planner_enabled: false
+  planner_enabled: true
   todo:
     enabled: false
     default_budget_secs: 120
     max_attempts: 3
     max_concurrent_tasks: 4
     replan_max_per_task: 1
+    max_respawns_per_task: 2                      # Phase 27: supervisor max worker respawn cap
+    token_threshold_pct: 0.80                      # Phase 27: proactive respawn token context threshold
   allowed_domains: [list]                          # safety whitelist
   task_presets: { name: "task string" }            # named task shortcuts
+  credentials:                                     # Phase 4: single-credential auth
+    google:
+      email_env: GOOGLE_EMAIL                      # env var name holding the Google email
+      password_env: GOOGLE_PASSWORD                # env var name holding the Google password
   pacing:
     enabled: false
     min_delay_ms: 800
@@ -371,6 +410,17 @@ agent:
   research:
     enabled: true
     platforms_file: config/research_platforms.toml
+    verify_links: true                             # Phase 22: liveness verification for harvested URLs
+    max_concurrent_workers: 3                      # Phase 1: global cap on in-flight platform subtasks
+    max_concurrent_per_domain: 1                   # Phase 1: per-domain concurrency cap to reduce ban risk
+    stream_partial_findings: true                  # Phase 2: live partial-finding streaming before task completion
+    lead_gen:
+      allow_email_pattern_guessing: false          # Phase 20: require verified contact evidence by default
+  memory:                                          # Phase 23–25: self-learning episodic memory
+    enabled: true
+    min_confidence: 0.8                            # min confidence threshold for prompt injection
+    max_lessons_per_prompt: 5                      # max retrieved lessons injected per system prompt
+    storage_dir: null                              # custom storage dir (null = OS app_data_dir/memory)
   captcha:
     enabled: false                                 # off by default
     solve_kinds: []                                # populated by the chosen provider

@@ -5,6 +5,7 @@ members = [
     "mew-perception",
     "mew-nav",
     "mew-resilience",
+    "mew-memory",
     "mew-agent",
     "mew-cli",
     "mew-ui/src-tauri",
@@ -14,6 +15,8 @@ members = [
 mew-cdp = { path = "mew-cdp" }
 mew-perception = { path = "mew-perception" }
 mew-nav = { path = "mew-nav" }
+mew-resilience = { path = "mew-resilience" }
+mew-memory = { path = "mew-memory" }
 mew-agent = { path = "mew-agent" }
 
 chromiumoxide = { version = "0.9.1" }
@@ -41,3 +44,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "registry", "std"] }
 url = "2.5"
 toml = "0.8"
+# Phase 41: lead-gen result export. The `csv` crate is a
+# tiny (~5k LoC, zero-dep), well-maintained CSV reader/writer
+# (1.4.0 as of Aug 2026). It lives in the workspace so any
+# future crate that needs CSV parsing can opt in via the
+# workspace alias without each crate pulling its own copy.
+# Dependency direction: this is an agent-side dep only
+# (mew-ui already imports the agent's exporter output, not
+# the crate directly), so it lives here, not in mew-ui.
+csv = "1.4"

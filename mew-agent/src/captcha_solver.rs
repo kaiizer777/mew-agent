@@ -154,7 +154,7 @@ impl CaptchaConfig {
         if !self.enabled {
             return false;
         }
-        if (calls_this_session as u32) >= self.per_session_cap {
+        if calls_this_session >= self.per_session_cap {
             return false;
         }
         self.solve_kinds.contains(&kind)
@@ -252,9 +252,7 @@ pub trait CaptchaSolver: Send + Sync {
     fn solve<'a>(
         &'a self,
         challenge: &'a Challenge,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = SolveOutcome> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SolveOutcome> + Send + 'a>>;
 }
 
 /// The default, always-unsupported solver. Returned by
@@ -272,9 +270,7 @@ impl CaptchaSolver for DisabledSolver {
     fn solve<'a>(
         &'a self,
         _challenge: &'a Challenge,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = SolveOutcome> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SolveOutcome> + Send + 'a>> {
         Box::pin(async { SolveOutcome::Unsupported })
     }
 }
@@ -404,10 +400,7 @@ mod tests {
         // strings keep log parsers happy.
         assert_eq!(format!("{}", SolveOutcome::Solved), "solved");
         assert_eq!(
-            format!(
-                "{}",
-                SolveOutcome::Failed { reason: "x".into() }
-            ),
+            format!("{}", SolveOutcome::Failed { reason: "x".into() }),
             "failed: x"
         );
         assert_eq!(

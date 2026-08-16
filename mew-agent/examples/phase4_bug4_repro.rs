@@ -64,11 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 1. navigate + wait_for_navigation (matches mew_cdp::navigate).
     println!("[repro] navigating...");
-    let nav_result = tokio::time::timeout(
-        Duration::from_secs(20),
-        page.goto(&url),
-    )
-    .await;
+    let nav_result = tokio::time::timeout(Duration::from_secs(20), page.goto(&url)).await;
     match nav_result {
         Ok(Ok(_)) => {
             let _ = page.wait_for_navigation().await;
@@ -93,7 +89,9 @@ async fn main() -> anyhow::Result<()> {
         println!("[repro] --- attempt {} ---", attempt);
         let raw = match tokio::time::timeout(
             Duration::from_secs(10),
-            page.execute(chromiumoxide::cdp::browser_protocol::accessibility::GetFullAxTreeParams::default()),
+            page.execute(
+                chromiumoxide::cdp::browser_protocol::accessibility::GetFullAxTreeParams::default(),
+            ),
         )
         .await
         {
@@ -120,13 +118,18 @@ async fn main() -> anyhow::Result<()> {
         let raw_json = serde_json::to_string_pretty(&raw_value).unwrap_or_default();
         let raw_path = run_dir.join(format!("raw_ax_response_attempt{}.json", attempt));
         let _ = std::fs::write(&raw_path, &raw_json);
-        println!("[repro] raw CDP response: {} nodes, dumped to {}",
-                 raw.nodes.len(), raw_path.display());
+        println!(
+            "[repro] raw CDP response: {} nodes, dumped to {}",
+            raw.nodes.len(),
+            raw_path.display()
+        );
         if raw.nodes.is_empty() {
             println!("[repro] ZERO NODES returned by Accessibility.getFullAXTree");
         } else {
             // Find the node with no parent_id (the AX tree's root).
-            let mut root_candidate: Option<&chromiumoxide::cdp::browser_protocol::accessibility::AxNode> = None;
+            let mut root_candidate: Option<
+                &chromiumoxide::cdp::browser_protocol::accessibility::AxNode,
+            > = None;
             for n in &raw.nodes {
                 if n.parent_id.is_none() {
                     root_candidate = Some(n);
@@ -170,7 +173,10 @@ async fn main() -> anyhow::Result<()> {
                 // Dump the serialized observation so we can read the
                 // exact bytes the LLM would have seen.
                 let obs = mew_perception::diff::serialize_full_tree(&root);
-                let _ = std::fs::write(run_dir.join(format!("observation_attempt{}.txt", attempt)), &obs);
+                let _ = std::fs::write(
+                    run_dir.join(format!("observation_attempt{}.txt", attempt)),
+                    &obs,
+                );
                 println!("[repro] observation bytes: {}", obs.len());
                 if attempt == 1 {
                     println!("[repro] EARLY EXIT on first success (debug)");

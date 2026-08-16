@@ -2,9 +2,9 @@
 //
 // Pure data + contract for worker execution of planned subtasks.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::Deref;
-use serde::{Deserialize, Serialize};
 
 pub use crate::completeness::SubTaskStatus as TodoStatus;
 
@@ -133,7 +133,11 @@ pub struct Todo {
 }
 
 impl Todo {
-    pub fn new(id: TodoId, intent: impl Into<String>, acceptance: Option<AcceptanceCriterion>) -> Self {
+    pub fn new(
+        id: TodoId,
+        intent: impl Into<String>,
+        acceptance: Option<AcceptanceCriterion>,
+    ) -> Self {
         Self {
             id,
             intent: intent.into(),
@@ -324,4 +328,3 @@ pub struct TodoRejectedEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
-

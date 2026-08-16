@@ -50,7 +50,11 @@ fn main() -> anyhow::Result<()> {
     let (_browser, _page, _handler, _job) = rt.block_on(async {
         let launch_result = mew_cdp::launch(
             config.browser.as_ref().and_then(|b| b.binary_path.clone()),
-            config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
+            config
+                .browser
+                .as_ref()
+                .map(|b| b.visible_cursor)
+                .unwrap_or(false),
         )
         .await;
         match launch_result {
@@ -74,7 +78,10 @@ fn main() -> anyhow::Result<()> {
     // We don't introspect the process tree from inside the
     // harness because wmic isn't on PATH in PowerShell 7+
     // and cross-platform process-tree walking is heavy.
-    println!("[harness] ready for hard-kill (parent_pid={})", std::process::id());
+    println!(
+        "[harness] ready for hard-kill (parent_pid={})",
+        std::process::id()
+    );
 
     // Hard-kill. We do NOT call `mew_cdp::shutdown` here.
     // `std::process::exit(1)` triggers normal process teardown

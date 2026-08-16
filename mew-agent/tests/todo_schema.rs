@@ -97,7 +97,10 @@ fn test_decompose_to_todos_instagram_regression() {
     assert_eq!(todos[1].id.as_str(), "text-my-friend-hi-2");
     assert_eq!(todos[1].intent, "text my friend hi");
     assert_eq!(todos[1].status, TodoStatus::Pending);
-    assert_eq!(todos[1].depends_on, vec![TodoId("go-to-instagram-1".to_string())]);
+    assert_eq!(
+        todos[1].depends_on,
+        vec![TodoId("go-to-instagram-1".to_string())]
+    );
     assert_eq!(
         todos[1].acceptance,
         Some(AcceptanceCriterion::new(

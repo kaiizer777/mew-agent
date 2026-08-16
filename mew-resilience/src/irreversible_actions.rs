@@ -29,6 +29,16 @@
 use serde_json::Value;
 
 /// What kind of action the LLM is about to dispatch.
+///
+/// Phase 6: `SubmitApplication` and `SendProposal` are *new*
+/// variants that distinguish a job-board "submit" from a
+/// generic form submit. The agent's auto-apply layer keys on
+/// these to draft application text and present it at a
+/// `Paused` checkpoint (see `mew_agent::application_dedup`
+/// and `mew_agent::auto_apply`). The string returned by
+/// `as_str()` is part of the wire protocol — the Tauri sink
+/// payload includes it — so existing string values are
+/// unchanged and only new variants are added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionKind {
     /// A message is being sent (DM, email, chat).
@@ -49,6 +59,21 @@ pub enum ActionKind {
     /// A "set" or "update" action that changes account-level
     /// state (password, email, privacy settings).
     Update,
+    /// A job-board application submission (LinkedIn Easy Apply,
+    /// Indeed Apply, Greenhouse, Lever, etc). Phase 6
+    /// auto-apply layer treats this as a typed pause point —
+    /// even with `auto_apply.enabled: true`, the agent pauses
+    /// to surface the drafted text for user approval.
+    SubmitApplication,
+    /// A freelance proposal / pitch submission (Upwork proposal,
+    /// Contra intro, etc). Phase 6 auto-apply treats this the
+    /// same as `SubmitApplication` — draft text + paused
+    /// confirmation + dedup-store check.
+    SendProposal,
+    /// A connection request (LinkedIn connect, Twitter follow
+    /// request). Phase 6 — sent on the user's behalf with the
+    /// same dedup-store / per-run cap as applications.
+    SendConnectionRequest,
     /// A read-only or otherwise reversible action.
     Other,
 }
@@ -63,6 +88,9 @@ impl ActionKind {
             ActionKind::Submit => "submit",
             ActionKind::Follow => "follow",
             ActionKind::Update => "update",
+            ActionKind::SubmitApplication => "submit_application",
+            ActionKind::SendProposal => "send_proposal",
+            ActionKind::SendConnectionRequest => "send_connection_request",
             ActionKind::Other => "other",
         }
     }
@@ -223,6 +251,78 @@ const RULES: &[Rule] = &[
         kind: ActionKind::Update,
         arg_keys: &["setting"],
     },
+    // -----------------------------------------------------------------
+    // Phase 6: auto-apply action layer
+    // -----------------------------------------------------------------
+    //
+    // The rules below are *more specific* than the generic
+    // `submit_application` and `send_message` rules above, so
+    // they sit *after* the generic ones in the table and only
+    // match when the LLM dispatches a typed tool. The
+    // `mew_agent::auto_apply` layer (consuming these verdicts)
+    // looks for `SubmitApplication` / `SendProposal` /
+    // `SendConnectionRequest` and:
+    //
+    //   1. Deduplicates the (platform, identifier) pair against
+    //      `<data_dir>/applications_sent.json`.
+    //   2. Enforces a per-run cap (`max_applications_per_run`).
+    //   3. Drafts the application / proposal / pitch text
+    //      (reusing the existing summarizer LLM call pattern).
+    //   4. Surfaces the draft to the user at the `Paused`
+    //      checkpoint for confirmation — never auto-submits
+    //      even with `auto_apply.enabled: true`, unless
+    //      `require_confirmation_per_application: false` is
+    //      explicitly set.
+    //
+    // Job-board application submission (LinkedIn Easy Apply,
+    // Indeed Apply, Greenhouse, Lever, AshbyHQ, Workday).
+    Rule {
+        name: "apply_to_job",
+        kind: ActionKind::SubmitApplication,
+        arg_keys: &["job_id", "role", "company"],
+    },
+    Rule {
+        name: "submit_job_application",
+        kind: ActionKind::SubmitApplication,
+        arg_keys: &["job_id", "role", "company"],
+    },
+    Rule {
+        name: "apply_for_job",
+        kind: ActionKind::SubmitApplication,
+        arg_keys: &["job_id", "role", "company"],
+    },
+    // Freelance proposal / pitch (Upwork, Contra, WeWorkRemotely
+    // contract listings). Typed distinctly from a generic
+    // "send" so the auto-apply draft text matches the
+    // platform's expected voice.
+    Rule {
+        name: "send_proposal",
+        kind: ActionKind::SendProposal,
+        arg_keys: &["project_id", "client_name", "scope"],
+    },
+    Rule {
+        name: "submit_proposal",
+        kind: ActionKind::SendProposal,
+        arg_keys: &["project_id", "client_name", "scope"],
+    },
+    Rule {
+        name: "pitch_client",
+        kind: ActionKind::SendProposal,
+        arg_keys: &["client_name", "scope"],
+    },
+    // Connection requests (LinkedIn, Twitter / X). Same dedup
+    // + per-run cap + paused-confirmation contract as
+    // applications.
+    Rule {
+        name: "send_connection_request",
+        kind: ActionKind::SendConnectionRequest,
+        arg_keys: &["to", "username", "user_id"],
+    },
+    Rule {
+        name: "connect_with",
+        kind: ActionKind::SendConnectionRequest,
+        arg_keys: &["username", "user_id"],
+    },
 ];
 
 /// Classify a tool call. Returns `Some(verdict)` if the call is
@@ -277,11 +377,7 @@ mod tests {
 
     #[test]
     fn send_message_is_irreversible() {
-        let v = classify(
-            "send_message",
-            &json!({ "to": "@alice", "text": "hi" }),
-        )
-        .unwrap();
+        let v = classify("send_message", &json!({ "to": "@alice", "text": "hi" })).unwrap();
         assert_eq!(v.action, ActionKind::Send);
         assert!(v.target.contains("@alice"));
     }
@@ -365,6 +461,9 @@ mod tests {
         assert_eq!(ActionKind::Submit.as_str(), "submit");
         assert_eq!(ActionKind::Follow.as_str(), "follow");
         assert_eq!(ActionKind::Update.as_str(), "update");
+        assert_eq!(ActionKind::SubmitApplication.as_str(), "submit_application");
+        assert_eq!(ActionKind::SendProposal.as_str(), "send_proposal");
+        assert_eq!(ActionKind::SendConnectionRequest.as_str(), "send_connection_request");
         assert_eq!(ActionKind::Other.as_str(), "other");
     }
 
@@ -398,10 +497,23 @@ mod tests {
             ("update_password", ActionKind::Update),
             ("update_email", ActionKind::Update),
             ("update_settings", ActionKind::Update),
+            // Phase 6: auto-apply surface.
+            ("apply_to_job", ActionKind::SubmitApplication),
+            ("submit_job_application", ActionKind::SubmitApplication),
+            ("apply_for_job", ActionKind::SubmitApplication),
+            ("send_proposal", ActionKind::SendProposal),
+            ("submit_proposal", ActionKind::SendProposal),
+            ("pitch_client", ActionKind::SendProposal),
+            ("send_connection_request", ActionKind::SendConnectionRequest),
+            ("connect_with", ActionKind::SendConnectionRequest),
         ];
         for (tool, expected_kind) in cases {
             let v = classify(tool, &json!({ "x": 1 })).expect(tool);
-            assert_eq!(v.action, *expected_kind, "tool {} expected kind {:?}", tool, expected_kind);
+            assert_eq!(
+                v.action, *expected_kind,
+                "tool {} expected kind {:?}",
+                tool, expected_kind
+            );
         }
     }
 
@@ -412,13 +524,117 @@ mod tests {
         // new irreversible rule must not accidentally
         // catch any of these.
         let tools = &[
-            "click", "type", "scroll", "press_key", "snapshot", "vision_inspect",
-            "navigate", "declare_subtasks", "mark_subtask_done",
-            "mark_subtask_skipped", "mark_subtask_failed", "finish",
+            "click",
+            "type",
+            "scroll",
+            "press_key",
+            "snapshot",
+            "vision_inspect",
+            "navigate",
+            "declare_subtasks",
+            "mark_subtask_done",
+            "mark_subtask_skipped",
+            "mark_subtask_failed",
+            "finish",
         ];
         for tool in tools {
             let v = classify(tool, &json!({}));
-            assert!(v.is_none(), "tool {} should be reversible, got {:?}", tool, v);
+            assert!(
+                v.is_none(),
+                "tool {} should be reversible, got {:?}",
+                tool,
+                v
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 6: auto-apply surface tests
+    // -----------------------------------------------------------------
+    //
+    // The auto-apply layer (see `mew_agent::application_dedup` and
+    // `mew_agent::auto_apply`) is built on top of the
+    // classifier's verdict. The tests below lock down that
+    // the *new* variants are produced with the right shape:
+    // action kind, populated `target` from the priority arg
+    // list, and a non-empty target even when args are absent
+    // (so the user-facing pause message is always meaningful).
+
+    #[test]
+    fn apply_to_job_classifies_as_submit_application() {
+        let v = classify(
+            "apply_to_job",
+            &json!({ "job_id": "gh-12345", "role": "Senior Rust Engineer", "company": "Acme" }),
+        )
+        .expect("apply_to_job must be irreversible");
+        assert_eq!(v.action, ActionKind::SubmitApplication);
+        // The arg_keys priority for `apply_to_job` is
+        // `["job_id", "role", "company"]`; `job_id` wins
+        // when present so the user can identify the posting
+        // in the chat list.
+        assert!(v.target.contains("gh-12345"));
+    }
+
+    #[test]
+    fn send_proposal_classifies_as_send_proposal() {
+        let v = classify(
+            "send_proposal",
+            &json!({ "project_id": "upwork-9876", "client_name": "Acme Co", "scope": "Build a CLI" }),
+        )
+        .expect("send_proposal must be irreversible");
+        assert_eq!(v.action, ActionKind::SendProposal);
+        assert!(v.target.contains("upwork-9876"));
+    }
+
+    #[test]
+    fn send_connection_request_classifies_as_send_connection_request() {
+        let v = classify(
+            "send_connection_request",
+            &json!({ "to": "@kaneki-gaming", "note": "Saw your Rust work" }),
+        )
+        .expect("send_connection_request must be irreversible");
+        assert_eq!(v.action, ActionKind::SendConnectionRequest);
+        assert!(v.target.contains("@kaneki-gaming"));
+    }
+
+    #[test]
+    fn submit_application_kind_distinct_from_submit_form() {
+        // The legacy `submit_application` rule maps to
+        // `ActionKind::Submit` (the generic kind). The
+        // Phase 6 typed rules (`apply_to_job`,
+        // `submit_job_application`, `apply_for_job`) map
+        // to `ActionKind::SubmitApplication`. The two
+        // kinds are *not* interchangeable — the auto-apply
+        // layer keys on the kind to decide whether to
+        // draft application text and consult the dedup
+        // store. A regression that collapses them would
+        // silently disable the auto-apply surface.
+        let generic = classify("submit_application", &json!({ "job_id": "x" })).unwrap();
+        let typed = classify("apply_to_job", &json!({ "job_id": "x" })).unwrap();
+        assert_eq!(generic.action, ActionKind::Submit);
+        assert_eq!(typed.action, ActionKind::SubmitApplication);
+        assert_ne!(generic.action, typed.action);
+    }
+
+    #[test]
+    fn auto_apply_target_falls_back_to_generic_when_args_empty() {
+        // Even with no args, the verdict must still be a
+        // typed gate (not a no-op). The user-facing pause
+        // message in the chat relies on `target` being
+        // non-empty so the user can tell what the agent
+        // was about to do.
+        for (tool, kind) in [
+            ("apply_to_job", ActionKind::SubmitApplication),
+            ("send_proposal", ActionKind::SendProposal),
+            ("send_connection_request", ActionKind::SendConnectionRequest),
+        ] {
+            let v = classify(tool, &json!({})).expect(tool);
+            assert_eq!(v.action, kind);
+            assert!(
+                !v.target.is_empty(),
+                "target must be non-empty even without args for {tool}, got {:?}",
+                v.target
+            );
         }
     }
 }

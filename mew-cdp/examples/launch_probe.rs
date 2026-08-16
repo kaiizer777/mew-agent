@@ -11,10 +11,8 @@ fn main() {
         .unwrap();
 
     rt.block_on(async {
-        let binary_path = Some(
-            "c:\\Users\\bari2\\Desktop\\mew-agent\\stealth-browser\\chrome.exe"
-                .to_string(),
-        );
+        let binary_path =
+            Some("c:\\Users\\bari2\\Desktop\\mew-agent\\stealth-browser\\chrome.exe".to_string());
         let visible_cursor = false;
 
         println!("[probe] calling mew_cdp::launch_headless...");

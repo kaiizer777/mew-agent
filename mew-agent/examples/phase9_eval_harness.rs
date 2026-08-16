@@ -26,7 +26,10 @@ use mew_agent::eval::{harness::default_scenarios, runner};
 
 fn main() -> anyhow::Result<()> {
     println!("== Phase 9 evaluation harness ==");
-    println!("Running {} default scenarios...\n", default_scenarios().len());
+    println!(
+        "Running {} default scenarios...\n",
+        default_scenarios().len()
+    );
 
     let chat_agent = runner::default_chat_agent();
     let report = runner::run_scenarios(&default_scenarios(), &chat_agent);

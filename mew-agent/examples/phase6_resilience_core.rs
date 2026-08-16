@@ -26,13 +26,13 @@
 //! Run with:
 //!   cargo run --example phase6_resilience_core -p mew-agent
 
+use mew_agent::resilience::{
+    evaluate_dispatch, evaluate_page, page_looks_dashboard_like, ResilienceHookOutcome,
+};
 use mew_resilience::mock_fixtures;
 use mew_resilience::{
-    RefActionKind, RefRecoveryConfig, RefRecoveryInputs, RefRecoveryOutcome, VisionConfidence,
-    VisionVerdict, attempt_recovery, classify_irreversible, score_vision,
-};
-use mew_agent::resilience::{
-    ResilienceHookOutcome, evaluate_dispatch, evaluate_page, page_looks_dashboard_like,
+    attempt_recovery, classify_irreversible, score_vision, RefActionKind, RefRecoveryConfig,
+    RefRecoveryInputs, RefRecoveryOutcome, VisionConfidence, VisionVerdict,
 };
 use serde_json::json;
 
@@ -44,7 +44,10 @@ fn assert_eq<T: PartialEq + std::fmt::Debug>(label: &str, actual: T, expected: T
     if actual == expected {
         println!("  [OK]   {} = {:?}", label, actual);
     } else {
-        println!("  [FAIL] {}: expected {:?}, got {:?}", label, expected, actual);
+        println!(
+            "  [FAIL] {}: expected {:?}, got {:?}",
+            label, expected, actual
+        );
         std::process::exit(1);
     }
 }
@@ -61,37 +64,52 @@ fn main() {
     section("1. Page-state detectors");
     {
         // 1a. Clean homepage — no finding.
-        let report = evaluate_page(&mock_fixtures::clean_homepage(), false);
-        assert_eq("clean homepage", report.outcome, ResilienceHookOutcome::Continue);
+        let report = evaluate_page(&mock_fixtures::clean_homepage(), false, false, "");
+        assert_eq(
+            "clean homepage",
+            report.outcome,
+            ResilienceHookOutcome::Continue,
+        );
     }
     {
         // 1b. Cookie banner — auto-dismiss.
-        let report = evaluate_page(&mock_fixtures::cookie_banner_page(), false);
+        let report = evaluate_page(&mock_fixtures::cookie_banner_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::AutoDismiss { dismiss_ref } => {
                 assert_eq("cookie banner dismiss_ref", dismiss_ref, "@e1".to_string());
             }
             other => {
-                println!("  [FAIL] cookie banner expected AutoDismiss, got {:?}", other);
+                println!(
+                    "  [FAIL] cookie banner expected AutoDismiss, got {:?}",
+                    other
+                );
                 std::process::exit(1);
             }
         }
     }
     {
         // 1c. HTTP 429 — backoff.
-        let report = evaluate_page(&mock_fixtures::http_429_page(), false);
-        assert_eq("429 backoff", report.outcome, ResilienceHookOutcome::Backoff { secs: 30 });
+        let report = evaluate_page(&mock_fixtures::http_429_page(), false, false, "");
+        assert_eq(
+            "429 backoff",
+            report.outcome,
+            ResilienceHookOutcome::Backoff { secs: 30 },
+        );
     }
     {
         // 1d. Cloudflare — backoff with 15s default.
-        let report = evaluate_page(&mock_fixtures::cloudflare_page(), false);
-        assert_eq("cloudflare backoff", report.outcome, ResilienceHookOutcome::Backoff { secs: 15 });
+        let report = evaluate_page(&mock_fixtures::cloudflare_page(), false, false, "");
+        assert_eq(
+            "cloudflare backoff",
+            report.outcome,
+            ResilienceHookOutcome::Backoff { secs: 15 },
+        );
     }
     {
         // 1e. Login wall — strong session-loss signal fires
         // regardless of the prior (the strong-signal branch
         // doesn't depend on prior_was_dashboard_like).
-        let report = evaluate_page(&mock_fixtures::login_wall_page(), false);
+        let report = evaluate_page(&mock_fixtures::login_wall_page(), false, false, "");
         match &report.outcome {
             ResilienceHookOutcome::SurfaceAsFinding { kind, summary } => {
                 assert_eq("login wall kind", kind.clone(), "session_loss".to_string());
@@ -102,7 +120,10 @@ fn main() {
                 );
             }
             other => {
-                println!("  [FAIL] login wall expected SurfaceAsFinding(session_loss), got {:?}", other);
+                println!(
+                    "  [FAIL] login wall expected SurfaceAsFinding(session_loss), got {:?}",
+                    other
+                );
                 std::process::exit(1);
             }
         }
@@ -112,13 +133,16 @@ fn main() {
         // detector returns SurfaceAsFinding. This is the
         // expected behavior: age gates usually need real
         // input, so the loop should not auto-dismiss.
-        let report = evaluate_page(&mock_fixtures::age_gate_page(), false);
+        let report = evaluate_page(&mock_fixtures::age_gate_page(), false, false, "");
         match &report.outcome {
             ResilienceHookOutcome::SurfaceAsFinding { kind, .. } => {
                 assert_eq("age gate kind", kind.clone(), "modal".to_string());
             }
             other => {
-                println!("  [FAIL] age gate expected SurfaceAsFinding(modal), got {:?}", other);
+                println!(
+                    "  [FAIL] age gate expected SurfaceAsFinding(modal), got {:?}",
+                    other
+                );
                 std::process::exit(1);
             }
         }
@@ -130,9 +154,21 @@ fn main() {
     // it on the *next* cycle.
     section("2. Dashboard-like detection");
     {
-        assert_eq("dashboard is dashboard-like", page_looks_dashboard_like(&mock_fixtures::dashboard_page()), true);
-        assert_eq("clean homepage is not", page_looks_dashboard_like(&mock_fixtures::clean_homepage()), false);
-        assert_eq("login wall is not", page_looks_dashboard_like(&mock_fixtures::login_wall_page()), false);
+        assert_eq(
+            "dashboard is dashboard-like",
+            page_looks_dashboard_like(&mock_fixtures::dashboard_page()),
+            true,
+        );
+        assert_eq(
+            "clean homepage is not",
+            page_looks_dashboard_like(&mock_fixtures::clean_homepage()),
+            false,
+        );
+        assert_eq(
+            "login wall is not",
+            page_looks_dashboard_like(&mock_fixtures::login_wall_page()),
+            false,
+        );
     }
 
     // Section 3: irreversible-action classification. The
@@ -144,12 +180,22 @@ fn main() {
     {
         let v = evaluate_dispatch("send_message", &json!({ "to": "@alice", "text": "hi" }));
         match v {
-            Some(ResilienceHookOutcome::PauseForUser { target, action_kind }) => {
+            Some(ResilienceHookOutcome::PauseForUser {
+                target,
+                action_kind,
+            }) => {
                 assert_eq("send_message action_kind", action_kind, "send".to_string());
-                assert!(target.contains("@alice"), "send_message target should contain @alice, got: {}", target);
+                assert!(
+                    target.contains("@alice"),
+                    "send_message target should contain @alice, got: {}",
+                    target
+                );
             }
             other => {
-                println!("  [FAIL] send_message expected PauseForUser, got {:?}", other);
+                println!(
+                    "  [FAIL] send_message expected PauseForUser, got {:?}",
+                    other
+                );
                 std::process::exit(1);
             }
         }
@@ -190,6 +236,7 @@ fn main() {
             description_index: None,
             action: RefActionKind::Click,
             attempts_so_far: 0,
+            page_navigated: false,
         };
         let outcome = attempt_recovery(&RefRecoveryConfig::default(), &inputs);
         match outcome {
@@ -213,6 +260,7 @@ fn main() {
             description_index: None,
             action: RefActionKind::Click,
             attempts_so_far: 1, // already used the 1-retry budget
+            page_navigated: false,
         };
         let outcome = attempt_recovery(&RefRecoveryConfig::default(), &inputs);
         assert!(matches!(outcome, RefRecoveryOutcome::EscalateToLLM { .. }));
@@ -230,9 +278,13 @@ fn main() {
             description_index: None,
             action: RefActionKind::Type,
             attempts_so_far: 0,
+            page_navigated: false,
         };
         let outcome = attempt_recovery(&RefRecoveryConfig::default(), &inputs);
-        assert!(matches!(outcome, RefRecoveryOutcome::AbortWithReason { .. }));
+        assert!(matches!(
+            outcome,
+            RefRecoveryOutcome::AbortWithReason { .. }
+        ));
         println!("  [OK]   type-on-empty-map aborts");
     }
 
@@ -251,7 +303,10 @@ fn main() {
             "uncertain phrase should be below 0.5, got {}",
             v.confidence.score
         );
-        println!("  [OK]   uncertain phrase -> {:.2} (below 0.5)", v.confidence.score);
+        println!(
+            "  [OK]   uncertain phrase -> {:.2} (below 0.5)",
+            v.confidence.score
+        );
     }
     {
         let v = score_vision(
@@ -263,12 +318,18 @@ fn main() {
             "substantive description should be acceptable, got {}",
             v.confidence.score
         );
-        println!("  [OK]   substantive description -> {:.2} (acceptable)", v.confidence.score);
+        println!(
+            "  [OK]   substantive description -> {:.2} (acceptable)",
+            v.confidence.score
+        );
     }
     {
         // Large box -> tighten suggestion.
         let v = score_vision("a button", Some((10.0, 10.0, 400.0, 300.0)));
-        assert!(v.tighten_crop.is_some(), "large box should suggest a tighter crop");
+        assert!(
+            v.tighten_crop.is_some(),
+            "large box should suggest a tighter crop"
+        );
         println!("  [OK]   large box -> tighten suggestion present");
     }
     {

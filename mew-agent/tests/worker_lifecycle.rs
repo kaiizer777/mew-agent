@@ -117,7 +117,6 @@ async fn test_submit_then_deadline() {
     assert_ne!(res.status, TodoStatus::Done);
 }
 
-
 #[tokio::test]
 #[should_panic(expected = "await the previous receiver first")]
 async fn test_submit_twice_without_awaiting_first_receiver_panics() {

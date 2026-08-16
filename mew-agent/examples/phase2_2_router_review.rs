@@ -156,7 +156,7 @@ fn corpus() -> Vec<Case> {
 fn render_intent(i: &Intent) -> (&'static str, String) {
     match i {
         Intent::Chat(r) => ("Chat", r.clone()),
-        Intent::BrowserTask(t) => ("BrowserTask", t.clone()),
+        Intent::BrowserTask { task: t, .. } => ("BrowserTask", t.clone()),
     }
 }
 
@@ -199,7 +199,11 @@ async fn main() -> anyhow::Result<()> {
                         mismatched += 1;
                         mismatches.push(format!(
                             "[{}] expected={} got={} msg={:?} ctx.len={}",
-                            c.label, exp, got, c.msg, c.ctx.len()
+                            c.label,
+                            exp,
+                            got,
+                            c.msg,
+                            c.ctx.len()
                         ));
                         "MISMATCH"
                     }

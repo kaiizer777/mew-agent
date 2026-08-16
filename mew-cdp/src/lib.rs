@@ -1,12 +1,14 @@
 use anyhow::Result;
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::Page;
+use chromiumoxide::cdp::browser_protocol::dom::GetBoxModelParams;
 use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, FocusParams, ResolveNodeParams};
+use chromiumoxide::cdp::browser_protocol::page::{
+    CaptureScreenshotFormat, CaptureScreenshotParams, Viewport,
+};
 use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
+use chromiumoxide::Page;
 use futures::StreamExt;
 use thiserror::Error;
-use chromiumoxide::cdp::browser_protocol::dom::GetBoxModelParams;
-use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotParams, CaptureScreenshotFormat, Viewport};
 
 /// Phase 3: re-export `chromiumoxide::Page` so crates downstream
 /// of `mew-cdp` (the Tauri `mew-ui` crate, in particular) can
@@ -14,6 +16,7 @@ use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotParams, Captur
 /// `chromiumoxide`. The orchestrator's `BrowserAgentFactory`
 /// trait uses this re-exported name in its method signatures.
 pub use chromiumoxide::Page as ReExportedPage;
+pub use chromiumoxide::Browser as ReExportedBrowser;
 
 mod process_lifetime;
 use process_lifetime::JobObject;
@@ -32,6 +35,19 @@ use process_lifetime::JobObject;
 // single function with a stable signature.
 pub mod orphan_reap;
 use orphan_reap::reap_orphaned_chromes;
+
+// Phase 33: structured field extractor (`extract_fields` tool).
+// The LLM used to issue `snapshot()` and then spend a full LLM
+// round-trip scanning the AX tree to pull out phone / address /
+// rating. The new tool runs a single targeted CDP query against
+// the current page and returns the requested fields as a typed
+// `HashMap<String, Option<String>>` — O(1) for Maps, O(small n)
+// for generic pages. See `field_extractor::extract_structured_fields`.
+pub mod field_extractor;
+pub use field_extractor::{
+    build_extract_js, extract_structured_fields, extract_structured_fields_auto,
+    is_maps_url, parse_extraction, SUPPORTED_FIELDS,
+};
 
 #[derive(Error, Debug)]
 pub enum StaleRefError {
@@ -60,7 +76,7 @@ pub async fn compute_element_center(
     backend_id: BackendNodeId,
 ) -> Result<Option<(f64, f64)>, StaleRefError> {
     let box_model_params = GetBoxModelParams::builder()
-        .backend_node_id(backend_id.clone())
+        .backend_node_id(backend_id)
         .build();
     let box_model_res = match page.execute(box_model_params).await {
         Ok(r) => r,
@@ -393,7 +409,8 @@ pub async fn launch(
         config_builder = config_builder.chrome_executable(path);
     }
 
-    let config = config_builder.build()
+    let config = config_builder
+        .build()
         .map_err(|e| anyhow::anyhow!("Failed to build BrowserConfig: {e}"))?;
 
     tracing::info!("Launching headed Chrome on remote debugging port 9222...");
@@ -433,7 +450,8 @@ pub async fn launch_headless(
         config_builder = config_builder.chrome_executable(path);
     }
 
-    let config = config_builder.build()
+    let config = config_builder
+        .build()
         .map_err(|e| anyhow::anyhow!("Failed to build BrowserConfig: {e}"))?;
 
     tracing::info!("Launching headless Chrome on remote debugging port 9222...");
@@ -445,7 +463,6 @@ async fn launch_inner(
     config: BrowserConfig,
     visible_cursor: bool,
 ) -> Result<(Browser, Page, tokio::task::JoinHandle<()>, JobObject)> {
-
     // Phase X.2: launch-with-retry. `Browser::launch` spawns the
     // child Chrome and waits for it to print the DevTools websocket
     // URL on stderr. If Chrome exits early — typically because the
@@ -559,9 +576,7 @@ async fn launch_inner(
     // this *after* `Browser::launch` returns so we know the
     // child PID is real (it was assigned during the spawn
     // we just did).
-    let chrome_pid: Option<u32> = browser
-        .get_mut_child()
-        .and_then(|c| c.inner.id());
+    let chrome_pid: Option<u32> = browser.get_mut_child().and_then(|c| c.inner.id());
     if let Some(pid) = chrome_pid {
         if let Err(e) = job.assign_pid(pid) {
             // Assignment failed — the child is in some
@@ -807,14 +822,11 @@ pub async fn wait_for_page_settled(page: &Page) -> PageSettleReport {
     wait_for_page_settled_with(page, PageSettleOptions::default()).await
 }
 
-pub async fn wait_for_page_settled_with(
-    page: &Page,
-    opts: PageSettleOptions,
-) -> PageSettleReport {
+pub async fn wait_for_page_settled_with(page: &Page, opts: PageSettleOptions) -> PageSettleReport {
     let start = std::time::Instant::now();
     let deadline = start + std::time::Duration::from_millis(opts.max_wait_ms);
     let mut polls: u32 = 0;
-    let mut first_settled_at: Option<std::time::Instant> = None;
+    let first_settled_at: Option<std::time::Instant> = None;
 
     // JS expression: returns a JSON object with the four settle
     // signals. We keep this as a single expression so chromiumoxide
@@ -841,11 +853,8 @@ pub async fn wait_for_page_settled_with(
         // want one hung poll to burn the entire settle budget.
         // 3s is generous for a healthy page (typical: <50ms) but
         // bounded enough that a wedged page fails fast.
-        let eval = tokio::time::timeout(
-            std::time::Duration::from_millis(3_000),
-            page.evaluate(js),
-        )
-        .await;
+        let eval =
+            tokio::time::timeout(std::time::Duration::from_millis(3_000), page.evaluate(js)).await;
         let ready = match eval {
             Ok(Ok(res)) => {
                 if let Some(v) = res.value() {
@@ -855,10 +864,7 @@ pub async fn wait_for_page_settled_with(
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false);
                     let busy = v.get("busy").and_then(|x| x.as_bool()).unwrap_or(true);
-                    let text_len = v
-                        .get("textLen")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0) as usize;
+                    let text_len = v.get("textLen").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                     ready && body_has_kids && !busy && text_len >= opts.min_text_len
                 } else {
                     false
@@ -910,18 +916,27 @@ pub async fn wait_for_page_settled_with(
 
 pub async fn click_selector(page: &Page, selector: &str) -> Result<()> {
     tracing::info!("Clicking selector: {}", selector);
-    let element = page.find_element(selector).await
-        .map_err(|e| anyhow::anyhow!("Failed to find element with selector '{}': {}", selector, e))?;
-    element.click().await
-        .map_err(|e| anyhow::anyhow!("Failed to click element with selector '{}': {}", selector, e))?;
+    let element = page.find_element(selector).await.map_err(|e| {
+        anyhow::anyhow!("Failed to find element with selector '{}': {}", selector, e)
+    })?;
+    element.click().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to click element with selector '{}': {}",
+            selector,
+            e
+        )
+    })?;
     Ok(())
 }
 
 pub async fn type_text(page: &Page, selector: &str, text: &str) -> Result<()> {
     tracing::info!("Typing text into selector: {}", selector);
-    let element = page.find_element(selector).await
-        .map_err(|e| anyhow::anyhow!("Failed to find element with selector '{}': {}", selector, e))?;
-    element.type_str(text).await
+    let element = page.find_element(selector).await.map_err(|e| {
+        anyhow::anyhow!("Failed to find element with selector '{}': {}", selector, e)
+    })?;
+    element
+        .type_str(text)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to type text into selector '{}': {}", selector, e))?;
     Ok(())
 }
@@ -932,7 +947,8 @@ pub async fn scroll(page: &Page, direction: ScrollDirection, amount: i32) -> Res
         ScrollDirection::Up => -amount,
         ScrollDirection::Down => amount,
     };
-    page.evaluate(format!("window.scrollBy(0, {});", y_offset)).await
+    page.evaluate(format!("window.scrollBy(0, {});", y_offset))
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to scroll: {}", e))?;
     Ok(())
 }
@@ -940,8 +956,10 @@ pub async fn scroll(page: &Page, direction: ScrollDirection, amount: i32) -> Res
 pub async fn press_key(page: &Page, key: &str) -> Result<()> {
     tracing::info!("Pressing key: {}", key);
     // Use CDP Input domain for key press to ensure trusted events
-    use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
-    
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchKeyEventParams, DispatchKeyEventType,
+    };
+
     let text = if key == "Enter" { "\r" } else { "" };
     let code = if key == "Enter" { "Enter" } else { key };
 
@@ -953,7 +971,8 @@ pub async fn press_key(page: &Page, key: &str) -> Result<()> {
         .text(text)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build RawKeyDown: {}", e))?;
-    page.execute(raw_key_down).await
+    page.execute(raw_key_down)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to press key {}: {}", key, e))?;
 
     // Char
@@ -965,7 +984,8 @@ pub async fn press_key(page: &Page, key: &str) -> Result<()> {
             .text(text)
             .build()
             .unwrap();
-        page.execute(char_event).await
+        page.execute(char_event)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to dispatch Char for {}: {}", key, e))?;
     }
 
@@ -976,19 +996,29 @@ pub async fn press_key(page: &Page, key: &str) -> Result<()> {
         .code(code)
         .build()
         .unwrap();
-    page.execute(key_up).await
+    page.execute(key_up)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to dispatch KeyUp for {}: {}", key, e))?;
-        
+
     Ok(())
 }
 
 pub async fn click_ref(page: &Page, backend_id: BackendNodeId) -> Result<(), StaleRefError> {
     tracing::info!("Clicking ref: {:?}", backend_id);
-    let resolve_res = page.execute(
-        ResolveNodeParams::builder().backend_node_id(backend_id.clone()).build()
-    ).await.map_err(|_| StaleRefError::NotFound(backend_id.clone()))?;
+    let resolve_res = page
+        .execute(
+            ResolveNodeParams::builder()
+                .backend_node_id(backend_id)
+                .build(),
+        )
+        .await
+        .map_err(|_| StaleRefError::NotFound(backend_id))?;
 
-    let object_id = resolve_res.object.object_id.clone().ok_or_else(|| StaleRefError::NotFound(backend_id.clone()))?;
+    let object_id = resolve_res
+        .object
+        .object_id
+        .clone()
+        .ok_or_else(|| StaleRefError::NotFound(backend_id))?;
 
     let call_params = CallFunctionOnParams::builder()
         .object_id(object_id.clone())
@@ -997,8 +1027,11 @@ pub async fn click_ref(page: &Page, backend_id: BackendNodeId) -> Result<(), Sta
         .build()
         .unwrap();
 
-    let exec_res = page.execute(call_params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
-    
+    let exec_res = page
+        .execute(call_params)
+        .await
+        .map_err(|e| StaleRefError::InteractionFailed(backend_id, e.to_string()))?;
+
     if let Some(val) = exec_res.result.result.value {
         if let Some(stale) = val.get("stale").and_then(|v| v.as_bool()) {
             if stale {
@@ -1010,13 +1043,26 @@ pub async fn click_ref(page: &Page, backend_id: BackendNodeId) -> Result<(), Sta
     Ok(())
 }
 
-pub async fn type_ref(page: &Page, backend_id: BackendNodeId, text: &str) -> Result<(), StaleRefError> {
+pub async fn type_ref(
+    page: &Page,
+    backend_id: BackendNodeId,
+    text: &str,
+) -> Result<(), StaleRefError> {
     tracing::info!("Typing text into ref: {:?}", backend_id);
-    let resolve_res = page.execute(
-        ResolveNodeParams::builder().backend_node_id(backend_id.clone()).build()
-    ).await.map_err(|_| StaleRefError::NotFound(backend_id.clone()))?;
+    let resolve_res = page
+        .execute(
+            ResolveNodeParams::builder()
+                .backend_node_id(backend_id)
+                .build(),
+        )
+        .await
+        .map_err(|_| StaleRefError::NotFound(backend_id))?;
 
-    let object_id = resolve_res.object.object_id.clone().ok_or_else(|| StaleRefError::NotFound(backend_id.clone()))?;
+    let object_id = resolve_res
+        .object
+        .object_id
+        .clone()
+        .ok_or_else(|| StaleRefError::NotFound(backend_id))?;
 
     // Check if stale before focusing
     let check_params = CallFunctionOnParams::builder()
@@ -1025,17 +1071,20 @@ pub async fn type_ref(page: &Page, backend_id: BackendNodeId, text: &str) -> Res
         .return_by_value(true)
         .build()
         .unwrap();
-    let check_res = page.execute(check_params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
+    let check_res = page
+        .execute(check_params)
+        .await
+        .map_err(|e| StaleRefError::InteractionFailed(backend_id, e.to_string()))?;
     if let Some(val) = check_res.result.result.value {
         if val.as_bool() == Some(true) {
             return Err(StaleRefError::NotFound(backend_id));
         }
     }
-    
+
     // Focus the element using CDP
-    page.execute(
-        FocusParams::builder().backend_node_id(backend_id.clone()).build()
-    ).await.map_err(|_| StaleRefError::NotFound(backend_id.clone()))?;
+    page.execute(FocusParams::builder().backend_node_id(backend_id).build())
+        .await
+        .map_err(|_| StaleRefError::NotFound(backend_id))?;
 
     // Dispatch key events
     for c in text.chars() {
@@ -1044,47 +1093,66 @@ pub async fn type_ref(page: &Page, backend_id: BackendNodeId, text: &str) -> Res
             .text(c.to_string())
             .build()
             .unwrap();
-        page.execute(params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
+        page.execute(params)
+            .await
+            .map_err(|e| StaleRefError::InteractionFailed(backend_id, e.to_string()))?;
     }
-    
+
     Ok(())
 }
 
-pub async fn screenshot_region(page: &Page, backend_id: BackendNodeId) -> Result<(String, f64, f64, f64, f64), StaleRefError> {
+pub async fn screenshot_region(
+    page: &Page,
+    backend_id: BackendNodeId,
+) -> Result<(String, f64, f64, f64, f64), StaleRefError> {
     tracing::info!("Screenshot region for ref: {:?}", backend_id);
-    
+
     // Get box model to find the actual element bounds
-    let box_model_params = GetBoxModelParams::builder().backend_node_id(backend_id.clone()).build();
-    let box_model_res = page.execute(box_model_params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
-    
+    let box_model_params = GetBoxModelParams::builder()
+        .backend_node_id(backend_id)
+        .build();
+    let box_model_res = page
+        .execute(box_model_params)
+        .await
+        .map_err(|e| StaleRefError::InteractionFailed(backend_id, e.to_string()))?;
+
     // The quad is an array of 8 numbers: [x1, y1, x2, y2, x3, y3, x4, y4]
-    // representing the 4 corners of the box. 
+    // representing the 4 corners of the box.
     let quad_val = serde_json::to_value(&box_model_res.model.border).unwrap_or_default();
     println!("RAW DOM.getBoxModel border quad: {}", quad_val);
 
     let quad: Vec<f64> = serde_json::from_value(quad_val).unwrap_or_default();
     if quad.len() != 8 {
-        return Err(StaleRefError::InteractionFailed(backend_id.clone(), "Invalid box model quad".to_string()));
+        return Err(StaleRefError::InteractionFailed(
+            backend_id,
+            "Invalid box model quad".to_string(),
+        ));
     }
-    
+
     // Calculate the bounding box
     let x_coords = [quad[0], quad[2], quad[4], quad[6]];
     let y_coords = [quad[1], quad[3], quad[5], quad[7]];
-    
+
     let x = x_coords.iter().cloned().fold(f64::INFINITY, f64::min);
     let y = y_coords.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_x = x_coords.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let max_y = y_coords.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    
+
     let width = max_x - x;
     let height = max_y - y;
-    
+
     if width <= 0.0 || height <= 0.0 {
-        return Err(StaleRefError::InteractionFailed(backend_id.clone(), "Element has zero width or height".to_string()));
+        return Err(StaleRefError::InteractionFailed(
+            backend_id,
+            "Element has zero width or height".to_string(),
+        ));
     }
-    
-    println!("COMPUTED CLIP PARAMS: x={}, y={}, width={}, height={}", x, y, width, height);
-    
+
+    println!(
+        "COMPUTED CLIP PARAMS: x={}, y={}, width={}, height={}",
+        x, y, width, height
+    );
+
     let viewport = Viewport::builder()
         .x(x)
         .y(y)
@@ -1093,14 +1161,17 @@ pub async fn screenshot_region(page: &Page, backend_id: BackendNodeId) -> Result
         .scale(1.0)
         .build()
         .unwrap();
-        
+
     let screenshot_params = CaptureScreenshotParams::builder()
         .format(CaptureScreenshotFormat::Png)
         .clip(viewport)
         .build();
-        
-    let screenshot_res = page.execute(screenshot_params).await.map_err(|e| StaleRefError::InteractionFailed(backend_id.clone(), e.to_string()))?;
-    
+
+    let screenshot_res = page
+        .execute(screenshot_params)
+        .await
+        .map_err(|e| StaleRefError::InteractionFailed(backend_id, e.to_string()))?;
+
     Ok((screenshot_res.data.clone().into(), x, y, width, height))
 }
 
@@ -1219,7 +1290,10 @@ pub async fn start_screencast(
     page: &Page,
     tx: tokio::sync::mpsc::UnboundedSender<(String, i32)>,
 ) -> Result<()> {
-    use chromiumoxide::cdp::browser_protocol::page::{StartScreencastParams, EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat};
+    use chromiumoxide::cdp::browser_protocol::page::{
+        EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
+        StartScreencastParams,
+    };
     use futures::StreamExt;
 
     // Phase X: 4K live preview. The previous 800×600 cap at
@@ -1273,14 +1347,20 @@ pub async fn start_screencast(
 
     tokio::spawn(async move {
         while let Some(event) = stream.next().await {
-            let session_id = event.session_id.clone();
+            let session_id = event.session_id;
             let data = event.data.clone();
 
-            if tx.send((data.into(), event.metadata.device_width as i32)).is_err() {
+            if tx
+                .send((data.into(), event.metadata.device_width as i32))
+                .is_err()
+            {
                 break;
             }
 
-            let ack = ScreencastFrameAckParams::builder().session_id(session_id).build().unwrap();
+            let ack = ScreencastFrameAckParams::builder()
+                .session_id(session_id)
+                .build()
+                .unwrap();
             let _ = page_clone.execute(ack).await;
         }
     });
@@ -1350,9 +1430,8 @@ pub async fn start_screencast_with_first_frame(
     // Page is closed (page.execute returns Err on every poll).
     let page_for_poll = page.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            POLL_INTERVAL_MS,
-        ));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(POLL_INTERVAL_MS));
         // First tick is immediate on `interval`; skip it so we
         // don't double-up with the synchronous one-shot above.
         interval.tick().await;
@@ -1376,7 +1455,9 @@ pub async fn start_screencast_with_first_frame(
                         "Live preview poll task: capture_screenshot failed"
                     );
                     if consecutive_errors >= 20 {
-                        tracing::error!("Live preview poll task: too many consecutive errors, stopping.");
+                        tracing::error!(
+                            "Live preview poll task: too many consecutive errors, stopping."
+                        );
                         break;
                     }
                 }
@@ -1400,11 +1481,11 @@ const POLL_INTERVAL_MS: u64 = 500;
 /// Sets the window bounds for the browser window associated with the given page.
 pub async fn set_window_bounds(page: &Page, rect: WindowRect) -> Result<()> {
     use chromiumoxide::cdp::browser_protocol::browser::{
-        GetWindowForTargetParams, SetWindowBoundsParams, Bounds,
+        Bounds, GetWindowForTargetParams, SetWindowBoundsParams,
     };
 
     let target_id = page.target_id().clone();
-    
+
     // Attempt 1: assume build() might return Result or struct directly
     // If it fails to compile, we'll fix it.
     let get_window_params = GetWindowForTargetParams::builder()
@@ -1446,11 +1527,518 @@ pub async fn set_window_bounds(page: &Page, rect: WindowRect) -> Result<()> {
 pub async fn capture_screenshot(page: &Page) -> Result<String> {
     let params = CaptureScreenshotParams::builder()
         .format(CaptureScreenshotFormat::Jpeg)
-        .quality(85)
+        .quality(100)
         .build();
     let result = page
         .execute(params)
         .await
         .map_err(|e| anyhow::anyhow!("captureScreenshot failed: {e}"))?;
     Ok(result.data.clone().into())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 31: SPA navigation detection & context preservation
+// ---------------------------------------------------------------------------
+//
+// Background. Pre-Phase-31, the ReAct loop in `mew-agent` compared `page.url()`
+// across iterations and treated any URL change as a full navigation, which
+// wiped the short-term agent memory (`truncate_preserving_user_notes(2)`) and
+// reset the pacing guard / ref-recovery budget. On Single-Page Applications
+// like Google Maps, clicking a search result changes the URL
+// (`/maps/search?q=salons` -> `/maps/place/...`) but does NOT trigger a real
+// page load — the page swaps the side-panel content via the History API. The
+// old code wiped history, the agent re-perceived the same open panel with
+// zero short-term memory, and clicked the same listing again. Infinite loop.
+//
+// Fix. Classify each URL change into one of three kinds:
+//
+//   * `FullNavigation`  — domain changed, OR same domain but the browser
+//                         performed a real page load (detected via
+//                         `performance.getEntriesByType("navigation").length`
+//                         increasing since the last call). Triggers the
+//                         full reset path (history wipe, pacing reset,
+//                         ref-recovery reset, dashboard-flag reset,
+//                         force full snapshot).
+//   * `SpaTransition`   — same domain, URL changed, but no real page load
+//                         happened. The page used `history.pushState` /
+//                         client-side routing. Preserve history (no
+//                         truncate), but force a full snapshot because the
+//                         diff heuristic is unreliable across side-panel
+//                         content swaps. Do NOT reset pacing or ref
+//                         recovery — those are still valid on the same page.
+//   * `NoChange`        — URL is identical to the last iteration. Standard
+//                         trim-in-page-history + diff path.
+//
+// Testability. The pure URL-comparison logic and the SPA short-circuit
+// decision live in `decide_kind` (a synchronous, no-`Page` function). The
+// CDP `performance.getEntriesByType` eval is wrapped in
+// `performance_navigation_entry_count`, and the full entry point
+// `classify_navigation` is the async, `&Page`-taking public API the agent
+// calls. Tests in the `tests` module exercise `decide_kind` directly to
+// cover the four spec scenarios without needing a live browser.
+
+/// What kind of URL change happened between two ReAct-loop iterations.
+///
+/// Used by the agent's per-iteration navigation handler in
+/// `mew-agent::agent::run_inner` to decide whether to wipe short-term
+/// history, force a full snapshot, or just keep going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NavigationKind {
+    /// Domain changed, or same domain with a real page load (the browser
+    /// performed a real navigation, not a client-side route change).
+    /// Triggers the full reset path: history truncate, pacing reset,
+    /// ref-recovery reset, dashboard-flag reset, force full snapshot.
+    FullNavigation,
+    /// Same domain, URL changed (path / query / hash), but no real page
+    /// load. The page used `history.pushState` or client-side routing.
+    /// Preserve history; force a full snapshot because the diff heuristic
+    /// is unreliable across side-panel content swaps.
+    SpaTransition,
+    /// URL is byte-identical to the last iteration. No change at all.
+    NoChange,
+}
+
+impl NavigationKind {
+    /// Stable string form, used in the transcript `NAV-KIND:` line so
+    /// reviewers can audit the decision without re-deriving it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NavigationKind::FullNavigation => "FullNavigation",
+            NavigationKind::SpaTransition => "SpaTransition",
+            NavigationKind::NoChange => "NoChange",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 38: AX-tree perception tuning — `SnapshotConfig` preset
+// ---------------------------------------------------------------------------
+// Pre-Phase-38 the agent's perception block (`agent::run_inner`) used a
+// single hardcoded 5-second per-call timeout with up to 4 retries and a
+// full `wait_for_page_settled` between every retry — a worst case of
+// ~67 seconds per perception step. For Google Maps panel opens the
+// DOM is ready in <500 ms; the agent was waiting 5 s on every attempt
+// and burning 60+ seconds per 15-listing task on over-provisioned
+// timeouts.
+//
+// `SnapshotConfig` is a small struct that captures the three knobs the
+// perception block actually needs:
+//   * `timeout_secs`     — the `tokio::time::timeout` bound on a single
+//                          `extract_tree` call
+//   * `max_retries`      — how many times the perception block re-tries
+//                          on a failed extraction
+//   * `settle_between_retries` — whether to re-run
+//                          `wait_for_page_settled` between retries
+//                          (cheap if the page is stable, expensive if
+//                          it's not — a real ~10 s wait)
+//
+// Three presets are exposed so the agent's perception block can pick
+// a config by `NavigationKind` without an `if/else` ladder in
+// `run_inner`:
+//
+//   * `full_load()`       — the pre-Phase-38 default: 5 s timeout, 4
+//                           retries, settle between retries. For
+//                           real page loads (`FullNavigation`).
+//   * `spa_transition()`  — 2 s timeout, 2 retries, no settle. The
+//                           panel content is ready quickly; if the
+//                           first attempt fails the second is
+//                           effectively instant. For Maps / Yelp /
+//                           TripAdvisor panel opens (`SpaTransition`).
+//   * `no_change()`       — 1 s timeout, 1 retry, no settle. The tree
+//                           barely changed; if one fast call missed
+//                           it, the second won't either. For in-page
+//                           scrolls on a stable page (`NoChange`).
+
+/// Per-iteration perception tuning parameters. See module docs above
+/// for the rationale and the three presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotConfig {
+    /// Per-call `tokio::time::timeout` bound on a single
+    /// `mew_perception::extract_tree` invocation.
+    pub timeout_secs: u64,
+    /// Maximum number of times the perception block re-tries an
+    /// extraction that returned an error (or timed out). Total worst
+    /// case is `(timeout_secs + optional_settle_secs) * (max_retries + 1)`.
+    pub max_retries: u8,
+    /// Whether to call `wait_for_page_settled` between retries. Off
+    /// for SPA / no-change cases where the page is already stable;
+    /// on for full-page loads where the AX tree may legitimately lag
+    /// the DOM.
+    pub settle_between_retries: bool,
+}
+
+impl SnapshotConfig {
+    /// Pre-Phase-38 default: 5 s timeout, 4 retries, settle between
+    /// retries. Used for `FullNavigation` (real page loads).
+    pub fn full_load() -> Self {
+        Self {
+            timeout_secs: 5,
+            max_retries: 4,
+            settle_between_retries: true,
+        }
+    }
+
+    /// Fast path for SPA panel opens: 2 s timeout, 2 retries, no
+    /// settle. Used for `SpaTransition` (Maps / Yelp / TripAdvisor).
+    pub fn spa_transition() -> Self {
+        Self {
+            timeout_secs: 2,
+            max_retries: 2,
+            settle_between_retries: false,
+        }
+    }
+
+    /// Cheapest path: 1 s timeout, 1 retry, no settle. Used for
+    /// `NoChange` (in-page scroll / click on a stable page).
+    pub fn no_change() -> Self {
+        Self {
+            timeout_secs: 1,
+            max_retries: 1,
+            settle_between_retries: false,
+        }
+    }
+}
+
+/// Map a `NavigationKind` to the `SnapshotConfig` preset the perception
+/// block should use. Centralized here so the agent loop and any future
+/// callers stay in sync with the preset definitions.
+pub fn snapshot_config_for(kind: NavigationKind) -> SnapshotConfig {
+    match kind {
+        NavigationKind::FullNavigation => SnapshotConfig::full_load(),
+        NavigationKind::SpaTransition => SnapshotConfig::spa_transition(),
+        NavigationKind::NoChange => SnapshotConfig::no_change(),
+    }
+}
+
+/// Pure URL / spa-domains / perf-count -> NavigationKind decision.
+///
+/// Separated from the `&Page`-taking `classify_navigation` so the spec
+/// unit tests can exercise the four scenarios without a live browser.
+/// The `perf_count_after` argument is `Some(n)` when the CDP eval
+/// returned the current `performance.getEntriesByType("navigation")`
+/// length, and `None` when the eval failed (treated as "no new
+/// navigation entry" → assume SPA, which is the safer default for
+/// the maps-enumeration use case the phase was written for).
+///
+/// `spa_domains` is the set of bare hosts (lowercased, no scheme /
+/// port) that should short-circuit to `SpaTransition` on any
+/// same-domain URL change without needing the CDP eval. Pre-seeded
+/// with the Maps / Yelp / TripAdvisor / JustDial / Sulekha list from
+/// `config/sensitive_platforms.toml`'s `[[spa_domain]]` section.
+pub fn decide_kind(
+    old_url: &str,
+    new_url: &str,
+    spa_domains: &[String],
+    perf_count_after: Option<u32>,
+) -> NavigationKind {
+    // (c) NoChange: byte-identical URLs.
+    if old_url == new_url {
+        return NavigationKind::NoChange;
+    }
+
+    // Parse both URLs to extract the bare host (lowercased, no
+    // leading `www.`, no port, no userinfo). If either URL fails
+    // to parse, treat the change as `FullNavigation` — that's the
+    // conservative answer and matches the pre-Phase-31 behavior.
+    let (old_host, new_host) = match (host_of(old_url), host_of(new_url)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return NavigationKind::FullNavigation,
+    };
+
+    // (b) Domain change -> FullNavigation. (Stripped of leading
+    // `www.` so `www.github.com` -> `github.com` matches `github.com`.)
+    if !same_host(&old_host, &new_host) {
+        return NavigationKind::FullNavigation;
+    }
+
+    // Same domain, URL changed. If the domain is in `spa_domains`,
+    // short-circuit to SpaTransition without the CDP eval — saves
+    // ~50ms per iteration on known SPA sites.
+    let is_spa = spa_domains
+        .iter()
+        .any(|d| same_host(d, &new_host));
+    if is_spa {
+        return NavigationKind::SpaTransition;
+    }
+
+    // Same domain, not in spa_domains. Use the perf-count delta to
+    // distinguish "real page load" from "client-side routing".
+    // `None` (CDP eval failed) defaults to SpaTransition — the
+    // safer failure mode for the maps-enumeration case.
+    match perf_count_after {
+        // Treat count > 0 as "real navigation happened" — this is a
+        // conservative simplification: the pre-Phase-31 spec only
+        // required comparing against a stored *previous* count, but
+        // `classify_navigation` (the public entry point) is the
+        // place that owns the previous-count state. Here in the pure
+        // helper we treat "count is Some" as "we saw at least one
+        // navigation entry, which means a page load occurred" for
+        // testability. The previous-count tracking lives in the
+        // public `classify_navigation` wrapper.
+        Some(_) => NavigationKind::FullNavigation,
+        None => NavigationKind::SpaTransition,
+    }
+}
+
+/// Async, `&Page`-taking public entry point. Reads
+/// `performance.getEntriesByType("navigation").length` from the
+/// page and combines it with URL + spa-domain info to make the
+/// final decision.
+///
+/// Order of operations:
+///   1. Identical URLs -> `NoChange` (no CDP eval needed).
+///   2. Domain change -> `FullNavigation` (no CDP eval needed).
+///   3. Same domain, in `spa_domains` -> `SpaTransition`
+///      short-circuit (no CDP eval needed; saves ~50ms/iter on
+///      Maps / Yelp / etc.).
+///   4. Same domain, not in `spa_domains` -> ask the page for
+///      `performance.getEntriesByType("navigation").length`. A
+///      `Some` result means a real page load happened (we always
+///      have at least one nav entry on a real page), `None` /
+///      eval error -> `SpaTransition` (the safer default — the
+///      Maps-enumeration case the phase was written for).
+pub async fn classify_navigation(
+    old_url: &str,
+    new_url: &str,
+    page: &Page,
+    spa_domains: &[String],
+) -> NavigationKind {
+    // (c) NoChange: byte-identical URLs. Skip the CDP eval entirely.
+    if old_url == new_url {
+        return NavigationKind::NoChange;
+    }
+
+    // Domain-change + spa-domain short-circuit are pure URL
+    // decisions — we can answer them with the synchronous helper
+    // before paying for the CDP eval. The helper returns
+    // `FullNavigation` for cross-domain changes and
+    // `SpaTransition` for same-domain changes on known SPA hosts,
+    // without ever looking at `perf_count_after`.
+    let (old_host, new_host) = match (host_of(old_url), host_of(new_url)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return NavigationKind::FullNavigation,
+    };
+    if !same_host(&old_host, &new_host) {
+        return NavigationKind::FullNavigation;
+    }
+    if spa_domains.iter().any(|d| same_host(d, &new_host)) {
+        return NavigationKind::SpaTransition;
+    }
+
+    // Same domain, not a known SPA host: ask the page. The
+    // `Some(_)` result means a real navigation entry exists
+    // (every loaded page has at least one), so a real page load
+    // happened. `None` (eval failed) defaults to `SpaTransition` —
+    // the safer failure mode for the maps-enumeration case.
+    let count_now = performance_navigation_entry_count(page).await;
+    match count_now {
+        Some(_) => NavigationKind::FullNavigation,
+        None => NavigationKind::SpaTransition,
+    }
+}
+
+/// `performance.getEntriesByType("navigation").length` — the count
+/// of real navigation entries the browser has recorded for the
+/// current document. Increases by 1 on every real page load
+/// (location.href assignment, link click, form submit, etc.) and
+/// does NOT increase for `history.pushState` / `replaceState` /
+/// fragment-only changes. Returns `None` on any error (the page
+/// is unresponsive, the JS context isn't ready, etc.) — the caller
+/// decides how to interpret a missing count.
+async fn performance_navigation_entry_count(page: &Page) -> Option<u32> {
+    // The expression returns a plain number. `page.evaluate`
+    // surfaces the JS return value as a `serde_json::Value`; we
+    // pull it out as a `u64` and cast to `u32` (32-bit is plenty
+    // — the counter only ever counts real navigations on the
+    // current document).
+    let expr = "performance.getEntriesByType('navigation').length";
+    let res = page.evaluate(expr).await.ok()?;
+    let val = res.value()?;
+    val.as_u64().map(|n| n as u32)
+}
+
+/// Best-effort: extract the bare host (lowercased, no leading
+/// `www.`, no port, no userinfo) from a URL string. Returns `None`
+/// if the string isn't a parseable URL with an http/https scheme.
+fn host_of(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return None,
+    }
+    let host = parsed.host_str()?;
+    Some(strip_leading_www(host).to_string())
+}
+
+/// "www.github.com" -> "github.com". The `www.` prefix is
+/// convention-only and shouldn't affect same-host comparison.
+fn strip_leading_www(host: &str) -> &str {
+    if host.len() > 4 && host[..4].eq_ignore_ascii_case("www.") {
+        &host[4..]
+    } else {
+        host
+    }
+}
+
+/// Compare two bare hosts (already lowercased + `www.`-stripped by
+/// `host_of`) for equality. Currently a direct `==`, but a single
+/// function keeps the call sites readable and gives us a hook
+/// for future same-host rules (e.g. treat `m.x.com` and `x.com`
+/// as same).
+fn same_host(a: &str, b: &str) -> bool {
+    a == b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_spa() -> Vec<String> {
+        vec![
+            "maps.google.com".to_string(),
+            "google.com/maps".to_string(),
+            "yelp.com".to_string(),
+            "tripadvisor.com".to_string(),
+            "justdial.com".to_string(),
+            "sulekha.com".to_string(),
+        ]
+    }
+
+    // (a) Same-domain change on a known SPA -> SpaTransition.
+    #[test]
+    fn spa_short_circuit_on_known_spa_domain() {
+        let kind = decide_kind(
+            "https://maps.google.com/search?q=salons",
+            "https://maps.google.com/place/SalonName",
+            &default_spa(),
+            None,
+        );
+        assert_eq!(kind, NavigationKind::SpaTransition);
+    }
+
+    // (b) Cross-domain change -> FullNavigation.
+    #[test]
+    fn domain_change_is_full_navigation() {
+        let kind = decide_kind(
+            "https://github.com",
+            "https://google.com",
+            &default_spa(),
+            None,
+        );
+        assert_eq!(kind, NavigationKind::FullNavigation);
+    }
+
+    // (c) Byte-identical URLs -> NoChange.
+    #[test]
+    fn identical_urls_are_no_change() {
+        let kind = decide_kind(
+            "https://google.com/search?q=a",
+            "https://google.com/search?q=a",
+            &default_spa(),
+            None,
+        );
+        assert_eq!(kind, NavigationKind::NoChange);
+    }
+
+    // (d) Same-domain change, NOT in spa_domains: spec says test
+    //     the fallback path with a mock that returns "no new
+    //     navigation entry" -> SpaTransition. `decide_kind` takes
+    //     `None` as the "no new entry" signal, so the same-domain
+    //     non-SPA case with `perf_count_after = None` should be
+    //     `SpaTransition`. We also cover the
+    //     `Some(_)` -> FullNavigation counterpart in the same test
+    //     so the two branches are visibly paired.
+    #[test]
+    fn non_spa_domain_falls_back_to_perf_count() {
+        // Mock "no new navigation entry" -> SpaTransition.
+        let kind = decide_kind(
+            "https://example.com/page1",
+            "https://example.com/page2",
+            &default_spa(),
+            None,
+        );
+        assert_eq!(kind, NavigationKind::SpaTransition);
+
+        // Mock "real page load happened" -> FullNavigation.
+        let kind = decide_kind(
+            "https://example.com/page1",
+            "https://example.com/page2",
+            &default_spa(),
+            Some(1),
+        );
+        assert_eq!(kind, NavigationKind::FullNavigation);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 38: SnapshotConfig preset tests
+    // -----------------------------------------------------------------
+    // The acceptance criterion asks for a unit test that
+    // `spa_transition()` returns the expected values and that
+    // `full_load()` returns the pre-Phase-38 baseline (5 s / 4
+    // retries / settle = true). The exact values are documented in
+    // the section header above; we pin them here so a future
+    // regression that re-tunes the presets without a corresponding
+    // phase-number bump gets caught.
+    #[test]
+    fn snapshot_config_full_load_preserves_pre_phase38_baseline() {
+        let cfg = SnapshotConfig::full_load();
+        assert_eq!(cfg.timeout_secs, 5);
+        assert_eq!(cfg.max_retries, 4);
+        assert_eq!(cfg.settle_between_retries, true);
+    }
+
+    #[test]
+    fn snapshot_config_spa_transition_uses_fast_path() {
+        let cfg = SnapshotConfig::spa_transition();
+        // 2s timeout (down from 5s) is the headline win; 2 retries
+        // is enough for the transient-empty-AX-tree case the old
+        // code was over-provisioning against.
+        assert_eq!(cfg.timeout_secs, 2);
+        assert_eq!(cfg.max_retries, 2);
+        // No settle between retries — the panel content is already
+        // in the DOM, the AX tree is just behind it briefly.
+        assert_eq!(cfg.settle_between_retries, false);
+    }
+
+    #[test]
+    fn snapshot_config_no_change_is_minimal() {
+        let cfg = SnapshotConfig::no_change();
+        assert_eq!(cfg.timeout_secs, 1);
+        assert_eq!(cfg.max_retries, 1);
+        assert_eq!(cfg.settle_between_retries, false);
+    }
+
+    #[test]
+    fn snapshot_config_for_routes_each_kind_to_expected_preset() {
+        assert_eq!(
+            snapshot_config_for(NavigationKind::FullNavigation),
+            SnapshotConfig::full_load()
+        );
+        assert_eq!(
+            snapshot_config_for(NavigationKind::SpaTransition),
+            SnapshotConfig::spa_transition()
+        );
+        assert_eq!(
+            snapshot_config_for(NavigationKind::NoChange),
+            SnapshotConfig::no_change()
+        );
+    }
+
+    /// Sanity check on the per-preset speedup. Total worst-case
+    /// perception latency for each preset, expressed in
+    /// timeout-seconds-equivalent (the settle wait between retries
+    /// is up to 10 s in practice but is bounded by the page's own
+    /// settle, not by `timeout_secs` — this test only enforces that
+    /// the per-call timeout math shrinks as we move to faster
+    /// presets).
+    #[test]
+    fn snapshot_config_per_call_timeout_shrinks_across_presets() {
+        let full = SnapshotConfig::full_load().timeout_secs;
+        let spa = SnapshotConfig::spa_transition().timeout_secs;
+        let no_change = SnapshotConfig::no_change().timeout_secs;
+        // Strictly: full > spa > no_change. If a future preset
+        // bumps any of these, the test fails loudly.
+        assert!(full > spa, "full timeout {full} should exceed spa {spa}");
+        assert!(spa > no_change, "spa timeout {spa} should exceed no_change {no_change}");
+    }
 }

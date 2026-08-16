@@ -64,7 +64,10 @@ fn typical_5_step() -> Vec<MockAction> {
     vec![
         MockAction::Navigate("https://example.com".to_string()),
         MockAction::Click("@e1".to_string()),
-        MockAction::Type { ref_id: "@e2".to_string(), text: "hello".to_string() },
+        MockAction::Type {
+            ref_id: "@e2".to_string(),
+            text: "hello".to_string(),
+        },
         MockAction::Click("@e3".to_string()),
         MockAction::Finish("done".to_string()),
     ]
@@ -128,7 +131,8 @@ impl Driver {
         // "Call LLM" (mock) and record the action.
         let label = action.label();
         self.actions_taken.push(label.clone());
-        self.iter_log.push((iter, label.clone(), prompt_user_count, active));
+        self.iter_log
+            .push((iter, label.clone(), prompt_user_count, active));
 
         // Append the assistant's "tool call" announcement as a plain
         // transcript line via the agent's USER: helper is not the
@@ -154,7 +158,10 @@ fn make_test_config() -> mew_agent::ProviderConfig {
             max_tokens: None,
             max_cost: None,
         },
-        browser: Some(BrowserConfig { binary_path: None, visible_cursor: false }),
+        browser: Some(BrowserConfig {
+            binary_path: None,
+            visible_cursor: false,
+        }),
         agent: AgentConfig::default(),
     }
 }
@@ -182,9 +189,11 @@ async fn evidence_1_and_2_mid_task_injection() -> anyhow::Result<()> {
     let tx2 = tx.clone();
     let injection = tokio::spawn(async move {
         sleep(Duration::from_millis(60)).await;
-        tx2.send(UserMessage::now("also open a new tab and check the weather"))
-            .await
-            .unwrap();
+        tx2.send(UserMessage::now(
+            "also open a new tab and check the weather",
+        ))
+        .await
+        .unwrap();
     });
 
     let mut driver = Driver::new(agent);
@@ -219,11 +228,22 @@ async fn evidence_1_and_2_mid_task_injection() -> anyhow::Result<()> {
         .iter()
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
         .filter(|c| c.starts_with("[user note while task is running]"))
-        .map(|c| c.trim_start_matches("[user note while task is running] ").to_string())
+        .map(|c| {
+            c.trim_start_matches("[user note while task is running] ")
+                .to_string()
+        })
         .collect();
-    assert_eq!(notes.len(), 1, "expected exactly 1 user note in history, got {:?}", notes);
+    assert_eq!(
+        notes.len(),
+        1,
+        "expected exactly 1 user note in history, got {:?}",
+        notes
+    );
     assert!(notes[0].contains("also open a new tab and check the weather"));
-    println!("  CHECKBOX 1.a PASS: injected note '{}' present in history", notes[0]);
+    println!(
+        "  CHECKBOX 1.a PASS: injected note '{}' present in history",
+        notes[0]
+    );
 
     // CHECKBOX 1.b: original task preserved.
     let has_original = history.iter().any(|m| {
@@ -239,14 +259,20 @@ async fn evidence_1_and_2_mid_task_injection() -> anyhow::Result<()> {
         .iter()
         .map(|a| a.split('(').next().unwrap_or("?"))
         .collect();
-    assert_eq!(actions, vec!["navigate", "click", "type", "click", "finish"]);
+    assert_eq!(
+        actions,
+        vec!["navigate", "click", "type", "click", "finish"]
+    );
     println!("  CHECKBOX 1.c PASS: full plan executed, no restart");
 
     // CHECKBOX 2: progress preserved. The action at iter 2 is the
     // 2nd plan step (`click(@e1)`), NOT a restart back to `navigate`.
     // A restart would show `navigate` again at iter 2.
     let iter2 = driver.iter_log.iter().find(|(i, _, _, _)| *i == 2).unwrap();
-    assert_eq!(iter2.1, "click(@e1)", "iter 2 should be the 2nd plan step (click), not a restart");
+    assert_eq!(
+        iter2.1, "click(@e1)",
+        "iter 2 should be the 2nd plan step (click), not a restart"
+    );
     // Also: the iter_log should show iter 1 was navigate and iter 2
     // was click — i.e. the plan continued past the injection, not
     // restarted. We already proved the full sequence above, so this
@@ -269,7 +295,9 @@ async fn evidence_1_and_2_mid_task_injection() -> anyhow::Result<()> {
         // collisions.
         let injection_lines: Vec<&str> = content
             .lines()
-            .filter(|l| l.contains("USER:") && l.contains("also open a new tab and check the weather"))
+            .filter(|l| {
+                l.contains("USER:") && l.contains("also open a new tab and check the weather")
+            })
             .collect();
         assert_eq!(
             injection_lines.len(),
@@ -282,7 +310,10 @@ async fn evidence_1_and_2_mid_task_injection() -> anyhow::Result<()> {
         println!("    transcript: {}", transcript_path.display());
         println!("    matching line: {}", injection_lines[0]);
     } else {
-        println!("  (no transcript file at {} — log path issue)", transcript_path.display());
+        println!(
+            "  (no transcript file at {} — log path issue)",
+            transcript_path.display()
+        );
     }
 
     Ok(())
@@ -312,15 +343,23 @@ async fn evidence_3_mid_task_correction() -> anyhow::Result<()> {
     assert_eq!(driver.noop_drain_count, 3);
 
     // Inject correction.
-    tx.send(UserMessage::now("no, use my other account")).await.unwrap();
+    tx.send(UserMessage::now("no, use my other account"))
+        .await
+        .unwrap();
 
     // Iter 4. Drain should be active. Prompt user-msg count > before.
     let pre_iter4 = driver.count_user_msgs();
     driver.step(4, plan[3].clone())?;
     let post_iter4 = driver.count_user_msgs();
 
-    assert!(post_iter4 > pre_iter4, "iter 4 prompt should have grown by at least 1 (the correction)");
-    assert_eq!(driver.active_drain_count, 1, "exactly 1 active drain (the correction)");
+    assert!(
+        post_iter4 > pre_iter4,
+        "iter 4 prompt should have grown by at least 1 (the correction)"
+    );
+    assert_eq!(
+        driver.active_drain_count, 1,
+        "exactly 1 active drain (the correction)"
+    );
 
     // Confirm the correction is the most recent user message in the
     // history (it would be seen by the LLM in the next prompt).
@@ -331,7 +370,10 @@ async fn evidence_3_mid_task_correction() -> anyhow::Result<()> {
         .find(|c| c.contains("no, use my other account"))
         .map(|s| s.to_string());
     assert!(correction.is_some(), "correction must be in history");
-    println!("  CHECKBOX 3 PASS: correction '{}' in history and visible to iter 4's prompt", correction.unwrap());
+    println!(
+        "  CHECKBOX 3 PASS: correction '{}' in history and visible to iter 4's prompt",
+        correction.unwrap()
+    );
 
     drop(tx);
     Ok(())
@@ -358,7 +400,10 @@ async fn evidence_4_burst_none_dropped() -> anyhow::Result<()> {
     driver.step(1, MockAction::Click("@e1".into()))?;
     drop(tx);
 
-    assert_eq!(driver.active_drain_count, 1, "exactly 1 active drain should have picked up all 4");
+    assert_eq!(
+        driver.active_drain_count, 1,
+        "exactly 1 active drain should have picked up all 4"
+    );
     assert_eq!(driver.noop_drain_count, 0);
 
     let history = driver.agent.history_snapshot();
@@ -366,10 +411,16 @@ async fn evidence_4_burst_none_dropped() -> anyhow::Result<()> {
         .iter()
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
         .filter(|c| c.starts_with("[user note while task is running]"))
-        .map(|c| c.trim_start_matches("[user note while task is running] ").to_string())
+        .map(|c| {
+            c.trim_start_matches("[user note while task is running] ")
+                .to_string()
+        })
         .collect();
     assert_eq!(notes, vec!["burst-1", "burst-2", "burst-3", "burst-4"]);
-    println!("  CHECKBOX 4.a PASS: 4 notes in history in order: {:?}", notes);
+    println!(
+        "  CHECKBOX 4.a PASS: 4 notes in history in order: {:?}",
+        notes
+    );
 
     // Read the real transcript file and verify the 4 USER: lines.
     // The session_id is generated from SystemTime::now().as_secs() in
@@ -404,7 +455,11 @@ async fn evidence_4_burst_none_dropped() -> anyhow::Result<()> {
     let mut last_idx = -1i64;
     for (i, line) in user_lines.iter().enumerate() {
         let idx = content.lines().position(|l| l == *line).unwrap() as i64;
-        assert!(idx > last_idx, "burst-{} should come after the previous burst line in the transcript", i + 1);
+        assert!(
+            idx > last_idx,
+            "burst-{} should come after the previous burst line in the transcript",
+            i + 1
+        );
         last_idx = idx;
     }
     println!("  CHECKBOX 4.b PASS: 4 USER: lines in transcript file, in burst-1..burst-4 order:");
@@ -442,20 +497,38 @@ async fn evidence_5_long_no_input_noop() -> anyhow::Result<()> {
         per_iter_us as f64
     );
 
-    assert_eq!(driver.noop_drain_count, 30, "every drain should be a no-op (30/30)");
-    assert_eq!(driver.active_drain_count, 0, "no drain should apply anything");
+    assert_eq!(
+        driver.noop_drain_count, 30,
+        "every drain should be a no-op (30/30)"
+    );
+    assert_eq!(
+        driver.active_drain_count, 0,
+        "no drain should apply anything"
+    );
     let history = driver.agent.history_snapshot();
     let notes: Vec<_> = history
         .iter()
-        .filter(|m| m.get("content").and_then(|c| c.as_str()).map(|c| c.starts_with("[user note while task is running]")).unwrap_or(false))
+        .filter(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .map(|c| c.starts_with("[user note while task is running]"))
+                .unwrap_or(false)
+        })
         .collect();
     assert!(notes.is_empty(), "no user notes should be in history");
     println!("  CHECKBOX 5.a PASS: 30/30 drains were no-ops, 0 active drains, 0 notes in history");
     // Per-iter overhead bound: well under 10ms/iter is fine for an
     // empty-drain; we don't enforce a hard number because CI jitter
     // is real, but print it for the record.
-    assert!(per_iter_us < 50_000, "per-iter overhead should be < 50ms, got {}us", per_iter_us);
-    println!("  CHECKBOX 5.b PASS: per-iter overhead bounded ({}us)", per_iter_us);
+    assert!(
+        per_iter_us < 50_000,
+        "per-iter overhead should be < 50ms, got {}us",
+        per_iter_us
+    );
+    println!(
+        "  CHECKBOX 5.b PASS: per-iter overhead bounded ({}us)",
+        per_iter_us
+    );
 
     Ok(())
 }

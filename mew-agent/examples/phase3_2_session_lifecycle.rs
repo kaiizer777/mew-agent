@@ -97,7 +97,11 @@ async fn run_browser_task_real(
 
     let (browser, page, handler_task, job) = mew_cdp::launch(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
-        config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
+        config
+            .browser
+            .as_ref()
+            .map(|b| b.visible_cursor)
+            .unwrap_or(false),
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to launch Chrome: {e}"))?;
@@ -114,14 +118,21 @@ async fn run_browser_task_real(
             tx: chat_tx,
         });
     }
-    println!("[ui-wiring] ActiveSession installed in slot, session_id={}", session_id);
+    println!(
+        "[ui-wiring] ActiveSession installed in slot, session_id={}",
+        session_id
+    );
 
     let result = agent.run(&page).await;
     let final_state = match &result {
         Ok(_) => "Done",
         Err(_) => "Failed",
     };
-    println!("[ui-wiring] agent.run returned Ok?={}, final_state={}", result.is_ok(), final_state);
+    println!(
+        "[ui-wiring] agent.run returned Ok?={}, final_state={}",
+        result.is_ok(),
+        final_state
+    );
 
     // Clear session on end so the next message goes back to classifier.
     {
@@ -161,7 +172,9 @@ async fn try_route_to_running_session(
         match session.tx.send(msg).await {
             Ok(()) => Ok(format!("[Routed to running agent] {}", text)),
             Err(_) => {
-                println!("[ui-wiring] Sender.send() returned Err — agent loop is dead. Clearing slot.");
+                println!(
+                    "[ui-wiring] Sender.send() returned Err — agent loop is dead. Clearing slot."
+                );
                 *lock = None;
                 Err("dead_session")
             }
@@ -175,15 +188,10 @@ async fn try_route_to_running_session(
 // Helper: read the on-disk transcript file and return its full contents.
 // ----------------------------------------------------------------------------
 fn read_transcript(session_id: &str) -> String {
-    let path = std::path::PathBuf::from("transcripts")
-        .join(format!("transcript_{}.log", session_id));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        format!(
-            "<could not read transcript at {}: {}>",
-            path.display(),
-            e
-        )
-    })
+    let path =
+        std::path::PathBuf::from("transcripts").join(format!("transcript_{}.log", session_id));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| format!("<could not read transcript at {}: {}>", path.display(), e))
 }
 
 // ----------------------------------------------------------------------------
@@ -195,12 +203,8 @@ async fn subtest_a_real_task(config: &ProviderConfig, slot: SessionSlot) -> anyh
     // Pick a deterministic but real task that won't trip the model's
     // completeness gate (single-item, no sub-action list needed).
     let task = "Navigate to https://example.com and report the main heading text.";
-    let (sid, final_state, history) = run_browser_task_real(
-        task.to_string(),
-        config.clone(),
-        slot.clone(),
-    )
-    .await?;
+    let (sid, final_state, history) =
+        run_browser_task_real(task.to_string(), config.clone(), slot.clone()).await?;
 
     println!("  session_id      : {}", sid);
     println!("  final state     : {}", final_state);
@@ -219,16 +223,30 @@ async fn subtest_a_real_task(config: &ProviderConfig, slot: SessionSlot) -> anyh
     let has_state_done = transcript.contains("-> Done (complete)")
         || transcript.contains("-> Failed (fail)")
         || transcript.contains("-> Stopped (stop)");
-    println!("  transcript: navigate_action_seen={}, started_running={}, terminal_state_seen={}",
-        has_navigate, has_state_running, has_state_done);
+    println!(
+        "  transcript: navigate_action_seen={}, started_running={}, terminal_state_seen={}",
+        has_navigate, has_state_running, has_state_done
+    );
 
-    assert!(has_navigate, "transcript should show a real navigate tool call");
-    assert!(has_state_running, "transcript should show STATE: -> Running transition");
-    assert!(has_state_done, "transcript should show a terminal state transition");
+    assert!(
+        has_navigate,
+        "transcript should show a real navigate tool call"
+    );
+    assert!(
+        has_state_running,
+        "transcript should show STATE: -> Running transition"
+    );
+    assert!(
+        has_state_done,
+        "transcript should show a terminal state transition"
+    );
 
     // Also check the slot was actually cleared.
     let slot_after = slot.lock().await;
-    assert!(slot_after.is_none(), "slot must be cleared after run_browser_task");
+    assert!(
+        slot_after.is_none(),
+        "slot must be cleared after run_browser_task"
+    );
     println!("  slot after run : None (cleared) ✓");
     drop(slot_after);
 
@@ -247,7 +265,8 @@ async fn subtest_b_mid_task_steering(
     println!("\n=== SUB-TEST B: mid-task message appended (headline) ===");
 
     let task = "Navigate to https://example.com and report the main heading text.";
-    let steering_text = "STEERING_FROM_UI_42: also tell me the page's <title> tag while you're at it";
+    let steering_text =
+        "STEERING_FROM_UI_42: also tell me the page's <title> tag while you're at it";
 
     // Spawn the agent task on a background task — this is the same shape
     // as `tauri::async_runtime::spawn` in lib.rs.
@@ -276,21 +295,33 @@ async fn subtest_b_mid_task_steering(
                     continue;
                 } else {
                     // dead_session while still in startup? that's a real bug.
-                    panic!("got dead_session while slot was supposed to be active: {}", e);
+                    panic!(
+                        "got dead_session while slot was supposed to be active: {}",
+                        e
+                    );
                 }
             }
         }
     }
-    assert!(pushed, "could not route steering message — slot never became active");
+    assert!(
+        pushed,
+        "could not route steering message — slot never became active"
+    );
     let steering_pushed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    println!("  [ui-wiring] steering message pushed at unix_secs={}", steering_pushed_at);
+    println!(
+        "  [ui-wiring] steering message pushed at unix_secs={}",
+        steering_pushed_at
+    );
 
     // Wait for the agent task to finish.
     let (sid, final_state, _history) = task_handle.await??;
-    println!("  agent task done: sid={}, final_state={}", sid, final_state);
+    println!(
+        "  agent task done: sid={}, final_state={}",
+        sid, final_state
+    );
 
     // CHECKBOX 1: the steered message is in the transcript file in order.
     let transcript = read_transcript(&sid);
@@ -326,7 +357,10 @@ async fn subtest_b_mid_task_steering(
     let transcript_has_chat_artifact = transcript.contains("CLASSIFY:")
         || transcript.contains("[Intent::Chat] for \"STEERING_FROM_UI_42")
         || transcript.contains("[Intent::BrowserTask] for \"STEERING_FROM_UI_42");
-    assert!(has_user_line, "steering message must be logged as USER: (live-chat), not as a classify result");
+    assert!(
+        has_user_line,
+        "steering message must be logged as USER: (live-chat), not as a classify result"
+    );
     assert!(
         !transcript_has_chat_artifact,
         "steering message must NOT show up as a classification result (would mean it was reclassified)"
@@ -356,7 +390,10 @@ async fn subtest_b_mid_task_steering(
 
     // CHECKBOX 5: slot is cleared at end.
     let slot_after = slot.lock().await;
-    assert!(slot_after.is_none(), "slot must be cleared after task ended");
+    assert!(
+        slot_after.is_none(),
+        "slot must be cleared after task ended"
+    );
     println!("  CHECKBOX B.5 PASS: slot cleared at end of session");
 
     Ok(())
@@ -373,12 +410,8 @@ async fn subtest_c_post_done_reclassify(
 
     // 1. Run a small real task to put the slot through its lifecycle.
     let task = "Navigate to https://example.com and report the main heading text.";
-    let (sid, final_state, _history) = run_browser_task_real(
-        task.to_string(),
-        config.clone(),
-        slot.clone(),
-    )
-    .await?;
+    let (sid, final_state, _history) =
+        run_browser_task_real(task.to_string(), config.clone(), slot.clone()).await?;
     println!("  task finished: sid={}, final_state={}", sid, final_state);
 
     // 2. Try to route a follow-up message via the same path. The slot
@@ -403,9 +436,12 @@ async fn subtest_c_post_done_reclassify(
     match intent {
         Intent::Chat(reply) => {
             println!("  CHECKBOX C.2 PASS: post-Done message classified as Intent::Chat");
-            println!("    reply: {}", &reply.chars().take(120).collect::<String>());
+            println!(
+                "    reply: {}",
+                &reply.chars().take(120).collect::<String>()
+            );
         }
-        Intent::BrowserTask(t) => {
+        Intent::BrowserTask { task: t, .. } => {
             // The reply could in principle be a browser task — but with
             // the prior turn having been a "thanks, that was quick"
             // follow-up, the model shouldn't escalate. We don't fail on
@@ -501,12 +537,8 @@ async fn subtest_e_sequential_sessions(
 
     // Session 1
     let task1 = "Navigate to https://example.com and report the main heading text.";
-    let (sid1, state1, _history1) = run_browser_task_real(
-        task1.to_string(),
-        config.clone(),
-        slot.clone(),
-    )
-    .await?;
+    let (sid1, state1, _history1) =
+        run_browser_task_real(task1.to_string(), config.clone(), slot.clone()).await?;
     println!("  session 1: sid={}, final_state={}", sid1, state1);
 
     // CHECKBOX: slot is cleared between sessions.
@@ -522,16 +554,15 @@ async fn subtest_e_sequential_sessions(
     // a different site, an allowlist-blocked fallback in the model could
     // pollute the second transcript and mask a real state-bleed bug.
     let task2 = "Navigate to https://example.com and report the page <title> tag.";
-    let (sid2, state2, _history2) = run_browser_task_real(
-        task2.to_string(),
-        config.clone(),
-        slot.clone(),
-    )
-    .await?;
+    let (sid2, state2, _history2) =
+        run_browser_task_real(task2.to_string(), config.clone(), slot.clone()).await?;
     println!("  session 2: sid={}, final_state={}", sid2, state2);
 
     // CHECKBOX: distinct session IDs.
-    assert_ne!(sid1, sid2, "session 2 must have a different session_id than session 1");
+    assert_ne!(
+        sid1, sid2,
+        "session 2 must have a different session_id than session 1"
+    );
     println!(
         "  CHECKBOX E.2 PASS: session ids are distinct ({} vs {})",
         sid1, sid2
@@ -560,7 +591,10 @@ async fn subtest_e_sequential_sessions(
     // CHECKBOX: slot is cleared at the end of session 2 too.
     {
         let lock = slot.lock().await;
-        assert!(lock.is_none(), "slot must be cleared at the end of session 2");
+        assert!(
+            lock.is_none(),
+            "slot must be cleared at the end of session 2"
+        );
         println!("  CHECKBOX E.4 PASS: slot cleared at end of session 2");
     }
 

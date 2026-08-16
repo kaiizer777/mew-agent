@@ -15,9 +15,7 @@
 //
 // Run with: `cargo run --example phase5_live_progress -p mew-agent`
 
-use mew_agent::summarizer::{
-    self, LiveProgress, ProgressKind, SummarizationConfig, Verbosity,
-};
+use mew_agent::summarizer::{self, LiveProgress, ProgressKind, SummarizationConfig, Verbosity};
 use mew_agent::{AgentConfig, OpencodeZenConfig, ProviderConfig};
 use serde_json::json;
 
@@ -30,25 +28,95 @@ async fn main() -> anyhow::Result<()> {
     let cases: &[(&str, serde_json::Value, &str, Verbosity)] = &[
         // (tool, args, result, verbosity) — `result` is the
         // simulated post-dispatch tool_result string.
-        ("navigate", json!({ "url": "https://www.instagram.com/explore/" }), "ok", Verbosity::Concise),
-        ("navigate", json!({ "url": "https://example.com/path?x=1" }), "ok", Verbosity::Detailed),
-        ("click",    json!({ "ref": "@e5" }), "Clicked successfully", Verbosity::Concise),
-        ("click",    json!({ "ref": "@e7" }), "Clicked successfully", Verbosity::Detailed),
-        ("type",     json!({ "ref": "@e4", "text": "hi alice" }), "ok", Verbosity::Concise),
-        ("type",     json!({ "ref": "@e4", "text": "x".repeat(200) }), "ok", Verbosity::Concise),
-        ("scroll",   json!({ "direction": "down" }), "ok", Verbosity::Concise),
-        ("scroll",   json!({ "direction": "up" }), "ok", Verbosity::Concise),
-        ("press_key",json!({ "key": "Enter" }), "ok", Verbosity::Concise),
+        (
+            "navigate",
+            json!({ "url": "https://www.instagram.com/explore/" }),
+            "ok",
+            Verbosity::Concise,
+        ),
+        (
+            "navigate",
+            json!({ "url": "https://example.com/path?x=1" }),
+            "ok",
+            Verbosity::Detailed,
+        ),
+        (
+            "click",
+            json!({ "ref": "@e5" }),
+            "Clicked successfully",
+            Verbosity::Concise,
+        ),
+        (
+            "click",
+            json!({ "ref": "@e7" }),
+            "Clicked successfully",
+            Verbosity::Detailed,
+        ),
+        (
+            "type",
+            json!({ "ref": "@e4", "text": "hi alice" }),
+            "ok",
+            Verbosity::Concise,
+        ),
+        (
+            "type",
+            json!({ "ref": "@e4", "text": "x".repeat(200) }),
+            "ok",
+            Verbosity::Concise,
+        ),
+        (
+            "scroll",
+            json!({ "direction": "down" }),
+            "ok",
+            Verbosity::Concise,
+        ),
+        (
+            "scroll",
+            json!({ "direction": "up" }),
+            "ok",
+            Verbosity::Concise,
+        ),
+        (
+            "press_key",
+            json!({ "key": "Enter" }),
+            "ok",
+            Verbosity::Concise,
+        ),
         ("snapshot", json!({}), "ok", Verbosity::Concise),
-        ("vision_inspect", json!({ "ref": "@e10" }), "ok", Verbosity::Concise),
-        ("declare_subtasks", json!({ "items": [{"id":"a"},{"id":"b"}] }), "ok", Verbosity::Concise),
-        ("mark_subtask_done", json!({ "id": "send_msg" }), "ok", Verbosity::Concise),
-        ("mark_subtask_failed", json!({ "id": "msg_to_alice" }), "ok", Verbosity::Concise),
-        ("finish", json!({ "result": "I sent the message." }), "ok", Verbosity::Concise),
+        (
+            "vision_inspect",
+            json!({ "ref": "@e10" }),
+            "ok",
+            Verbosity::Concise,
+        ),
+        (
+            "declare_subtasks",
+            json!({ "items": [{"id":"a"},{"id":"b"}] }),
+            "ok",
+            Verbosity::Concise,
+        ),
+        (
+            "mark_subtask_done",
+            json!({ "id": "send_msg" }),
+            "ok",
+            Verbosity::Concise,
+        ),
+        (
+            "mark_subtask_failed",
+            json!({ "id": "msg_to_alice" }),
+            "ok",
+            Verbosity::Concise,
+        ),
+        (
+            "finish",
+            json!({ "result": "I sent the message." }),
+            "ok",
+            Verbosity::Concise,
+        ),
     ];
     for (name, args, result, verbosity) in cases {
-        let (kind, line, success) = summarizer::summarize(name, &args, result, *verbosity)
-            .expect("templated summary");
+        let (kind, line, success) =
+            summarizer::summarize(name, &args, result, *verbosity).expect("templated summary");
         println!(
             "  [{}] {} (verbosity={:?}, success={})",
             kind.as_str(),
@@ -62,17 +130,16 @@ async fn main() -> anyhow::Result<()> {
     println!("\n[2] LiveProgress cap behavior");
     let mut buf = LiveProgress::new(3);
     for i in 0..7 {
-        let line = summarizer::ProgressLine::new(
-            ProgressKind::Other,
-            format!("step {i}"),
-            i as u64,
-            true,
-        );
+        let line =
+            summarizer::ProgressLine::new(ProgressKind::Other, format!("step {i}"), i as u64, true);
         buf.push(line);
     }
     let snap = buf.snapshot();
     assert_eq!(snap.len(), 3, "cap 3 should hold 3 lines");
-    assert_eq!(snap[0].text, "step 4", "oldest should be step 4 after 7 pushes");
+    assert_eq!(
+        snap[0].text, "step 4",
+        "oldest should be step 4 after 7 pushes"
+    );
     assert_eq!(snap[2].text, "step 6", "newest should be step 6");
     println!("  cap=3, 7 pushes -> kept [step 4, step 5, step 6] (OK)");
 
@@ -112,7 +179,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let agent = mew_agent::agent::Agent::new(cfg, "send a message to alice", None);
     let raw = "I clicked the message field. I typed hi. I called finish().";
-    let summarized = agent.end_of_task_summarize("send a message to alice", raw).await;
+    let summarized = agent
+        .end_of_task_summarize("send a message to alice", raw)
+        .await;
     println!("  summarized = {summarized:?}");
     assert!(
         summarized.is_none(),
@@ -148,8 +217,14 @@ async fn main() -> anyhow::Result<()> {
 
     // --- 6. more_steps_suffix ------------------------------------
     println!("\n[6] more_steps_suffix");
-    assert_eq!(summarizer::more_steps_suffix(10, 5), Some("…and 5 more steps".into()));
-    assert_eq!(summarizer::more_steps_suffix(6, 5), Some("…and 1 more step".into()));
+    assert_eq!(
+        summarizer::more_steps_suffix(10, 5),
+        Some("…and 5 more steps".into())
+    );
+    assert_eq!(
+        summarizer::more_steps_suffix(6, 5),
+        Some("…and 1 more step".into())
+    );
     assert_eq!(summarizer::more_steps_suffix(5, 5), None);
     assert_eq!(summarizer::more_steps_suffix(3, 5), None);
     println!("  singular/plural/under-cap all behave (OK)");

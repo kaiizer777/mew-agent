@@ -40,6 +40,7 @@ type MessageKind =
   | 'task_progress'
   | 'task_completed'
   | 'task_failed'
+  | 'task_recovered'
   | 'todo_list'
   | 'todo_rejected';
 
@@ -68,6 +69,8 @@ interface ChatMessage {
    *  emitted for this task — including ones we collapsed out
    *  of the visible cap. Used for the header meta line. */
   liveLineTotal?: number;
+  /** Phase 2: deduplication tracker for live streamed partial findings. */
+  seenFindingIds?: string[];
 }
 
 interface LiveProgressLine {
@@ -384,6 +387,47 @@ function appendToTaskDetails(taskId: string, row: { label: string; value: string
   rowEl.appendChild(label);
   rowEl.appendChild(value);
   content.appendChild(rowEl);
+}
+
+function formatFinding(finding: any): string {
+  let s = '';
+  if (finding.title) {
+    s += finding.title;
+  } else {
+    s += '(untitled role)';
+  }
+  if (finding.company) {
+    s += ` @ ${finding.company}`;
+  }
+  if (finding.platform) {
+    s += ` [${finding.platform}]`;
+  }
+  if (finding.url) {
+    s += ` — ${finding.url}`;
+  }
+  if (finding.email) {
+    s += ` (contact: ${finding.email})`;
+  }
+  if (finding.note) {
+    s += ` — ${finding.note}`;
+  }
+  return s;
+}
+
+function appendPartialFinding(taskId: string, finding: any): void {
+  const task = messages.find((m) => m.id === taskId);
+  if (!task) return;
+  task.seenFindingIds = task.seenFindingIds ?? [];
+  const findingId = finding.id || `${finding.platform}_${finding.url}_${finding.title}`;
+  if (task.seenFindingIds.includes(findingId)) {
+    return;
+  }
+  task.seenFindingIds.push(findingId);
+  const platformLabel = finding.platform ? `finding [${finding.platform}]` : 'finding';
+  appendToTaskDetails(taskId, {
+    label: platformLabel,
+    value: formatFinding(finding),
+  });
 }
 
 function updateTaskMeta(taskId: string): void {
@@ -867,6 +911,11 @@ onEvent.onmessage = (event) => {
       timestampSecs: data.timestamp_secs,
       success: data.success !== false,
     });
+  } else if (event.type === 'PartialFinding') {
+    // Phase 2: live partial findings stream
+    const data = event.data;
+    if (!activeTaskId) return;
+    appendPartialFinding(activeTaskId, data.finding);
   }
 };
 
@@ -1043,6 +1092,47 @@ listen<{
   }
   finishWorkingPill(payload.status === 'Done' ? 'done' : 'failed');
 });
+
+// Phase 29: task recovered notice listener. Updates current task card to 'task_recovered'
+// and surfaces a human-readable recovery note.
+listen<{ originating_message_id: string; reason_note: string; attempt: number }>(
+  'chat-task-recovered',
+  ({ payload }) => {
+    const taskId = activeTaskId;
+    if (taskId) {
+      const task = messages.find((m) => m.id === taskId);
+      if (task) {
+        task.kind = 'task_recovered';
+        task.details = task.details ?? [];
+        task.details.push({
+          label: 'recovered',
+          value: `Attempt ${payload.attempt}: ${payload.reason_note}`,
+        });
+      }
+      const taskEl = chatList.querySelector<HTMLDivElement>(`[data-id="${taskId}"]`);
+      if (taskEl) {
+        taskEl.classList.remove('task_started');
+        taskEl.classList.add('task_recovered');
+        taskEl.dataset.kind = 'task_recovered';
+        const meta = taskEl.querySelector<HTMLDivElement>('.message-meta');
+        if (meta) {
+          meta.textContent = `Task recovered (attempt ${payload.attempt}).`;
+        }
+      }
+    }
+  }
+);
+
+// Phase 2: live partial findings stream listener
+listen<{ originating_message_id: string; finding: any }>(
+  'chat-partial-finding',
+  ({ payload }) => {
+    const taskId = activeTaskId;
+    if (taskId) {
+      appendPartialFinding(taskId, payload.finding);
+    }
+  }
+);
 
 // Phase 1.5: minimal Bug #2 fix. The Rust side of `run_browser_task`
 // emits the browser agent's final result on `chat-reply`. We push

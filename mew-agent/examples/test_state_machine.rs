@@ -103,7 +103,10 @@ async fn test_terminal_rejects_resume() {
 
     let s = h.session.stop("user asked".to_string()).await;
     println!("  stop() -> {:?}", s);
-    assert!(matches!(s, Ok(SessionState::Stopped)), "stop should succeed");
+    assert!(
+        matches!(s, Ok(SessionState::Stopped)),
+        "stop should succeed"
+    );
 
     let r = h.session.resume(None).await;
     println!("  resume() after stop -> {:?}", r);
@@ -251,7 +254,10 @@ async fn test_double_pause_and_resume_idle() {
     );
 
     // Pause once -> ok.
-    h.session.pause(None).await.expect("first pause should work");
+    h.session
+        .pause(None)
+        .await
+        .expect("first pause should work");
 
     // Pause twice -> InvalidTransition (Paused -> Paused is not allowed).
     let r2 = h.session.pause(None).await;
@@ -262,11 +268,17 @@ async fn test_double_pause_and_resume_idle() {
     );
 
     // Resume once -> ok.
-    h.session.resume(None).await.expect("resume from Paused should work");
+    h.session
+        .resume(None)
+        .await
+        .expect("resume from Paused should work");
 
     // Resume again on Running -> InvalidTransition.
     let r3 = h.session.resume(None).await;
-    println!("  resume() on Running (after one pause/resume cycle) -> {:?}", r3);
+    println!(
+        "  resume() on Running (after one pause/resume cycle) -> {:?}",
+        r3
+    );
     assert!(
         matches!(r3, Err(SessionError::InvalidTransition { .. })),
         "second resume on Running must be InvalidTransition"
@@ -292,9 +304,16 @@ async fn test_double_pause_and_resume_idle() {
             r.reason
         );
         // Sanity: timestamp must be > 0 (real Unix time, not 1970).
-        assert!(r.timestamp_secs > 1_700_000_000, "timestamp looks fake: {}", r.timestamp_secs);
+        assert!(
+            r.timestamp_secs > 1_700_000_000,
+            "timestamp looks fake: {}",
+            r.timestamp_secs
+        );
     }
-    assert!(history.len() >= 5, "should have start + 3 pauses + 3 resumes at minimum");
+    assert!(
+        history.len() >= 5,
+        "should have start + 3 pauses + 3 resumes at minimum"
+    );
     println!("  PASS: history has real timestamps (Unix epoch seconds, not 0)");
 }
 
@@ -325,7 +344,9 @@ async fn test_stop_while_parked() {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let _ = h2.record(&format!("about to call checkpoint (t={started})")).await;
+        let _ = h2
+            .record(&format!("about to call checkpoint (t={started})"))
+            .await;
         let res = h2.session.checkpoint().await;
         let ended = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -400,7 +421,10 @@ async fn test_transcript_has_real_timestamps() {
     write_latest(&h, "after resume").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    h.session.pause(Some("again".into())).await.expect("pause 2");
+    h.session
+        .pause(Some("again".into()))
+        .await
+        .expect("pause 2");
     write_latest(&h, "after second pause").await;
 
     h.session.stop("done".into()).await.expect("stop");
@@ -416,10 +440,7 @@ async fn test_transcript_has_real_timestamps() {
     }
 
     // Each STATE: line should start with [seconds] and have a valid Unix time.
-    let state_lines: Vec<&str> = content
-        .lines()
-        .filter(|l| l.contains("STATE:"))
-        .collect();
+    let state_lines: Vec<&str> = content.lines().filter(|l| l.contains("STATE:")).collect();
     assert!(
         state_lines.len() >= 5,
         "expected at least 5 STATE lines (start + 2 pauses + 1 resume + stop), got {}",
@@ -427,7 +448,10 @@ async fn test_transcript_has_real_timestamps() {
     );
     for line in &state_lines {
         // Format: [<ts>] [<sid>] STATE: <from> -> <to> (<kind>)[ reason=...]
-        assert!(line.starts_with('['), "line should start with timestamp: {line}");
+        assert!(
+            line.starts_with('['),
+            "line should start with timestamp: {line}"
+        );
         let close = line.find(']').expect("malformed line");
         let ts: u64 = line[1..close]
             .parse()

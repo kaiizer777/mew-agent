@@ -152,18 +152,16 @@ fn has_login_text(node: &TreeNode) -> bool {
             return;
         }
         let lower = n.name.to_lowercase();
-        if n.role.eq_ignore_ascii_case("heading")
+        if (n.role.eq_ignore_ascii_case("heading")
             || n.role.eq_ignore_ascii_case("dialog")
-            || n.role.eq_ignore_ascii_case("alertdialog")
-        {
-            if lower.contains("sign in")
+            || n.role.eq_ignore_ascii_case("alertdialog"))
+            && (lower.contains("sign in")
                 || lower.contains("log in")
                 || lower.contains("login")
-                || lower.contains("authenticate")
-            {
-                *out = true;
-                return;
-            }
+                || lower.contains("authenticate"))
+        {
+            *out = true;
+            return;
         }
         for child in &n.children {
             walk(child, out);
@@ -344,7 +342,13 @@ mod tests {
             "Login",
             "",
             None,
-            vec![node("textbox", "secret", "current-password", Some("@e1"), vec![])],
+            vec![node(
+                "textbox",
+                "secret",
+                "current-password",
+                Some("@e1"),
+                vec![],
+            )],
         );
         let inputs = SessionLossInputs {
             tree: &tree,

@@ -1,3 +1,8 @@
+pub mod batch_dispatch;
+pub mod maps_lead_gen;
+pub mod memory_retrieval;
+pub mod parallel_maps;
+pub mod phase30_integration;
 pub mod planner_worker_shortcut;
 
 pub use planner_worker_shortcut::{

@@ -1,8 +1,8 @@
 // mew v2 — Phase 13: Worker pool for planner execution.
 
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::oneshot;
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 use crate::handoff::{Handoff, TodoResult};
 use crate::supervisor::{SupervisorCommand, SupervisorSignal};
@@ -47,12 +47,45 @@ impl WorkerPool {
             return Err(PoolError::ShuttingDown);
         }
 
-        let worker = self.workers.first().ok_or(PoolError::NoWorker)?;
-        if worker.is_busy() {
-            return Err(PoolError::Busy);
+        if self.workers.is_empty() {
+            return Err(PoolError::NoWorker);
         }
 
+        let worker = self
+            .workers
+            .iter()
+            .find(|w| !w.is_busy())
+            .ok_or(PoolError::Busy)?;
+
         Ok(worker.submit(todo, handoff))
+    }
+
+    pub fn has_available_worker(&self) -> bool {
+        !self.is_shutting_down() && self.workers.iter().any(|w| !w.is_busy())
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    pub fn busy_count(&self) -> usize {
+        self.workers.iter().filter(|w| w.is_busy()).count()
+    }
+
+    /// Construct a pool with N workers from a shared BrowserAgentFactory.
+    pub fn from_factory(
+        factory: Arc<dyn crate::orchestrator::BrowserAgentFactory>,
+        count: usize,
+    ) -> Self {
+        let count = count.max(1);
+        let mut workers = Vec::with_capacity(count);
+        for i in 1..=count {
+            workers.push(BrowserAgentWorker::new(
+                format!("worker-{}", i),
+                factory.clone(),
+            ));
+        }
+        Self::new(workers)
     }
 
     pub fn signal(&self, cmd: SupervisorCommand) {
@@ -67,5 +100,25 @@ impl WorkerPool {
             *shutting = true;
         }
         self.signal(SupervisorCommand::new(u64::MAX, SupervisorSignal::Cancel));
+    }
+
+    /// Replaces a worker in the pool with a fresh `BrowserAgentWorker` instance,
+    /// ensuring old worker is signaled with `SupervisorSignal::Respawn` for clean teardown.
+    pub fn replace_worker(
+        &mut self,
+        index: usize,
+        new_worker: BrowserAgentWorker,
+        reason: crate::supervisor::RespawnReason,
+    ) -> Option<BrowserAgentWorker> {
+        if index < self.workers.len() {
+            self.workers[index].signal(SupervisorCommand::new(
+                u64::MAX,
+                SupervisorSignal::Respawn(reason),
+            ));
+            let old = std::mem::replace(&mut self.workers[index], new_worker);
+            Some(old)
+        } else {
+            None
+        }
     }
 }

@@ -117,7 +117,9 @@ async fn main() -> anyhow::Result<()> {
                         println!("    parsed: intent={} reply={:?}", intent, reply);
                         match intent {
                             "chat" | "browser_task" => println!("    SCHEMA OK"),
-                            other => println!("    SCHEMA FAIL: unexpected intent value `{}`", other),
+                            other => {
+                                println!("    SCHEMA FAIL: unexpected intent value `{}`", other)
+                            }
                         }
                     }
                     Err(e) => println!("    SCHEMA FAIL: arguments not valid JSON: {e}"),

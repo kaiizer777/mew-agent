@@ -51,11 +51,7 @@ async fn main() -> anyhow::Result<()> {
     let (browser, page, handle, job) = launch(binary_path, false).await?;
 
     println!("[post-fix] navigating...");
-    let nav_result = tokio::time::timeout(
-        Duration::from_secs(20),
-        page.goto(&url),
-    )
-    .await;
+    let nav_result = tokio::time::timeout(Duration::from_secs(20), page.goto(&url)).await;
     match nav_result {
         Ok(Ok(_)) => {
             let _ = page.wait_for_navigation().await;

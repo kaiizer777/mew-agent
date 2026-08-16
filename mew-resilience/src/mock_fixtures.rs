@@ -49,8 +49,16 @@ pub fn clean_homepage() -> TreeNode {
         "Acme",
         vec![
             n("heading", "Welcome to Acme", vec![]),
-            n("link", "About", vec![n_with_ref("text", "About us", Some("@e1"), vec![])]),
-            n("link", "Pricing", vec![n_with_ref("text", "See pricing", Some("@e2"), vec![])]),
+            n(
+                "link",
+                "About",
+                vec![n_with_ref("text", "About us", Some("@e1"), vec![])],
+            ),
+            n(
+                "link",
+                "Pricing",
+                vec![n_with_ref("text", "See pricing", Some("@e2"), vec![])],
+            ),
         ],
     )
 }
@@ -86,18 +94,16 @@ pub fn login_wall_page() -> TreeNode {
     n(
         "RootWebArea",
         "Acme",
-        vec![
-            n(
-                "dialog",
-                "Sign in to continue",
-                vec![
-                    n("heading", "Sign in", vec![]),
-                    n_with_ref("textbox", "Email", Some("@e1"), vec![]),
-                    n_with_ref("textbox", "Password", Some("@e2"), vec![]),
-                    n_with_ref("button", "Sign in", Some("@e3"), vec![]),
-                ],
-            ),
-        ],
+        vec![n(
+            "dialog",
+            "Sign in to continue",
+            vec![
+                n("heading", "Sign in", vec![]),
+                n_with_ref("textbox", "Email", Some("@e1"), vec![]),
+                n_with_ref("textbox", "Password", Some("@e2"), vec![]),
+                n_with_ref("button", "Sign in", Some("@e3"), vec![]),
+            ],
+        )],
     )
 }
 
@@ -126,17 +132,15 @@ pub fn age_gate_page() -> TreeNode {
     n(
         "RootWebArea",
         "WinesOnline",
-        vec![
-            n(
-                "dialog",
-                "Age verification",
-                vec![
-                    n("heading", "Are you 18 or older?", vec![]),
-                    n_with_ref("button", "Yes, I am 18+", Some("@e1"), vec![]),
-                    n_with_ref("button", "No, I am not", Some("@e2"), vec![]),
-                ],
-            ),
-        ],
+        vec![n(
+            "dialog",
+            "Age verification",
+            vec![
+                n("heading", "Are you 18 or older?", vec![]),
+                n_with_ref("button", "Yes, I am 18+", Some("@e1"), vec![]),
+                n_with_ref("button", "No, I am not", Some("@e2"), vec![]),
+            ],
+        )],
     )
 }
 
@@ -164,7 +168,11 @@ pub fn cloudflare_page() -> TreeNode {
         "RootWebArea",
         "Example",
         vec![
-            n("heading", "Checking your browser before accessing example.com", vec![]),
+            n(
+                "heading",
+                "Checking your browser before accessing example.com",
+                vec![],
+            ),
             n(
                 "paragraph",
                 "DDoS protection by Cloudflare. Ray ID: 8a1b2c3d4e5f6g. Your IP: 1.2.3.4.",
@@ -252,12 +260,7 @@ pub fn cloudflare_turnstile_page() -> TreeNode {
         vec![
             n("heading", "instagram.com", vec![]),
             n("paragraph", "Verify you are human", vec![]),
-            n_with_ref(
-                "iframe",
-                "cf-turnstile",
-                Some("@e1"),
-                vec![],
-            ),
+            n_with_ref("iframe", "cf-turnstile", Some("@e1"), vec![]),
         ],
     )
 }
@@ -313,6 +316,137 @@ pub fn hcaptcha_page() -> TreeNode {
     )
 }
 
+/// Synthetic worker health fixture for a looping worker (identical actions, static snapshot).
+pub fn looping_worker_health() -> crate::WorkerHealth {
+    let mut health = crate::WorkerHealth::new("mock-looping-worker");
+    for _ in 0..4 {
+        health.on_checkpoint();
+        health.record_action(0xDEADBEEF, Some(0x12345678));
+    }
+    health
+}
+
+/// Synthetic worker health fixture for a spinning worker (iteration count climbing, no progress).
+pub fn spinning_worker_health() -> crate::WorkerHealth {
+    let mut health = crate::WorkerHealth::new("mock-spinning-worker");
+    health.iteration_count = 10;
+    health.last_progress_at = std::time::Instant::now() - std::time::Duration::from_secs(300);
+    health
+}
+
+/// Synthetic worker health fixture for a healthy worker.
+pub fn healthy_worker_health() -> crate::WorkerHealth {
+    let mut health = crate::WorkerHealth::new("mock-healthy-worker");
+    health.on_checkpoint();
+    health.record_action(101, Some(1001));
+    health.record_action(102, Some(1002));
+    health.record_progress();
+    health
+}
+
+/// Synthetic worker health fixture for a worker nearing token limit.
+pub fn token_approaching_worker_health() -> crate::WorkerHealth {
+    let mut health = crate::WorkerHealth::new("mock-token-worker");
+    health.record_tokens(9000, false);
+    health
+}
+
+// -------------------------------------------------------------------------
+// Phase 4 fixtures: Google authenticated session pages
+// -------------------------------------------------------------------------
+
+/// Platform login page with a "Sign in with Google" button.
+/// The agent detects this and clicks the button to start the
+/// Google OAuth flow.
+pub fn google_signin_button_page() -> TreeNode {
+    n(
+        "RootWebArea",
+        "LinkedIn Login",
+        vec![
+            n("heading", "Sign in", vec![]),
+            n_with_ref("textbox", "Email", Some("@e1"), vec![]),
+            n_with_ref("textbox", "Password", Some("@e2"), vec![]),
+            n_with_ref("button", "Sign in", Some("@e3"), vec![]),
+            n_with_ref("button", "Sign in with Google", Some("@e4"), vec![]),
+        ],
+    )
+}
+
+/// Google email input page (accounts.google.com).
+/// The agent types the user's email and clicks Next.
+pub fn google_email_input_page() -> TreeNode {
+    n(
+        "RootWebArea",
+        "Google Accounts",
+        vec![
+            n("heading", "Sign in", vec![
+                n("text", "Google", vec![]),
+            ]),
+            n_with_ref("textbox", "Email or phone", Some("@e1"), vec![]),
+            n_with_ref("button", "Next", Some("@e2"), vec![]),
+            n("link", "Forgot email?", vec![]),
+            n("text", "Not your computer? Use Guest mode to sign in privately.", vec![]),
+        ],
+    )
+}
+
+/// Google password input page (accounts.google.com).
+/// The agent types the user's password and clicks Next.
+pub fn google_password_input_page() -> TreeNode {
+    n(
+        "RootWebArea",
+        "Google Accounts",
+        vec![
+            n("heading", "user@gmail.com", vec![]),
+            n_with_ref("textbox", "Password", Some("@e1"), vec![]),
+            n_with_ref("button", "Next", Some("@e2"), vec![]),
+            n("link", "Forgot password?", vec![]),
+        ],
+    )
+}
+
+/// Google 2FA / phone verification prompt.
+/// The agent detects this and pauses for user intervention.
+pub fn google_2fa_page() -> TreeNode {
+    n(
+        "RootWebArea",
+        "Google Accounts",
+        vec![
+            n("heading", "Verify it's you", vec![]),
+            n(
+                "paragraph",
+                "To continue, Google will send a verification code to your phone.",
+                vec![],
+            ),
+            n_with_ref("textbox", "Enter code", Some("@e1"), vec![]),
+            n_with_ref("button", "Next", Some("@e2"), vec![]),
+        ],
+    )
+}
+
+/// Post-login dashboard page. After successful Google OAuth,
+/// the agent lands back on the platform's dashboard.
+pub fn post_login_dashboard_page() -> TreeNode {
+    n(
+        "RootWebArea",
+        "LinkedIn",
+        vec![
+            n("heading", "Welcome back, Alice", vec![]),
+            n(
+                "table",
+                "Feed",
+                vec![
+                    n_with_ref("row", "Post from Bob", Some("@e1"), vec![]),
+                    n_with_ref("row", "Post from Carol", Some("@e2"), vec![]),
+                ],
+            ),
+            n_with_ref("link", "My Network", Some("@e3"), vec![]),
+            n_with_ref("link", "Messaging", Some("@e4"), vec![]),
+            n_with_ref("button", "Sign out", Some("@e5"), vec![]),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,9 +457,9 @@ mod tests {
         // be *insensitive* to. If this fixture starts tripping a
         // detector, that's a regression in the detector, not the
         // fixture.
+        use crate::captcha::detect as detect_captcha;
         use crate::modal_interrupts::detect as detect_modal;
         use crate::rate_limit::detect as detect_rate;
-        use crate::captcha::detect as detect_captcha;
         assert!(detect_modal(&clean_homepage()).is_none());
         assert!(detect_rate(&clean_homepage()).is_none());
         // Phase 8: the captcha detector also treats a normal
@@ -380,7 +514,10 @@ mod tests {
             search_page(),
             multi_modal_page(),
         ] {
-            assert!(detect_captcha(&f).is_none(), "unexpected captcha on fixture");
+            assert!(
+                detect_captcha(&f).is_none(),
+                "unexpected captcha on fixture"
+            );
         }
     }
 
@@ -412,5 +549,11 @@ mod tests {
         let _ = recaptcha_v2_page();
         let _ = recaptcha_v3_page();
         let _ = hcaptcha_page();
+        // Phase 4 Google auth fixtures.
+        let _ = google_signin_button_page();
+        let _ = google_email_input_page();
+        let _ = google_password_input_page();
+        let _ = google_2fa_page();
+        let _ = post_login_dashboard_page();
     }
 }

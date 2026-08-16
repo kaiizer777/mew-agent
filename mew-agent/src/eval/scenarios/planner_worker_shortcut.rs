@@ -6,9 +6,7 @@
 //! 3. Stale evidence: worker reuses signature from a previous iteration -> rejected as StaleEvidence, status stays Pending.
 
 use crate::eval::assertions::{assert_todo_done, assert_todo_rejected, AssertionResult};
-use crate::todo::{
-    planner_signature, MarkTodoOutcome, Todo, TodoId, TodoStatus,
-};
+use crate::todo::{planner_signature, MarkTodoOutcome, Todo, TodoId, TodoStatus};
 
 #[derive(Clone)]
 pub struct PlannerWorkerScenario {
@@ -23,7 +21,11 @@ impl PlannerWorkerScenario {
         description: &'static str,
         run_fn: fn() -> AssertionResult,
     ) -> Self {
-        Self { id, description, run_fn }
+        Self {
+            id,
+            description,
+            run_fn,
+        }
     }
 
     pub fn run(&self) -> AssertionResult {
@@ -85,7 +87,12 @@ pub fn reject_on_mismatch() -> AssertionResult {
                 ));
             }
         }
-        other => return Err(format!("expected StaleEvidence on 1st attempt, got {:?}", other)),
+        other => {
+            return Err(format!(
+                "expected StaleEvidence on 1st attempt, got {:?}",
+                other
+            ))
+        }
     }
 
     // Attempt 2: retry with fake signature, hitting max_attempts = 2
@@ -98,18 +105,17 @@ pub fn reject_on_mismatch() -> AssertionResult {
             assert_todo_rejected(&todo, Some("snapshot signature mismatch"))?;
             Ok(())
         }
-        other => Err(format!("expected StaleEvidence on 2nd attempt, got {:?}", other)),
+        other => Err(format!(
+            "expected StaleEvidence on 2nd attempt, got {:?}",
+            other
+        )),
     }
 }
 
 /// Scenario 3: Stale evidence — worker re-uses evidence from a previous iteration.
 /// Assert: rejected as StaleEvidence, todo stays Pending.
 pub fn retry_on_stale_evidence() -> AssertionResult {
-    let mut todo = Todo::new(
-        TodoId::from_slug("send-message", 1),
-        "send message",
-        None,
-    );
+    let mut todo = Todo::new(TodoId::from_slug("send-message", 1), "send message", None);
     // Simulate that the todo was already evaluated at iteration 2
     todo.last_evidence_iteration = Some(2);
     todo.attempts = 1;
@@ -135,12 +141,18 @@ pub fn retry_on_stale_evidence() -> AssertionResult {
                 ));
             }
             if todo.attempts != 2 {
-                return Err(format!("expected attempts incremented to 2, got {}", todo.attempts));
+                return Err(format!(
+                    "expected attempts incremented to 2, got {}",
+                    todo.attempts
+                ));
             }
             assert_todo_rejected(&todo, None)?;
             Ok(())
         }
-        other => Err(format!("expected StaleEvidence outcome for stale iteration, got {:?}", other)),
+        other => Err(format!(
+            "expected StaleEvidence outcome for stale iteration, got {:?}",
+            other
+        )),
     }
 }
 

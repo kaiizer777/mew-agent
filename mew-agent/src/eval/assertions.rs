@@ -100,7 +100,6 @@ pub fn assert_todo_rejected(todo: &Todo, reason: Option<&str>) -> AssertionResul
     Ok(())
 }
 
-
 /// Assert the orchestrator dispatched the right task.
 /// `expected` is the user message the test passed to
 /// `ChatAgent`; the planner may rephrase it (e.g. split
@@ -110,10 +109,7 @@ pub fn assert_todo_rejected(todo: &Todo, reason: Option<&str>) -> AssertionResul
 /// the planner's stand-alone rephrasing). The check
 /// here is the "did the planner produce a non-empty
 /// task that the agent can act on" guard.
-pub fn assert_correct_task_dispatched(
-    user_message: &str,
-    handoff: &Handoff,
-) -> AssertionResult {
+pub fn assert_correct_task_dispatched(user_message: &str, handoff: &Handoff) -> AssertionResult {
     if handoff.task_description.is_empty() {
         return Err(format!(
             "handoff has empty task_description (user message was {user_message:?})"
@@ -127,7 +123,10 @@ pub fn assert_correct_task_dispatched(
     // play (the planner splits clauses but does not
     // rephrase), so this is a strong signal.
     if user_message.split_whitespace().any(|w| {
-        handoff.task_description.to_lowercase().contains(&w.to_lowercase())
+        handoff
+            .task_description
+            .to_lowercase()
+            .contains(&w.to_lowercase())
     }) {
         Ok(())
     } else {
@@ -198,17 +197,14 @@ pub fn assert_result_reflected_in_chat_reply(
             }
             // (1) Summary fragment.
             if !result.summary.is_empty() {
-                let first_30: String =
-                    result.summary.chars().take(30).collect();
+                let first_30: String = result.summary.chars().take(30).collect();
                 if chat_reply.contains(&first_30) {
                     return Ok(());
                 }
             }
             // (2) Key finding description.
             for finding in &result.key_findings {
-                if !finding.description.is_empty()
-                    && chat_reply.contains(&finding.description)
-                {
+                if !finding.description.is_empty() && chat_reply.contains(&finding.description) {
                     return Ok(());
                 }
             }
@@ -232,16 +228,14 @@ pub fn assert_result_reflected_in_chat_reply(
             // the user knows what went wrong.
             if result.failure_reason.is_empty() {
                 return Err(
-                    "Failed result has empty failure_reason (the user gets nothing to read)"
-                        .into(),
+                    "Failed result has empty failure_reason (the user gets nothing to read)".into(),
                 );
             }
             // The synthesizer rephrases the reason
             // (e.g. "I couldn't complete the task:
             // <reason>"), so a 30-char fragment is the
             // check.
-            let first_30: String =
-                result.failure_reason.chars().take(30).collect();
+            let first_30: String = result.failure_reason.chars().take(30).collect();
             if chat_reply.contains(&first_30) {
                 Ok(())
             } else if word_overlap(&result.failure_reason, chat_reply) {
@@ -264,16 +258,14 @@ pub fn assert_result_reflected_in_chat_reply(
 /// bridge rephrasings.
 fn word_overlap(source: &str, target: &str) -> bool {
     const STOPWORDS: &[&str] = &[
-        "the", "and", "then", "with", "this", "that", "from", "your", "into", "have",
-        "this", "task", "result", "reply", "message",
+        "the", "and", "then", "with", "this", "that", "from", "your", "into", "have", "this",
+        "task", "result", "reply", "message",
     ];
     let target_lower = target.to_lowercase();
     source.split_whitespace().any(|w| {
         let lower = w.to_lowercase();
         let trimmed = lower.trim_matches(|c: char| !c.is_alphanumeric());
-        trimmed.len() >= 4
-            && !STOPWORDS.contains(&trimmed)
-            && target_lower.contains(&trimmed)
+        trimmed.len() >= 4 && !STOPWORDS.contains(&trimmed) && target_lower.contains(trimmed)
     })
 }
 
@@ -306,10 +298,7 @@ pub fn assert_originating_message_id_preserved(
 /// assertion in assertion form: a future regression
 /// that flattens compound tasks back to a single
 /// sub-task fails this guard.
-pub fn assert_subtask_decomposition(
-    handoff: &Handoff,
-    min_subtasks: usize,
-) -> AssertionResult {
+pub fn assert_subtask_decomposition(handoff: &Handoff, min_subtasks: usize) -> AssertionResult {
     if handoff.subtasks.len() < min_subtasks {
         Err(format!(
             "task decomposition too coarse: got {} subtasks, expected at least {} (handoff task: {:?})",
@@ -390,6 +379,11 @@ mod tests {
             constraints: vec![],
             originating_message_id: id.into(),
             research_plan: None,
+            job_query: None,
+            lead_query: None,
+            task_shape: None,
+            respawn_handoff: None,
+            maps_query: None,
         }
     }
 
@@ -403,6 +397,11 @@ mod tests {
             constraints: vec![],
             originating_message_id: id.into(),
             research_plan: None,
+            job_query: None,
+            lead_query: None,
+            task_shape: None,
+            respawn_handoff: None,
+            maps_query: None,
         }
     }
 
@@ -473,10 +472,7 @@ mod tests {
     #[test]
     fn full_contract_passes_when_all_four_hold() {
         let user = "go to instagram and text alice hi";
-        let h = decomposed_handoff(
-            "open instagram and send the message",
-            "id:42",
-        );
+        let h = decomposed_handoff("open instagram and send the message", "id:42");
         let r = done_result();
         let reply = "I sent the message to Alice. 2 of 2 sub-tasks completed.";
         let res = assert_handoff_contract(user, &h, &r, reply, "id:42", 2);
@@ -495,7 +491,13 @@ mod tests {
         // The aggregated error should mention at least
         // the id-preservation drift and the
         // decomposition-coarseness.
-        assert!(err.contains("originating_message_id"), "missing id drift: {err}");
-        assert!(err.contains("decomposition"), "missing decomposition failure: {err}");
+        assert!(
+            err.contains("originating_message_id"),
+            "missing id drift: {err}"
+        );
+        assert!(
+            err.contains("decomposition"),
+            "missing decomposition failure: {err}"
+        );
     }
 }

@@ -113,7 +113,9 @@ fn match_load_config(detail: &str) -> Option<String> {
 /// Map Chrome-launch failures. The two most common shapes:
 ///   * Binary path missing or wrong.
 fn match_launch_chrome(detail: &str) -> Option<String> {
-    if detail.contains("Failed to launch Chrome") || detail.contains("Failed to build BrowserConfig") {
+    if detail.contains("Failed to launch Chrome")
+        || detail.contains("Failed to build BrowserConfig")
+    {
         return Some(
             "Couldn't start the browser. Check the browser.binary_path in config.yaml and that the file exists."
                 .to_string(),
@@ -125,6 +127,33 @@ fn match_launch_chrome(detail: &str) -> Option<String> {
 /// Map intent-classification failures. The user typed something,
 /// the LLM call failed. The user can't fix the network or the
 /// model, but they should know the message was not lost.
+///
+/// The `router::classify` failure path bails with a status-bearing
+/// string — `"API returned error status {status}: {text}"` — for
+/// every non-2xx response from the upstream provider. Different
+/// status codes mean very different things to the user, so we
+/// pull the status out of the detail and produce copy that points
+/// at the right knob:
+///
+///   * 401 / 403 — the API key is wrong or has been revoked.
+///     Telling the user "try again in a moment" is wrong; the
+///     key needs to be fixed in `config.yaml`.
+///   * 402 — the account is out of credit or on a plan tier that
+///     does not cover the configured `default_model`. This is the
+///     single most common "chat just stopped working" symptom on
+///     the xiaomimimo / OpenCode-Zen style providers; we name it
+///     explicitly so the user knows to top up or switch plan.
+///   * 404 — the configured `default_model` is not available to
+///     this account. Most providers' `/v1/models` endpoint
+///     enumerates what the key can use.
+///   * 429 — rate-limited; transient, the user can retry.
+///   * 5xx — upstream service hiccup; transient, the user can
+///     retry in a moment.
+///
+/// Everything else that lands here (parse failure, network
+/// timeout, malformed body) is the existing generic copy — the
+/// user can't act on it, but they should know their message
+/// was not lost.
 fn match_classify(detail: &str) -> Option<String> {
     if detail.contains("Classification failed")
         || detail.contains("Failed to read classification response body")
@@ -132,12 +161,59 @@ fn match_classify(detail: &str) -> Option<String> {
         || detail.contains("Failed to parse tool call arguments")
         || detail.contains("API returned error status")
     {
+        // Pull the status code out of the anyhow chain. The
+        // classifier bails with the exact shape
+        // `API returned error status 402 Payment Required: <body>`,
+        // so a regex-style scan for `status <3-digit>` is the
+        // cheapest correct parse. If the status isn't there
+        // (e.g. the failure is a network error or a parse error
+        // and not a non-2xx response), fall back to the generic
+        // copy that doesn't promise a retry.
+        if let Some(status) = api_error_status(detail) {
+            return Some(match status {
+                401 | 403 => "The chat service rejected the API key. Check `opencode_zen.api_key` in config.yaml — it may be wrong or revoked.".to_string(),
+                402 => "The chat service account is out of credit or on a plan that doesn't cover the configured model. Top up the account or switch `default_model` in config.yaml.".to_string(),
+                404 => "The chat service doesn't recognize the configured model. Check `opencode_zen.default_model` in config.yaml — the model name may be wrong or not available to this account.".to_string(),
+                429 => "The chat service is rate-limiting requests. Please wait a moment and try again.".to_string(),
+                500..=599 => "The chat service is having a temporary problem. Please try again in a moment.".to_string(),
+                // Other 4xx (e.g. 400 from a malformed tool-call
+                // shape) — the user can't really fix this from the
+                // UI, so we don't promise a retry.
+                400 | 4..=499 => "The chat service rejected the request. Please try again — and if it keeps happening, the prompt or model config may need a tweak.".to_string(),
+                // Unknown non-2xx status — fall through to the
+                // generic message below; we don't have a
+                // confident copy for it.
+                _ => return None,
+            });
+        }
+        // No status code in the detail (network error, parse
+        // error, empty body, etc.) — keep the original generic
+        // message: user can't act on it, but the message was
+        // not lost.
         return Some(
-            "I couldn't understand your message. The chat service didn't respond — please try again in a moment."
+            "I couldn't reach the chat service. Please try again in a moment."
                 .to_string(),
         );
     }
     None
+}
+
+/// Extract the HTTP status code from an anyhow detail string
+/// shaped like `"API returned error status 402 Payment Required: ..."`,
+/// or `None` if no 3-digit status is present. We only accept
+/// 3-digit codes to keep this from accidentally matching other
+/// 3-digit numbers in a body (e.g. tokens-used counts in a
+/// response body that the provider echoes back).
+fn api_error_status(detail: &str) -> Option<u16> {
+    let needle = "API returned error status ";
+    let start = detail.find(needle)? + needle.len();
+    let rest = &detail[start..];
+    // Take the longest leading run of ASCII digits, up to 3.
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).take(3).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Map the catch-all from the spawned browser-task future. By the
@@ -266,6 +342,79 @@ mod tests {
         assert!(!msg.contains("502"));
     }
 
+    /// Pin the 402 (Payment Required) mapping. This is the single
+    /// most common "chat suddenly stopped" symptom on
+    /// xiaomimimo / OpenCode-Zen style providers when the API
+    /// key has no plan attached — a regression to the generic
+    /// "I couldn't understand your message" copy here is a
+    /// real-world UX bug, not a stylistic one.
+    #[test]
+    fn classify_402_payment_required_yields_actionable_message() {
+        let err = anyhow!("Classification failed: API returned error status 402 Payment Required: ");
+        let msg = for_user(&err, "classifying intent");
+        assert!(
+            msg.contains("out of credit") || msg.contains("plan"),
+            "402 message should name the billing/plan cause; got: {msg}"
+        );
+        assert!(
+            !msg.contains("try again"),
+            "402 is not transient — must not promise a retry; got: {msg}"
+        );
+        assert!(!msg.contains("Classification failed"));
+        assert!(!msg.contains("402"));
+    }
+
+    /// Pin the 401 / 403 (unauthorized) mapping. Telling the user
+    /// to "try again" hides a config error they need to fix.
+    #[test]
+    fn classify_401_unauthorized_yields_actionable_message() {
+        let err = anyhow!("Classification failed: API returned error status 401 Unauthorized: invalid api key");
+        let msg = for_user(&err, "classifying intent");
+        assert!(
+            msg.contains("api_key") || msg.contains("API key"),
+            "401 message should point at config.yaml api_key; got: {msg}"
+        );
+        assert!(!msg.contains("try again"));
+    }
+
+    /// Pin the 404 mapping — usually a wrong `default_model` name.
+    #[test]
+    fn classify_404_model_not_found_yields_actionable_message() {
+        let err =
+            anyhow!("Classification failed: API returned error status 404 Not Found: model 'gpt-9000'");
+        let msg = for_user(&err, "classifying intent");
+        assert!(
+            msg.contains("default_model") || msg.contains("model"),
+            "404 message should point at default_model in config.yaml; got: {msg}"
+        );
+    }
+
+    /// Pin the 429 mapping — this *is* transient, so the message
+    /// must explicitly invite a retry.
+    #[test]
+    fn classify_429_rate_limited_yields_retry_message() {
+        let err = anyhow!("Classification failed: API returned error status 429 Too Many Requests");
+        let msg = for_user(&err, "classifying intent");
+        assert!(
+            msg.contains("rate") || msg.contains("wait"),
+            "429 message should mention rate-limiting or waiting; got: {msg}"
+        );
+    }
+
+    /// A network error (no status code in the detail) should
+    /// still produce a sensible message — the user can't act on
+    /// it, but they should know the message wasn't lost.
+    #[test]
+    fn classify_network_error_yields_generic_message() {
+        let err = anyhow!(
+            "Classification failed: Network error during classification: connection refused"
+        );
+        let msg = for_user(&err, "classifying intent");
+        assert!(!msg.is_empty());
+        assert!(!msg.contains("Classification failed"));
+        assert!(!msg.contains("connection refused"));
+    }
+
     #[test]
     fn browser_task_factory_consumed_yields_user_facing_message() {
         let err = anyhow!("PrefabricatedAgentFactory: agent already consumed");
@@ -328,4 +477,3 @@ mod tests {
         assert!(!msg.contains("EvidenceMismatch"));
     }
 }
-

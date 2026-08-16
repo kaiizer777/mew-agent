@@ -12,10 +12,7 @@ fn main() -> anyhow::Result<()> {
     println!("  default_model = {}", zen.default_model);
     println!("  base_url      = {}", zen.base_url);
     println!("  max_iter      = {}", zen.max_iterations);
-    println!(
-        "  api_key_len   = {}",
-        zen.api_key.len()
-    );
+    println!("  api_key_len   = {}", zen.api_key.len());
     if let Some(b) = &cfg.browser {
         println!("  browser.bin   = {:?}", b.binary_path);
         println!("  visible_cur   = {}", b.visible_cursor);

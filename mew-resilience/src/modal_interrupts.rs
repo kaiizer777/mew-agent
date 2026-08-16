@@ -149,9 +149,7 @@ pub fn detect(tree: &TreeNode) -> Option<ModalReport> {
 ///      let the LLM look at the tree).
 fn classify_node(node: &TreeNode) -> Option<ModalReport> {
     // Rule 1: explicit dialog role.
-    if node.role.eq_ignore_ascii_case("dialog")
-        || node.role.eq_ignore_ascii_case("alertdialog")
-    {
+    if node.role.eq_ignore_ascii_case("dialog") || node.role.eq_ignore_ascii_case("alertdialog") {
         let mut kind = modal_kind_from_text(&node.name);
         // If the dialog's own name is generic (e.g.
         // "Age verification" for an age gate), try the
@@ -164,10 +162,7 @@ fn classify_node(node: &TreeNode) -> Option<ModalReport> {
             }
         }
         let dismiss_ref = find_close_button(node);
-        return Some(ModalReport {
-            kind,
-            dismiss_ref,
-        });
+        return Some(ModalReport { kind, dismiss_ref });
     }
 
     // Rule 2: heading whose name matches a known modal pattern.
@@ -231,7 +226,7 @@ fn first_classifiable_heading(node: &TreeNode) -> Option<ModalKind> {
 fn modal_kind_from_text(text: &str) -> ModalKind {
     let lower = text.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
-    let has_word = |w: &str| words.iter().any(|x| *x == w);
+    let has_word = |w: &str| words.contains(&w);
     let has_phrase = |p: &str| lower.contains(p);
 
     if has_word("cookie")
@@ -318,12 +313,7 @@ mod tests {
     use super::*;
     use mew_perception::NodeCategory;
 
-    fn node(
-        role: &str,
-        name: &str,
-        ref_id: Option<&str>,
-        children: Vec<TreeNode>,
-    ) -> TreeNode {
+    fn node(role: &str, name: &str, ref_id: Option<&str>, children: Vec<TreeNode>) -> TreeNode {
         TreeNode {
             id: format!("n_{}_{}", role, name),
             role: role.to_string(),

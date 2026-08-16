@@ -261,7 +261,9 @@ impl Budget {
         if budget.is_unlimited() {
             let used = self.steps_used(id) + 1;
             self.steps_used.insert(id.to_string(), used);
-            self.started_at_secs.entry(id.to_string()).or_insert(now_secs);
+            self.started_at_secs
+                .entry(id.to_string())
+                .or_insert(now_secs);
             return BudgetDecision::StillUnder {
                 steps_used: used,
                 steps_max: 0,
@@ -364,6 +366,9 @@ mod tests {
                     step_budget: 5,
                     time_budget_secs: 60,
                     query: String::new(),
+                    platform_kind: String::new(),
+                    query_template: String::new(),
+                    lead_subtask_kind: None,
                 },
                 ResearchSubTask {
                     id: "indeed".into(),
@@ -374,12 +379,18 @@ mod tests {
                     step_budget: 3,
                     time_budget_secs: 30,
                     query: String::new(),
+                    platform_kind: String::new(),
+                    query_template: String::new(),
+                    lead_subtask_kind: None,
                 },
             ],
-            synthesis_hint: String::new(),
-            overall_deadline_secs: None,
+            synthesis_hint: "One row per role".into(),
+            overall_deadline_secs: Some(300),
             is_research: true,
             matched_pattern: "test".into(),
+            max_concurrent_workers: None,
+            max_concurrent_per_domain: None,
+            stream_partial_findings: None,
         }
     }
 
@@ -388,8 +399,20 @@ mod tests {
         let plan = research_plan_for_test();
         let b = Budget::from_research_plan(&plan);
         assert_eq!(b.len(), 2);
-        assert_eq!(b.get("linkedin"), Some(SubtaskBudget { step_budget: 5, time_budget_secs: 60 }));
-        assert_eq!(b.get("indeed"), Some(SubtaskBudget { step_budget: 3, time_budget_secs: 30 }));
+        assert_eq!(
+            b.get("linkedin"),
+            Some(SubtaskBudget {
+                step_budget: 5,
+                time_budget_secs: 60
+            })
+        );
+        assert_eq!(
+            b.get("indeed"),
+            Some(SubtaskBudget {
+                step_budget: 3,
+                time_budget_secs: 30
+            })
+        );
         assert_eq!(b.get("nope"), None);
     }
 
@@ -399,7 +422,11 @@ mod tests {
         let mut b = Budget::from_research_plan(&plan);
         let d = b.tick("linkedin", 1_000);
         match d {
-            BudgetDecision::StillUnder { steps_used, steps_max, .. } => {
+            BudgetDecision::StillUnder {
+                steps_used,
+                steps_max,
+                ..
+            } => {
                 assert_eq!(steps_used, 1);
                 assert_eq!(steps_max, 5);
             }
@@ -427,7 +454,10 @@ mod tests {
             assert!(matches!(d, BudgetDecision::StillUnder { .. }), "got {d:?}");
         }
         let d = b.tick("linkedin", 1_000);
-        assert!(matches!(d, BudgetDecision::StepExhausted { used: 6, max: 5 }), "got {d:?}");
+        assert!(
+            matches!(d, BudgetDecision::StepExhausted { used: 6, max: 5 }),
+            "got {d:?}"
+        );
     }
 
     #[test]
@@ -439,7 +469,11 @@ mod tests {
         // Step 2 at t=10s — still under (limit is 60s).
         let d = b.tick("linkedin", 1_010);
         match d {
-            BudgetDecision::StillUnder { elapsed_secs, time_max_secs, .. } => {
+            BudgetDecision::StillUnder {
+                elapsed_secs,
+                time_max_secs,
+                ..
+            } => {
                 assert_eq!(elapsed_secs, 10);
                 assert_eq!(time_max_secs, 60);
             }
@@ -447,7 +481,16 @@ mod tests {
         }
         // Step 3 at t=70s — over the 60s cap.
         let d = b.tick("linkedin", 1_070);
-        assert!(matches!(d, BudgetDecision::TimeExhausted { elapsed: 70, limit: 60 }), "got {d:?}");
+        assert!(
+            matches!(
+                d,
+                BudgetDecision::TimeExhausted {
+                    elapsed: 70,
+                    limit: 60
+                }
+            ),
+            "got {d:?}"
+        );
     }
 
     #[test]
@@ -476,11 +519,17 @@ mod tests {
                 step_budget: 1,
                 time_budget_secs: 30,
                 query: String::new(),
+                platform_kind: String::new(),
+                query_template: String::new(),
+                lead_subtask_kind: None,
             }],
             synthesis_hint: String::new(),
             overall_deadline_secs: None,
             is_research: true,
             matched_pattern: "test".into(),
+            max_concurrent_workers: None,
+            max_concurrent_per_domain: None,
+            stream_partial_findings: None,
         };
         let mut b = Budget::from_research_plan(&plan);
         let d = b.tick("a", 100);
@@ -490,19 +539,28 @@ mod tests {
         // 2nd tick at t=200. Used=2 (over cap of 1). Step
         // cap fires.
         let d = b.tick("a", 200);
-        assert!(matches!(d, BudgetDecision::StepExhausted { .. }), "got {d:?}");
+        assert!(
+            matches!(d, BudgetDecision::StepExhausted { .. }),
+            "got {d:?}"
+        );
     }
 
     #[test]
     fn unlimited_budget_never_fires() {
         let b = Budget::from_rows(vec![(
             "open".to_string(),
-            SubtaskBudget { step_budget: 0, time_budget_secs: 0 },
+            SubtaskBudget {
+                step_budget: 0,
+                time_budget_secs: 0,
+            },
         )]);
         let mut b = b;
         for i in 0..50 {
             let d = b.tick("open", i);
-            assert!(matches!(d, BudgetDecision::StillUnder { .. }), "iter {i} got {d:?}");
+            assert!(
+                matches!(d, BudgetDecision::StillUnder { .. }),
+                "iter {i} got {d:?}"
+            );
         }
     }
 
@@ -528,9 +586,16 @@ mod tests {
         let d = b.tick_and_enforce(&mut tracker, "linkedin", 1_000);
         assert!(matches!(d, BudgetDecision::StepExhausted { .. }));
         // Tracker should be in Exhausted state.
-        let sub = tracker.subtasks.iter().find(|s| s.id == "linkedin").unwrap();
+        let sub = tracker
+            .subtasks
+            .iter()
+            .find(|s| s.id == "linkedin")
+            .unwrap();
         assert!(
-            matches!(sub.status, crate::completeness::SubTaskStatus::Exhausted { .. }),
+            matches!(
+                sub.status,
+                crate::completeness::SubTaskStatus::Exhausted { .. }
+            ),
             "subtask should be Exhausted, got {:?}",
             sub.status,
         );
@@ -557,7 +622,11 @@ mod tests {
         let d = b.tick_and_enforce(&mut tracker, "linkedin", 1_000);
         assert!(matches!(d, BudgetDecision::StepExhausted { .. }));
         // Still only one Exhausted status — verify by re-reading.
-        let sub = tracker.subtasks.iter().find(|s| s.id == "linkedin").unwrap();
+        let sub = tracker
+            .subtasks
+            .iter()
+            .find(|s| s.id == "linkedin")
+            .unwrap();
         assert!(matches!(
             sub.status,
             crate::completeness::SubTaskStatus::Exhausted { .. }
@@ -577,9 +646,15 @@ mod tests {
 
     #[test]
     fn subtask_budget_is_unlimited_when_both_zero() {
-        let b = SubtaskBudget { step_budget: 0, time_budget_secs: 0 };
+        let b = SubtaskBudget {
+            step_budget: 0,
+            time_budget_secs: 0,
+        };
         assert!(b.is_unlimited());
-        let b = SubtaskBudget { step_budget: 1, time_budget_secs: 0 };
+        let b = SubtaskBudget {
+            step_budget: 1,
+            time_budget_secs: 0,
+        };
         assert!(!b.is_unlimited());
     }
 }

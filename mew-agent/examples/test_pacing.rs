@@ -93,7 +93,8 @@ impl LoopDriver {
                 {
                     let _ = f.write_all(line.as_bytes());
                 }
-                self.events.push((ts, line.trim().to_string(), Some(*delay)));
+                self.events
+                    .push((ts, line.trim().to_string(), Some(*delay)));
                 std::thread::sleep(*delay);
             }
         }
@@ -204,7 +205,10 @@ fn test_one_off_is_not_paced() {
     let e1 = driver.dispatch(&mut guard, "click");
     let e2 = driver.dispatch(&mut guard, "snapshot");
     let e3 = driver.dispatch(&mut guard, "click");
-    println!("  elapsed: click1={:?} snapshot={:?} click2={:?}", e1, e2, e3);
+    println!(
+        "  elapsed: click1={:?} snapshot={:?} click2={:?}",
+        e1, e2, e3
+    );
 
     // All three must be near-instant (no sleep anywhere in a
     // 1000-2000ms range).
@@ -212,7 +216,8 @@ fn test_one_off_is_not_paced() {
         assert!(
             **e < Duration::from_millis(20),
             "dispatch {} should be near-instant, got {:?}",
-            i, e
+            i,
+            e
         );
     }
 
@@ -257,13 +262,25 @@ fn test_different_action_resets_streak() {
         "click2 should pace 200-400ms: {:?}",
         e2
     );
-    assert!(e3 < Duration::from_millis(20), "type resets, no pace: {:?}", e3);
-    assert!(e4 < Duration::from_millis(20), "click3 new streak, no pace: {:?}", e4);
+    assert!(
+        e3 < Duration::from_millis(20),
+        "type resets, no pace: {:?}",
+        e3
+    );
+    assert!(
+        e4 < Duration::from_millis(20),
+        "click3 new streak, no pace: {:?}",
+        e4
+    );
 
     // Exactly 1 PACING line in the transcript.
     let transcript = driver.transcript();
     let pacing_line_count = transcript.matches("PACING:").count();
-    assert_eq!(pacing_line_count, 1, "expected 1 PACING line, got {} in:\n{}", pacing_line_count, transcript);
+    assert_eq!(
+        pacing_line_count, 1,
+        "expected 1 PACING line, got {} in:\n{}",
+        pacing_line_count, transcript
+    );
     println!("  PASS: type-action reset the click streak, only 1 PACING line");
 }
 
@@ -378,7 +395,11 @@ fn test_agent_integration() {
     // run (the first 2 clicks were under the threshold, silent).
     let t = driver2.transcript();
     let count = t.matches("PACING:").count();
-    assert_eq!(count, 2, "expected 2 PACING lines, got {} in:\n{}", count, t);
+    assert_eq!(
+        count, 2,
+        "expected 2 PACING lines, got {} in:\n{}",
+        count, t
+    );
     println!("  PASS: end-to-end through Agent pacing guard works");
 }
 
@@ -414,7 +435,11 @@ fn test_absurdly_low_range_still_logs() {
 
     // The decision was `Pace` even though the sleep was 0ms —
     // elapsed is near-instant but the function path executed.
-    assert!(elapsed < Duration::from_millis(20), "should be near-instant with 0ms delay, got {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_millis(20),
+        "should be near-instant with 0ms delay, got {:?}",
+        elapsed
+    );
 
     // Transcript must contain a PACING line — proving the
     // pacing code path ran, not just that we got lucky on a

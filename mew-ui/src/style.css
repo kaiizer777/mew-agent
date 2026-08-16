@@ -272,7 +272,7 @@ input {
   border-radius: var(--radius-lg);
   max-width: 85%;
   line-height: 1.55;
-  font-size: 0.9rem;
+  font-size: 1.05rem;
   animation: msgIn 0.18s ease both;
 }
 
@@ -335,6 +335,15 @@ input {
   background: var(--surface-raised);
   border: 1px solid rgb(248 113 113 / 0.25);
   border-left: 3px solid var(--state-failed);
+  max-width: 90%;
+  padding: 0.875rem 1rem;
+}
+
+.message.task_recovered {
+  align-self: flex-start;
+  background: var(--surface-raised);
+  border: 1px solid rgb(6 182 212 / 0.25);
+  border-left: 3px solid #06b6d4;
   max-width: 90%;
   padding: 0.875rem 1rem;
 }
@@ -620,6 +629,11 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   object-position: center;
   background: var(--surface-base);
   border-radius: var(--radius-sm);
+}
+
+.live-preview-img:not([src]), 
+.live-preview-img[src=""] {
+  visibility: hidden;
 }
 
 .preview-placeholder {

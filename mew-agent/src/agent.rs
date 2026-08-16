@@ -3,6 +3,7 @@ use crate::captcha_telemetry;
 use crate::chat::{MessageBus, UserMessage};
 use crate::completeness::{CompletenessTracker, DeclareItem, MarkOutcome, SubTaskStatus};
 use crate::pacing::{PacingDecision, PacingGuard};
+use crate::router::TaskShape;
 use crate::session::{SessionError, SessionHandle};
 use crate::summarizer::{self, ProgressLine};
 use serde::{Deserialize, Serialize};
@@ -13,11 +14,35 @@ use tokio::sync::Mutex;
 use std::io::Write;
 use mew_perception::state::PerceptionState;
 
+/// Phase 32: serde default for `AgentEvent::Tool::tools_per_turn`.
+/// Returns 1 so old JSON / pre-Phase-32 callers (or replay logs)
+/// deserialize cleanly.
+fn default_tools_per_turn() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum AgentEvent {
     State(crate::session::TransitionRecord),
-    Tool { timestamp_secs: u64, name: String, args: String, result: String },
+    Tool {
+        timestamp_secs: u64,
+        name: String,
+        args: String,
+        result: String,
+        /// Phase 32: number of tool calls dispatched in the LLM
+        /// turn that produced this event. When
+        /// `max_tools_per_turn = 1`, this is always 1 (default
+        /// behavior, byte-for-byte equivalent to pre-Phase-32).
+        /// When `max_tools_per_turn > 1`, the UI's "Working ·
+        /// step N" pill can count individual tool dispatches
+        /// instead of LLM turns. The first tool in a batch sets
+        /// `tools_per_turn = N` (the full batch size); subsequent
+        /// tools in the same batch also set `tools_per_turn = N`
+        /// so the UI has a stable denominator.
+        #[serde(default = "default_tools_per_turn")]
+        tools_per_turn: usize,
+    },
     Summary { timestamp_secs: u64, text: String },
     /// Phase 5: live progress line. Emitted after every tool
     /// dispatch (templated) and at finish() time. The
@@ -31,6 +56,11 @@ pub enum AgentEvent {
         text: String,
         kind: String,
         success: bool,
+    },
+    /// Phase 2: live partial finding emitted during research execution.
+    PartialFinding {
+        timestamp_secs: u64,
+        finding: crate::research::ResearchFinding,
     },
 }
 
@@ -202,6 +232,51 @@ pub struct Agent {
     /// one handle, the CLI / Tauri command can hold
     /// another, both update the same in-memory state).
     captcha_telemetry: std::sync::Arc<captcha_telemetry::CaptchaTelemetry>,
+    /// Phase 35: per-iteration in-page history cap. The number of
+    /// assistant+tool message pairs `trim_in_page_history` keeps
+    /// after a `NoChange` perception. Sourced from
+    /// `config.agent.in_page_history_cap` at construction; the
+    /// `run_preflight_plan` step may override it at session start
+    /// when the task string matches an enumeration pattern
+    /// (`detect_enumeration_task` returns `Some(N)` → cap becomes
+    /// `min(N + 5, 50)`). The trim call site in `run_inner` reads
+    /// from this field every iteration.
+    in_page_history_cap: usize,
+    /// Phase 6: auto-apply orchestration layer. Wraps the
+    /// `AutoApplyConfig` block from config.yaml, the
+    /// `ApplicationDedup` store, and the per-run submission
+    /// counter into a single `AutoApply` handle. The
+    /// dispatch site (`dispatch_single_tool_call`) calls
+    /// `auto_apply.decide(verdict, platform, posting_id)`
+    /// at the irreversible-gate site and matches on the
+    /// returned `AutoApplyDecision` to either pause for
+    /// a draft, silently drop a dedup hit, enforce the
+    /// per-run cap, or auto-submit (the fire-and-forget
+    /// path). Cheap to clone (the dedup store and counter
+    /// are `Arc`-shared) so the dispatch site can call
+    /// into it from a closure / future without
+    /// borrowing the parent.
+    auto_apply: crate::auto_apply::AutoApply,
+}
+
+/// Phase 32: per-tool outcome from `dispatch_single_tool_call`.
+/// The batch loop in `run_inner` reads this to decide whether to
+/// continue dispatching, break (page change or pause), or return
+/// (finish was honored).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchStepOutcome {
+    /// The tool dispatched cleanly; the batch loop should continue
+    /// to the next tool call (if any).
+    Continue,
+    /// The tool was `navigate` and changed the page; remaining
+    /// tools in the batch must NOT run on the new page.
+    PageChanged,
+    /// The tool was `finish()` and the caller should return Ok
+    /// with the finish result.
+    Finish,
+    /// The tool hit the irreversible-action gate; the session is
+    /// now Paused and the next outer iteration should park.
+    Paused,
 }
 
 impl Agent {
@@ -256,12 +331,28 @@ impl Agent {
         // `config.agent.pacing` after the move it'd be a use-after-
         // move error.
         let pacing_config = config.agent.pacing.clone();
+        // Phase 6: same trick for the auto-apply config.
+        // The orchestration layer is built from this
+        // clone; without the clone, the field
+        // initialization at the bottom of the
+        // constructor would try to read
+        // `config.agent.auto_apply` after `config`
+        // has already been moved into `Self`.
+        let auto_apply_config = config.agent.auto_apply.clone();
         // Phase 5: same trick for the summarization config.
         // We hold the cloned value, build the live progress
         // buffer from `live_lines_cap`, then move the cloned
         // config into the struct.
         let summarization_cfg = config.agent.summarization.clone();
         let live_lines_cap = summarization_cfg.live_lines_cap;
+        // Phase 35: read the in-page history cap out of
+        // `config` before the move below. The value is a `usize`
+        // (Copy), so no clone is needed — just bind it to a
+        // local and the move of `config` into `Self` is still
+        // sound. The cap may be raised later in
+        // `run_preflight_plan` by `detect_enumeration_task`,
+        // but the *initial* value is what we install here.
+        let in_page_history_cap = config.agent.in_page_history_cap;
         let system_prompt = "You are mew, a visible browser agent. You drive a real Chromium window.
 You can perceive pages via accessibility-tree snapshots and take actions like click, type, scroll.
 If you need to interact with an element that has no meaningful accessible name/role (e.g. an empty button or canvas), use the `vision_inspect` tool first to visually inspect it.
@@ -274,14 +365,78 @@ For each sub-item, after you take a fresh `snapshot()` and verify the expected s
 If you cannot complete a sub-item, call `mark_subtask_skipped(id, reason)` (deliberately out of scope) or `mark_subtask_failed(id, reason)` (attempted but could not verify). Both are accepted as terminal states.
 Calling `finish()` while any subtask is still pending is intercepted: the agent will force a fresh snapshot and re-prompt you to either mark each pending item done/skipped/failed or explicitly justify it. The gate is not a suggestion.";
 
+        // Phase 36: agent-optimized task prompt compiler. Run the
+        // raw user `task` through the deterministic rule set
+        // *before* either message is constructed. The compiler:
+        //   1. Strips human-oriented directives that the agent has
+        //      no way to honor ("narrate as you go", "move quickly",
+        //      "don't batch", "use declare_subtasks", etc.).
+        //   2. Produces `agent_task` — the cleaned string the LLM
+        //      actually sees as `messages[1].content`.
+        //   3. Produces `execution_hints` — per-vertical lines
+        //      appended to the system prompt as an
+        //      `EXECUTION HINTS:` block, mirroring the style of the
+        //      `PLAN:` block that `run_preflight_plan` appends
+        //      later. For `LocalLeadGen` the block carries the
+        //      Phase 34 Maps execution strategy (extract_fields
+        //      per listing, Escape to close panels, no
+        //      declare_subtasks, markdown-table finish()).
+        //   4. Records `strip_warnings` — one per normalization
+        //      applied. The constructor logs each one to the
+        //      transcript as `[ts] [session_id] PROMPT-COMPILE: <w>`
+        //      right after the transcript file is opened below,
+        //      so a transcript reviewer can see exactly what the
+        //      compiler did to the user's input.
+        //
+        // The shape is inferred from the raw task using the same
+        // cheap text-keyword helper the rest of the agent uses
+        // (`infer_task_shape_from_task`, defined further down in
+        // this file). This keeps the constructor self-contained —
+        // no chat_agent / handoff plumbing is required, and the
+        // compiler's `LocalLeadGen` branch fires whenever the task
+        // textually looks like a Maps lead-gen request, regardless
+        // of whether a parsed `MapsQuery` is available.
+        //
+        // The `Option<&MapsQuery>` parameter is reserved for future
+        // per-vertical hint customization; the current Maps hint
+        // set is shape-driven (the phase 34 spec calls for the
+        // hints to fire "regardless of what the user wrote"),
+        // so we pass `None` here.
+        let compiled = crate::prompt_compiler::compile(
+            &task,
+            infer_task_shape_from_task(&task),
+            None,
+        );
+        // Build the system prompt with the optional
+        // `EXECUTION HINTS:` block appended. Mirrors the
+        // `run_preflight_plan` `PLAN:` block format: a header line
+        // followed by one hint per line, blank line separator.
+        // When `execution_hints` is empty (every non-Maps shape),
+        // the block is omitted entirely so the system prompt stays
+        // byte-for-byte equivalent to the pre-Phase-36 text for
+        // every shape other than `LocalLeadGen`.
+        let system_content = if compiled.execution_hints.is_empty() {
+            system_prompt.to_string()
+        } else {
+            let hints_block = compiled
+                .execution_hints
+                .iter()
+                .map(|h| format!("- {h}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "{system_prompt}\n\nEXECUTION HINTS (pre-flight compiler):\n{hints_block}"
+            )
+        };
+
         let messages = vec![
             json!({
                 "role": "system",
-                "content": system_prompt
+                "content": system_content
             }),
             json!({
                 "role": "user",
-                "content": format!("Task: {}", task)
+                "content": format!("Task: {}", compiled.agent_task)
             })
         ];
 
@@ -354,7 +509,15 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
             Some(dir) => {
                 let path = crate::tracing_layer::session_log_path(dir, &session_id);
                 match crate::tracing_layer::SessionJsonLayer::new(session_id.clone(), path.clone()) {
-                    Ok(layer) => {
+                    Ok(mut layer) => {
+                        // Phase 4: set credential redaction targets
+                        // so GOOGLE_EMAIL / GOOGLE_PASSWORD values
+                        // never appear in trace output.
+                        let redaction_targets =
+                            crate::auth::collect_redaction_targets(&config.agent.credentials);
+                        if !redaction_targets.is_empty() {
+                            layer.set_redaction_targets(redaction_targets);
+                        }
                         let layer = std::sync::Arc::new(layer);
                         // Stage 1: try global. Best-effort.
                         let _ = crate::tracing_layer::try_install_global(layer.clone());
@@ -399,6 +562,36 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                 now, session_id
             );
             let _ = file.write_all(entry.as_bytes());
+        }
+
+        // Phase 36: log each prompt-compiler `strip_warning` to the
+        // transcript in the same `[ts] [session_id] EVENT: ...` format
+        // used by `STATE:` / `PREFLIGHT:` / `TOOL CALL:`. The line
+        // appears after the `STATE: -> Running (start)` line so a
+        // transcript reviewer sees the compiler's audit trail
+        // immediately after the session opens, before any tool
+        // dispatch. When the user wrote a clean task (no
+        // normalizations fired), the loop is a no-op and the
+        // transcript is silent on this front — that's the desired
+        // behavior: only the operations that actually changed the
+        // task string are recorded.
+        if !compiled.strip_warnings.is_empty() {
+            if let Some(mut file) = transcript_file.as_ref() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                for warning in &compiled.strip_warnings {
+                    let entry = format!(
+                        "[{}] [{}] PROMPT-COMPILE: {}\n",
+                        now, session_id, warning
+                    );
+                    let _ = file.write_all(entry.as_bytes());
+                }
+                // Trailing blank line for visual separation from the
+                // first tool-dispatch log.
+                let _ = file.write_all(b"\n");
+            }
         }
 
         Self {
@@ -494,6 +687,38 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                     captcha_telemetry::CaptchaTelemetry::load_or_default(Some(telemetry_path)),
                 )
             },
+            // Phase 35: per-iteration in-page history cap. Read
+            // from `config.agent.in_page_history_cap` (the config
+            // loader hard-clamps to [3, 50]). The `run_preflight_plan`
+            // step may *override* this at session start when
+            // `detect_enumeration_task` finds a "check N listings"
+            // pattern in the task string — auto-detection lets a
+            // 45-listing Maps run keep coherent context across all
+            // 45 listings without the operator having to pre-tune
+            // the YAML for every task shape. The trim call site in
+            // `run_inner` reads from this field every iteration, so
+            // the override takes effect immediately.
+            in_page_history_cap,
+            // Phase 6: auto-apply orchestration layer. The
+            // dedup store lives next to the transcripts
+            // (one folder, two log files) and is loaded
+            // eagerly at construction so the dispatch
+            // site can call `is_already_applied` without
+            // paying for an I/O round-trip on the hot
+            // path. The default `enabled: false` means
+            // the layer is a pure no-op for the
+            // pre-Phase-6 read-only / report-only flow.
+            // Uses `auto_apply_config` (cloned before
+            // the move) rather than `config.agent.auto_apply`
+            // because `config` has already been moved
+            // into the struct by this point.
+            auto_apply: {
+                let dedup_path = crate::application_dedup::default_persist_path(&transcript_dir);
+                let dedup = std::sync::Arc::new(
+                    crate::application_dedup::ApplicationDedup::load_or_default(Some(dedup_path)),
+                );
+                crate::auto_apply::AutoApply::new(auto_apply_config, dedup)
+            },
         }
     }
 
@@ -536,6 +761,57 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
             .unwrap_or_default()
             .as_secs();
         let line = ProgressLine::new(kind, text, ts, success);
+        let pushed = self.live_progress.push(line);
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(AgentEvent::ProgressLine {
+                timestamp_secs: pushed.timestamp_secs,
+                text: pushed.text.clone(),
+                kind: pushed.kind.as_str().to_string(),
+                success: pushed.success,
+            });
+        }
+        Some(pushed)
+    }
+
+    /// Phase 40: emit a chat-visible `AgentEvent::ProgressLine`
+    /// for an allowlist violation. Bypasses the
+    /// `summarizer::summarize` template path because the
+    /// violation text is already constructed — `summarize` is
+    /// designed for the templated "after a tool dispatch" case
+    /// and would truncate our hardened error to its standard
+    /// `<action>: <arg> <result-preview>` shape, losing the
+    /// "edit config.yaml" instruction that the spec calls out
+    /// as the load-bearing user-facing detail.
+    ///
+    /// The line is also pushed to the live-progress buffer
+    /// (same path the templated emit uses) so the
+    /// end-of-task LLM summarizer can quote the violation
+    /// in its summary.
+    ///
+    /// `kind` is the static string `"navigate"` because the
+    /// frontend keys its color/icon off the standard set
+    /// (`navigate` is the closest fit — the violation *is* a
+    /// navigation attempt) and `Other` would be uncolored /
+    /// icon-less in the UI.
+    fn emit_allowlist_block_progress_line(
+        &mut self,
+        blocked_domain: &str,
+        resolution_path: &str,
+    ) -> Option<ProgressLine> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let text = format!(
+            "Navigation blocked: domain '{blocked_domain}' is not in the allowed list — \
+see config.yaml `agent.allowed_domains` (resolver path: {resolution_path})"
+        );
+        let line = ProgressLine::new(
+            summarizer::ProgressKind::Navigate,
+            text,
+            ts,
+            false, // success = false so the UI renders the line in red
+        );
         let pushed = self.live_progress.push(line);
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(AgentEvent::ProgressLine {
@@ -825,6 +1101,21 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
         &self.session_id
     }
 
+    /// Phase 30 stub: stash a respawn handoff payload on the
+    /// agent. The real implementation lives in
+    /// `mew_agent::respawn_policy` / `mew_agent::handoff`; until
+    /// Phase 30 ships, the orchestrator's call site fails to
+    /// compile without this method existing. The stub is a
+    /// no-op — it accepts the handoff so the lib builds, but
+    /// doesn't apply it. A real implementation is a Phase 30
+    /// follow-up.
+    pub fn set_respawn_handoff<T: serde::Serialize>(
+        &mut self,
+        _respawn_h: T,
+    ) {
+        // No-op until Phase 30 lands.
+    }
+
     /// Phase 8: read-only handle to the captcha telemetry. The
     /// CLI / Tauri command holds a sibling `Arc` clone so a
     /// future Tauri command can call `summary()` without
@@ -833,6 +1124,38 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
     /// `O(rows)`.
     pub fn captcha_telemetry(&self) -> std::sync::Arc<captcha_telemetry::CaptchaTelemetry> {
         self.captcha_telemetry.clone()
+    }
+
+    /// Phase 6: read-only handle to the auto-apply
+    /// orchestration layer. Mirrors the captcha-telemetry
+    /// accessor pattern. Cheap to clone (`AutoApply::clone`
+    /// is just an `Arc` refcount bump on the inner dedup
+    /// store + counter). Used by the dispatch site and by
+    /// the end-of-task summary to read the per-run
+    /// submission count without borrowing the agent.
+    pub fn auto_apply(&self) -> crate::auto_apply::AutoApply {
+        self.auto_apply.clone()
+    }
+
+    /// Phase 6: read-only handle to the application
+    /// dedup store. Mirrors the captcha-telemetry
+    /// accessor pattern. Used by the dispatch site
+    /// to call `record_submission` after a confirmed
+    /// application and by the Tauri command that
+    /// surfaces a "X applications sent this session"
+    /// tile. Cheap to clone (`Arc` deep).
+    pub fn application_dedup(
+        &self,
+    ) -> std::sync::Arc<crate::application_dedup::ApplicationDedup> {
+        // The dedup store is the inner state of the
+        // auto-apply handle. The accessor reaches
+        // through `auto_apply` rather than holding
+        // a separate `Arc` so the lifetime
+        // invariants are obvious: the dedup store
+        // is created at construction and lives as
+        // long as the agent; the auto-apply layer
+        // shares it via `Arc`.
+        self.auto_apply.dedup_handle()
     }
 
     /// Phase 2: pre-flight decomposition. Called exactly once
@@ -885,6 +1208,137 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
 
         let plan = crate::planner::plan(&task);
 
+        // Phase 35: enumeration auto-detection. If the task
+        // string contains a "check N listings" / "top N results"
+        // / "each of the N businesses" pattern, override the
+        // per-iteration in-page history cap to `min(N + 5, 50)`
+        // so the agent maintains coherent context across all
+        // listings (without the auto-bump, by listing 7 the
+        // messages describing listings 1-2 have been trimmed
+        // and the agent cannot reliably remember which listings
+        // it has already visited — causing re-clicks). The
+        // override is logged to the transcript with the
+        // `ENUM-DETECT:` prefix so a post-mortem reviewer can
+        // confirm the auto-bump fired on a 15-listing Maps run.
+        // We clamp the headroom to 50 explicitly even though
+        // `detect_enumeration_task` only matches N ∈ [2, 100] —
+        // the `min(..., 50)` is the spec-mandated cap on the
+        // history window itself, applied here for symmetry with
+        // the config loader's [3, 50] clamp.
+        let detected_count = crate::planner::detect_enumeration_task(&task);
+        if let Some(n) = detected_count {
+            let new_cap = (n + 5).min(50);
+            let prev_cap = self.in_page_history_cap;
+            self.in_page_history_cap = new_cap;
+            // Log the decision. Two channels: a structured
+            // tracing event (for JSONL post-mortems) and a
+            // transcript line (for human review).
+            tracing::info!(
+                event = "enum_detect",
+                detected_count = n,
+                prev_cap,
+                new_cap = self.in_page_history_cap,
+                "enumeration task auto-detected; raising in_page_history_cap"
+            );
+            if let Some(mut file) = self.transcript_file.as_ref() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let line = format!(
+                    "[{}] [{}] ENUM-DETECT: count={} cap={}\n\n",
+                    ts,
+                    self.session_id,
+                    n,
+                    self.in_page_history_cap
+                );
+                let _ = file.write_all(line.as_bytes());
+            }
+        }
+
+        // Phase 40: domain allowlist auto-expansion. We
+        // load the per-vertical TOML files (Maps + research
+        // platforms) once and append their `required_domains`
+        // to the session-local `agent.allowed_domains` vec.
+        // The shape is inferred from the task text using the
+        // same helper the preflight system-prompt block uses
+        // (so a "find salons in Mumbai" Maps task and a
+        // "find remote SWE roles" research task both route
+        // to the right variant). When the inferred shape is
+        // `GenericBrowse` or `GenericResearch`, we still load
+        // nothing — `VerticalConfig::Empty` makes
+        // `expand_allowlist` a no-op.
+        //
+        // The expansion is session-local: the
+        // `Option<Vec<String>>` in `AgentConfig` is
+        // `Some(Vec::new())`-ified (or extended) at session
+        // start, never written back to disk. This matches
+        // the spec's "the vec is cloned from the parsed
+        // config at session start — not persisted to disk"
+        // contract.
+        //
+        // Each appended domain is logged via the existing
+        // transcript `ALLOWLIST-EXPAND:` line format so a
+        // post-mortem reviewer can confirm which domains
+        // were auto-added for which task. We also emit a
+        // structured `tracing::info!` event so the JSONL
+        // trace file sees the same fact.
+        let inferred_shape = infer_task_shape_from_task(&task);
+        let vertical_config: crate::VerticalConfig = match inferred_shape {
+            TaskShape::LocalLeadGen => {
+                crate::VerticalConfig::LocalLeadGen(
+                    crate::research::MapsVerticalConfig::load_from_default_location(),
+                )
+            }
+            TaskShape::JobSearch | TaskShape::LeadGen => {
+                crate::VerticalConfig::Research(
+                    crate::research::ResearchPlatforms::load_from_default_location(),
+                )
+            }
+            // GenericBrowse / GenericResearch don't declare
+            // any required domains; passing `Empty` makes
+            // the expansion a clean no-op.
+            _ => crate::VerticalConfig::Empty,
+        };
+        if let Some(ref mut allowed) = self.config.agent.allowed_domains {
+            // Snapshot the pre-expansion list so we can
+            // diff and log the *new* entries only — keeps
+            // the transcript readable on a fresh `config.yaml`
+            // (where most domains are already in the list
+            // and the expansion would otherwise log "added"
+            // for every pre-existing entry).
+            let before: Vec<String> = allowed.clone();
+            crate::expand_allowlist(inferred_shape, allowed, &vertical_config);
+            for added in allowed.iter() {
+                if !before.iter().any(|b| b == added) {
+                    tracing::info!(
+                        event = "allowlist_expand",
+                        session_id = %self.session_id,
+                        domain = %added,
+                        shape = ?inferred_shape,
+                        "session-local allowlist auto-expansion"
+                    );
+                    if let Some(mut file) = self.transcript_file.as_ref() {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let line = format!(
+                            "[{}] [{}] ALLOWLIST-EXPAND: added={} reason={:?}\n\n",
+                            ts, self.session_id, added, inferred_shape
+                        );
+                        let _ = file.write_all(line.as_bytes());
+                    }
+                }
+            }
+        }
+        // Note: when `allowed_domains` is `None` in
+        // `config.yaml` (the explicit "no allowlist
+        // configured" mode), we leave it as `None` — the
+        // pre-Phase-40 navigate handler treats `None` as
+        // "all domains allowed", and changing that
+        // contract is out of scope for this phase.
+
         // Seed the tracker. Empty plans are valid (the LLM may
         // not want to declare anything, and the tracker treats
         // an empty subtask list as "gate is a no-op" — same
@@ -915,6 +1369,22 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
         // makes it unambiguous to the LLM that no subtask
         // tracking is expected, which is itself useful.
         let plan_block = render_plan_block(&plan);
+        // Phase 34: if the task is a Google Maps local-lead-gen
+        // request, append the `GOOGLE MAPS EXECUTION STRATEGY:`
+        // block right after the `PLAN:` block. The block
+        // contains everything the agent needs to know about
+        // the Maps SPA (panel/SPA semantics, extract_fields
+        // usage, escape-to-close, sidebar scroll vs. map
+        // scroll, no-declare-subtasks, ranked table output).
+        // Without this, the agent treats Maps as an unknown
+        // website and reverts to generic-browse defaults —
+        // which the phase 34 spec calls out as the regression
+        // that motivates this work.
+        let maps_block = if infer_task_shape_from_task(&task) == TaskShape::LocalLeadGen {
+            Some(render_maps_hint_block(&task))
+        } else {
+            None
+        };
         if let Some(sys) = self.messages.first_mut() {
             // `serde_json::Value` doesn't expose a mutable string
             // accessor, so we read the current content, build the
@@ -927,7 +1397,10 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                 .and_then(|c| c.as_str())
                 .map(str::to_string);
             if let Some(current) = current {
-                let new_content = format!("{}\n\n{}", current, plan_block);
+                let new_content = match maps_block {
+                    Some(mb) => format!("{}\n\n{}\n\n{}", current, plan_block, mb),
+                    None => format!("{}\n\n{}", current, plan_block),
+                };
                 if let Some(obj) = sys.as_object_mut() {
                     obj.insert("content".to_string(), serde_json::Value::String(new_content));
                 }
@@ -1231,6 +1704,7 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
             "press_key",
             "snapshot",
             "vision_inspect",
+            "extract_fields",
             "finish",
             "declare_subtasks",
             "mark_subtask_done",
@@ -1333,6 +1807,27 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                             "ref": { "type": "string" }
                         },
                         "required": ["ref"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "extract_fields",
+                    "description": "Extract structured data fields from the current page. Returns a JSON object with requested field values. Use this instead of manually parsing the accessibility tree when you need specific data like phone numbers, addresses, ratings, or website URLs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fields": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": ["phone", "address", "rating", "website", "name", "hours", "category", "review_count"]
+                                },
+                                "description": "Array of field names to extract from the current page"
+                            }
+                        },
+                        "required": ["fields"]
                     }
                 }
             },
@@ -1534,6 +2029,17 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
         // hundred bytes for normal use.
         self.captcha_telemetry.flush();
 
+        // Phase 6: flush the application dedup store to
+        // disk so the on-disk records reflect *this*
+        // session's confirmed submissions. The next
+        // session's `load_or_default` reads the same
+        // file and sees the cumulative state — this is
+        // what makes a Monday-then-Tuesday dedup hit
+        // possible. Cheap — JSON file, a few hundred
+        // bytes for normal use. No-op when the dedup
+        // store is in-memory only (`persist_path: None`).
+        self.application_dedup().flush();
+
         if !self.summary_written {
             // Build a short task summary from the original task line
             // in `self.messages`. Same shape the finish() handler
@@ -1664,12 +2170,56 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
 
             // Check for navigation
             let current_page_url = page.url().await.ok().flatten().unwrap_or_default();
+            // Phase 38: snapshot the *old* URL before we overwrite
+            // `self.current_url` so the NavigationKind derivation
+            // below compares the pre-navigation URL against the
+            // current one (matches the boolean logic just above).
+            let old_url_for_nav = self
+                .current_url
+                .clone()
+                .unwrap_or_default();
             let is_navigation = if let Some(ref old_url) = self.current_url {
                 old_url != &current_page_url
             } else {
                 true
             };
             self.current_url = Some(current_page_url.clone());
+
+            // Phase 38: derive a `NavigationKind` from the URL delta so
+            // the perception block can pick a `SnapshotConfig` preset.
+            //
+            // Scope note (rule 6 in work.md): phase 31 was marked
+            // shipped in work.md, but agent.rs's only navigation
+            // signal today is the boolean `is_navigation` above. The
+            // `NavigationKind` enum + `classify_navigation` live in
+            // `mew-cdp` (untouched here per the "don't silently fix
+            // an already-shipped phase" rule) but the agent.rs wiring
+            // from phase 31's work items 3-5 was not applied. This
+            // block is the minimum-impact bridge phase 38 needs:
+            // it re-derives the `NavigationKind` from the URL delta
+            // using the pure `decide_kind` helper, with `None` for
+            // the perf-count (we don't need the CDP eval here —
+            // phase 38 is selecting perception tuning, not driving
+            // history-reset decisions, so the conservative
+            // non-SPA-domain default of `SpaTransition` is
+            // acceptable and won't change the perception timeout
+            // materially for true real-page-load cases). The flag
+            // is in the work plan / phase 31 acceptance log; a
+            // proper fix belongs in a phase-31 follow-up.
+            let nav_kind = if !is_navigation {
+                mew_cdp::NavigationKind::NoChange
+            } else {
+                let spa_domains: Vec<String> = self
+                    .sensitive_platforms
+                    .spa_domains();
+                mew_cdp::decide_kind(
+                    &old_url_for_nav,
+                    &current_page_url,
+                    &spa_domains,
+                    None,
+                )
+            };
+            let snap_config = mew_cdp::snapshot_config_for(nav_kind);
 
             if is_navigation {
                 println!("Navigation detected: Resetting history and forcing full snapshot.");
@@ -1698,9 +2248,17 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                 // fresh tree.
                 self.prior_was_dashboard_like = false;
             } else {
-                // Justify K=5: 5 recent actions provide enough short-term memory (e.g. opened dropdown, scrolled down, typed input)
-                // to continue the task without hallucinating or losing the immediate thread of action, while dropping older stale results.
-                self.trim_in_page_history(5);
+                // Phase 35: trim to the per-iteration cap from
+                // `self.in_page_history_cap` (default 5; may have
+                // been raised by `run_preflight_plan`'s
+                // `detect_enumeration_task` override on a "check
+                // N listings" / "top N results" task). The original
+                // K=5 comment still describes the *baseline*
+                // behavior — 5 recent actions is enough short-term
+                // memory for a typical task — but the cap is now
+                // configurable for long enumeration / lead-gen
+                // tasks where 5 is too few.
+                self.trim_in_page_history(self.in_page_history_cap);
             }
 
             // Phase 13.1: drain the live chat channel *after* navigation has
@@ -1740,17 +2298,29 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
             // bound for a page that genuinely never settles.
             // Realistic case on a healthy page: 1 fast retry with
             // no re-settle needed.
+            //
+            // Phase 38: the hardcoded 5s timeout + 4 retries +
+            // unconditional re-settle is over-provisioned for SPA
+            // panel opens and in-page scrolls. `snap_config` was
+            // computed above from `NavigationKind`; the perception
+            // block now uses its `timeout_secs`, `max_retries`, and
+            // `settle_between_retries` so Maps panel opens get a
+            // 2s/2-retries/no-settle budget and full page loads keep
+            // the pre-Phase-38 5s/4-retries/with-settle budget.
+            // Phase 38 also tracks wall-clock latency so a future
+            // regression is auditable in the transcript.
+            let perception_start = std::time::Instant::now();
             let observation = {
                 let mut state = self.state.lock().await;
 
                 let mut tree_res = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
+                    tokio::time::Duration::from_secs(snap_config.timeout_secs),
                     mew_perception::extract_tree(page, true),
                 )
                 .await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("Timeout extracting tree")));
-                let mut retries = 0;
-                while tree_res.is_err() && retries < 4 {
+                let mut retries: u8 = 0;
+                while tree_res.is_err() && retries < snap_config.max_retries {
                     tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                     // Re-settle: if the AX tree was empty, the
                     // page may have re-rendered between the first
@@ -1758,9 +2328,22 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                     // mode, lazy hydration, etc). One more
                     // bounded wait — usually returns instantly
                     // because the page is now stable.
-                    let _ = mew_cdp::wait_for_page_settled(page).await;
+                    //
+                    // Phase 38: only run the re-settle when
+                    // `snap_config.settle_between_retries` is
+                    // true. For `SpaTransition` (Maps panel
+                    // opens) and `NoChange` (in-page scroll)
+                    // the page is already stable and the
+                    // re-settle would just add up to 10s of
+                    // waiting for no benefit. We still sleep
+                    // 250ms between retries (cheap, lets
+                    // transiently-empty AX trees populate) but
+                    // skip the full page-settle wait.
+                    if snap_config.settle_between_retries {
+                        let _ = mew_cdp::wait_for_page_settled(page).await;
+                    }
                     tree_res = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(5),
+                        tokio::time::Duration::from_secs(snap_config.timeout_secs),
                         mew_perception::extract_tree(page, true),
                     )
                     .await
@@ -1791,8 +2374,33 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                 if !is_navigation {
                     if let Some(prev) = state.get_previous_tree(&self.session_id) {
                         let diff = mew_perception::diff::compute_diff(prev, &tree);
-                        // Heuristic for full page replacement
-                        if diff.removed.len() > 50 && diff.added.len() > 50 {
+                        // Heuristic for full page replacement.
+                        //
+                        // Phase 38: the original `> 50 && > 50`
+                        // threshold is tuned for genuine page
+                        // replacements (where most of the DOM
+                        // changes). For `SpaTransition` (Maps
+                        // panel opens) the diff is smaller but
+                        // still warrants a full snapshot of the
+                        // new panel state, so we lower the
+                        // threshold to 20 in that case. The
+                        // comparator is also `||` for SPA
+                        // (per phase 38 spec) — Maps panel
+                        // swaps typically move nodes *into* the
+                        // removed set without symmetrical adds
+                        // when the previous listing's nodes are
+                        // reused as scaffolding for the next
+                        // listing. Full page navigations
+                        // (`FullNavigation`) and in-page scrolls
+                        // (`NoChange`) keep the pre-Phase-38
+                        // `&& / 50` threshold byte-for-byte.
+                        let is_full = match nav_kind {
+                            mew_cdp::NavigationKind::SpaTransition => {
+                                diff.removed.len() > 20 || diff.added.len() > 20
+                            }
+                            _ => diff.removed.len() > 50 && diff.added.len() > 50,
+                        };
+                        if is_full {
                             is_full_replace = true;
                         } else {
                             computed_diff = Some(diff);
@@ -1800,8 +2408,27 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                     }
                 }
 
-                let obs_text = if is_navigation || is_full_replace || self.force_snapshot || state.get_previous_tree(&self.session_id).is_none() {
-                    mew_perception::diff::serialize_full_tree(&tree)
+                let is_full_snapshot = is_navigation
+                    || is_full_replace
+                    || self.force_snapshot
+                    || state.get_previous_tree(&self.session_id).is_none();
+
+                if is_full_snapshot {
+                    state.record_full_snapshot(&self.session_id);
+                } else {
+                    state.record_diff_snapshot(&self.session_id);
+                }
+                let snap_stats = state.get_stats(&self.session_id);
+
+                let obs_text = if is_full_snapshot {
+                    // Phase 38: honor `agent.max_ax_tree_nodes` from
+                    // config when serializing the full tree. The
+                    // underlying `TreeNode` is untouched (the diff
+                    // path still walks the full tree); only the
+                    // emitted string is truncated. `None` matches
+                    // the pre-Phase-38 unbounded behavior.
+                    let cap = self.config.agent.max_ax_tree_nodes;
+                    mew_perception::diff::serialize_full_tree_capped(&tree, cap)
                 } else {
                     computed_diff.unwrap().serialize_compact()
                 };
@@ -1838,21 +2465,29 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                 };
                 self.completeness
                     .record_snapshot(self.iterations, snapshot_signature.clone());
-                // Phase 1: emit a structured snapshot event so the
-                // trace log can be diffed across runs by signature.
-                // The signature is the same opaque hash the
-                // completeness tracker uses; recording it here means
-                // a reviewer can ask "did the perception block
-                // actually take a fresh snapshot between these two
-                // tool calls?" without reading the transcript.
+                // Phase 1 / Phase 3: emit a structured snapshot event
+                // with full vs diff counters so the trace log can report
+                // full-vs-diff efficiency metrics per session.
                 tracing::info!(
                     event = "snapshot_recorded",
                     iter = self.iterations,
                     signature = %snapshot_signature,
                     obs_bytes = obs_text.len(),
                     is_full_replace = is_full_replace,
+                    is_full_snapshot = is_full_snapshot,
+                    snapshot_type = if is_full_snapshot { "full" } else { "diff" },
+                    full_count = snap_stats.full_snapshots,
+                    diff_count = snap_stats.diff_snapshots,
                     "snapshot recorded"
                 );
+
+                // Phase 38: count the underlying tree's node count
+                // (pre-cap) so the PERCEPTION log line below can
+                // report it. We can't compute this on the rendered
+                // `obs_text` because the cap may have truncated
+                // the output — the reviewer needs to see the true
+                // tree size to audit cap-vs-budget trade-offs.
+                let tree_node_count = count_tree_nodes(&tree_for_resilience);
                 // Phase 6: return the cloned `tree` so the
                 // resilience hook (right after the perception
                 // block) can walk it for modal / rate-limit /
@@ -1861,7 +2496,7 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                 // this clone is the one that flows to the
                 // resilience hook. The detectors see exactly
                 // the tree the LLM sees.
-                (obs_text, ref_map, is_full_replace, tree_for_resilience)
+                (obs_text, ref_map, is_full_replace, tree_for_resilience, tree_node_count)
             };
 
             // The perception block returned whether the diff heuristic
@@ -1871,7 +2506,30 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
             //
             // Phase 13.1: use the note-preserving truncate so a user-
             // typed steering note isn't lost across the reset.
-            let (obs_text, ref_map, is_full_replace, tree) = observation;
+            let (obs_text, ref_map, is_full_replace, tree, tree_node_count) = observation;
+
+            // Phase 38: emit the PERCEPTION line to the transcript
+            // (and tracing) so a future performance regression is
+            // auditable without a profiler. Format mirrors the
+            // NAV-KIND line so reviewers can grep both. The
+            // `latency_ms` is wall-clock from the start of the
+            // perception block; `nodes` is the underlying tree
+            // size (pre-cap) so a truncated snapshot is visibly
+            // distinct from an unbounded one; `snapshot_bytes`
+            // is the post-cap size of the obs text the LLM
+            // actually sees.
+            let perception_latency_ms = perception_start.elapsed().as_millis();
+            self.write_perception_line(nav_kind, perception_latency_ms, tree_node_count, obs_text.len());
+            tracing::info!(
+                event = "perception_recorded",
+                iter = self.iterations,
+                kind = nav_kind.as_str(),
+                latency_ms = perception_latency_ms,
+                nodes = tree_node_count,
+                snapshot_bytes = obs_text.len(),
+                "perception recorded"
+            );
+
             if is_full_replace {
                 println!("Full page replace detected via diff: Resetting history and forcing full snapshot.");
                 self.truncate_preserving_user_notes(2);
@@ -1899,6 +2557,8 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
             let report = crate::resilience::evaluate_page(
                 &tree,
                 self.prior_was_dashboard_like,
+                self.config.agent.credentials.google.is_some(),
+                self.current_url.as_deref().unwrap_or(""),
             );
             match &report.outcome {
                 crate::resilience::ResilienceHookOutcome::Continue => {}
@@ -2079,6 +2739,36 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                         challenge.label,
                         challenge.kind.user_action_hint()
                     ));
+                }
+                crate::resilience::ResilienceHookOutcome::AttemptGoogleLogin { domain } => {
+                    // Phase 4: session loss detected and Google
+                    // credentials are available. Log the event
+                    // and push a system note so the LLM knows
+                    // to look for the Google sign-in button and
+                    // execute the login flow.
+                    crate::resilience::log_resilience_event(
+                        self.transcript_file.as_ref(),
+                        &self.session_id,
+                        "google_auto_login",
+                        &format!("domain={domain}; attempting Google re-authentication"),
+                    );
+                    tracing::info!(
+                        event = "google_auto_login_attempt",
+                        session_id = %self.session_id,
+                        domain = %domain,
+                        "session loss detected; attempting Google re-authentication"
+                    );
+                    self.messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!(
+                            "[resilience:session_loss] Your session on {} has expired. \
+                             A 'Sign in with Google' button may be present on this page. \
+                             Click it to re-authenticate using Google. \
+                             If no Google button is visible, use the platform's login form. \
+                             After signing in, resume the original task.",
+                            domain
+                        ),
+                    }));
                 }
             }
             // Refresh the "did the prior look like a dashboard?"
@@ -2300,1435 +2990,50 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                     continue;
                 }
 
-                // Process first tool call (single action per turn for now)
-                let call = &calls[0];
-                let call_id = call["id"].as_str().unwrap_or("unknown_id");
-                let func = &call["function"];
-                let name = func["name"].as_str().unwrap_or("");
-                let args_str = func["arguments"].as_str().unwrap_or("{}");
-
-                println!("LLM Called Tool: {} with args: {}", name, args_str);
-
-                // Phase 1: log the tool dispatch as a structured
-                // event. The args are recorded as the raw JSON string
-                // (not parsed fields) so a `jq` query can pull them
-                // out later without us maintaining a per-tool schema
-                // in the log layer. The result is recorded by the
-                // existing post-match logging block; we just need the
-                // *dispatch* event to anchor the start of a tool call
-                // in the trace.
-                tracing::info!(
-                    event = "tool_dispatch",
-                    iter = self.iterations,
-                    tool = %name,
-                    args = %args_str,
-                    "tool dispatched"
-                );
-
-                // Phase 12.1: checkpoint after the tool call is parsed, before
-                // it is executed. This is the point where pause()/resume()/
-                // stop() can safely interrupt without leaving the browser in a
-                // half-mutated state. We log the current state so a pause
-                // shows up in the transcript with a real timestamp; the resume
-                // line is logged the next time the state changes back to
-                // Running.
-                let pre_exec_state = self.session.state().await;
-                if let Err(e) = self.session.checkpoint().await {
-                    // If the session went terminal (e.g. caller called
-                    // stop() between the LLM response and the dispatch), log
-                    // the transition we observed and bail.
-                    let post = self.session.history().await;
-                    if let Some(last) = post.last() {
-                        if last.from != last.to {
-                            self.write_state_line(last);
-                        }
-                    }
-                    let _ = pre_exec_state; // documented, retained for the next state read
-                    return Err(anyhow::anyhow!(e.to_string()));
-                }
-                // If state changed through the checkpoint (Running -> Paused ->
-                // Running or Running -> Stopped), log it. We use a snapshot of
-                // the history because the post-checkpoint state is the one the
-                // loop will actually use.
-                let post_history = self.session.history().await;
-                if let Some(last) = post_history.last() {
-                    if last.from != last.to {
-                        self.write_state_line(last);
-                    }
-                }
-
-                // Phase 6: the original `args_str` and
-                // `args` are kept (the LLM's intent, logged
-                // to the transcript). The dispatch site uses
-                // `effective_name` / `effective_args` which
-                // are the modal-dismiss-override-aware
-                // versions — see the block below. The match
-                // arm reads from `effective_args` so the
-                // override flows through naturally.
-                let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                let mut tool_result = String::new();
-
-                // Phase 6: modal-dismiss override. If the
-                // perception step detected a dismissable modal
-                // and stored the close-button ref, *redirect*
-                // the LLM's chosen tool to click that ref first.
-                // The LLM's original choice is logged but not
-                // executed; the LLM sees the dismiss result in
-                // the next observation and re-plans from there.
+                // Phase 32: multi-action batch dispatch.
+                // The LLM may return several tool calls in one
+                // response. We dispatch them sequentially before
+                // the next LLM round-trip, bounded by
+                // `max_tools_per_turn` (default 1 = pre-Phase-32
+                // behavior).
                 //
-                // Why override at the dispatch boundary: the
-                // perception step is the only place that knows
-                // the modal exists; the dispatch step is the
-                // only place that can actually click something.
-                // Wiring both is cleaner than smuggling the
-                // dismiss ref through `self.messages` as a
-                // system-injected tool call (which would change
-                // the LLM's tool-calling history and break
-                // replay).
-                let mut effective_name = name.to_string();
-                let mut effective_args_str = args_str.to_string();
-                let mut effective_args = args.clone();
-                if let Some(dismiss_ref) = self.pending_modal_dismiss.take() {
-                    crate::resilience::log_resilience_event(
-                        self.transcript_file.as_ref(),
-                        &self.session_id,
-                        "modal_dismiss_dispatch",
-                        &format!("dismiss_ref={dismiss_ref} original_tool={name}"),
-                    );
-                    println!("[resilience] modal-dismiss override: clicking {} instead of {}", dismiss_ref, name);
-                    effective_name = "click".to_string();
-                    effective_args_str = format!("{{\"ref\":\"{}\"}}", dismiss_ref);
-                    effective_args = serde_json::json!({ "ref": dismiss_ref });
-                }
-
-                // Phase 6: irreversible-action gate. If the
-                // effective tool is in the irreversible table,
-                // transition the session to `Paused` and surface
-                // a confirmation request to the user instead of
-                // executing. The LLM gets a typed tool result
-                // explaining the gate, and the user can resume
-                // (via the Tauri command path) to confirm.
-                if let Some(outcome) = crate::resilience::evaluate_dispatch(
-                    &effective_name, &effective_args,
-                ) {
-                    if let crate::resilience::ResilienceHookOutcome::PauseForUser { target, action_kind } = outcome {
-                        crate::resilience::log_resilience_event(
-                            self.transcript_file.as_ref(),
-                            &self.session_id,
-                            "irreversible_gate",
-                            &format!("action={} target={}", action_kind, target),
-                        );
-                        // Pause the session so the loop parks
-                        // until the user confirms. The state
-                        // machine in `session.rs` already
-                        // supports Running -> Paused; the
-                        // checkpoint at the top of the next
-                        // iteration will block on this.
-                        let pause_reason = format!(
-                            "irreversible action: {} (target: {}) — awaiting user confirmation",
-                            action_kind, target
-                        );
-                        if let Err(e) = self.session.pause(Some(pause_reason.clone())).await {
-                            tracing::warn!(
-                                event = "irreversible_pause_failed",
-                                error = %e,
-                                "could not transition to Paused; continuing with gate-as-error instead"
-                            );
-                        } else {
-                            // Log the state transition so the
-                            // transcript reviewer sees the
-                            // pause fired.
-                            let history = self.session.history().await;
-                            if let Some(last) = history.last() {
-                                if last.from != last.to {
-                                    self.write_state_line(last);
-                                }
-                            }
-                        }
-                        // Push a "please confirm" message to
-                        // the chat list so the user sees a
-                        // natural-language prompt — never
-                        // raw JSON, per the Phase 4
-                        // communicator-first guarantee.
-                        self.messages.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": format!(
-                                "IRREVERSIBLE ACTION GATE: I'm about to {} (target: {}). I need your confirmation before I proceed. The agent is now paused — please confirm in the chat to resume, or send a steering message to redirect.",
-                                action_kind, target
-                            ),
-                        }));
-                        if let Some(mut file) = self.transcript_file.as_ref() {
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let log_entry = format!(
-                                "[{}] [{}] GATE-IRREVERSIBLE: action={} target={}\n\n",
-                                timestamp, self.session_id, action_kind, target
-                            );
-                            let _ = file.write_all(log_entry.as_bytes());
-                        }
-                        // Do not execute the tool. The next
-                        // iteration's checkpoint will park
-                        // here (state == Paused) until the
-                        // user resumes.
-                        tool_result = format!(
-                            "GATE: irreversible action {} (target: {}) paused for user confirmation. Loop will park on next iteration until resumed.",
-                            action_kind, target
-                        );
-                        // Skip the rest of the dispatch. The
-                        // checkpoint at the top of the next
-                        // iteration will catch the Paused
-                        // state and park the loop. We push
-                        // the tool result above so the LLM
-                        // sees the gate in its history.
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        if let Some(tx) = &self.event_tx {
-                            let _ = tx.send(AgentEvent::Tool {
-                                timestamp_secs: timestamp,
-                                name: effective_name.clone(),
-                                args: effective_args_str.clone(),
-                                result: tool_result.clone(),
-                            });
-                        }
-                        self.emit_progress_line(&effective_name, &effective_args, &tool_result);
-                        continue;
-                    }
-                }
-
-                // Phase 17.1: pacing guard. Decide *before* dispatch
-                // whether the next action should be preceded by a
-                // sleep. The guard is a no-op when the config block
-                // is absent or `enabled: false`, so this is free in
-                // the common case. When pacing *does* fire, we log
-                // the decision to the transcript (so reviewers can
-                // see it) and then sleep.
-                //
-                // Why here, not in each match arm: pacing is a
-                // single decision per tool call, not per tool — we
-                // want exactly one sleep per paced action, and
-                // exactly one transcript line. Putting it at the
-                // dispatch boundary (one call site) makes that
-                // structural rather than convention-based.
-                let pacing_decision = self.pacing.before_action(&effective_name);
-                match &pacing_decision {
-                    PacingDecision::NoPacing => {
-                        // No log line, no sleep. (17.1 spec: log
-                        // *when pacing is applied*, not every
-                        // no-op — that would be spam on every
-                        // iteration.)
-                    }
-                    PacingDecision::Pace { delay, .. } => {
-                        // Log via the shared helper so the format
-                        // matches the other transcript lines.
-                        if let Some(action) = crate::pacing::PacedAction::from_tool_name(name) {
-                            crate::pacing::log_pacing_decision(
-                                self.transcript_file.as_ref(),
-                                &self.session_id,
-                                action,
-                                &pacing_decision,
-                            );
-                        }
-                        tokio::time::sleep(*delay).await;
-                    }
-                }
-
-                let normalize_ref = |r: &str| -> String {
-                    if !r.starts_with('@') { format!("@{}", r) } else { r.to_string() }
-                };
-
-                // Phase 6: the match arm keys on `effective_name`
-                // (which is the modal-dismiss-override-aware
-                // name) rather than the LLM's original `name`.
-                // When the modal-dismiss override fired,
-                // `effective_name == "click"` and the click arm
-                // runs with the dismiss ref as its arg. The
-                // original tool name is preserved in
-                // `effective_args_str` for the transcript.
-                //
-                // `args` (the LLM's original args) is
-                // shadowed to `effective_args` so the match
-                // arm reads the override-aware value without
-                // a per-arm find/replace. The original
-                // `args_str` is unchanged and continues to
-                // be used in the transcript / event-emit
-                // lines below.
-                let args = &effective_args;
-                match effective_name.as_str() {
-                    "navigate" => {
-                        let url = args["url"].as_str().unwrap_or("");
-
-                        if url.contains("force-crash") {
-                            anyhow::bail!("Deliberately forced crash mid-task!");
-                        }
-
-                        // Phase 14.1: URL resolution layer. The LLM may have
-                        // said `navigate("instagram")` (just a bare name) —
-                        // we don't trust its guess, we resolve it ourselves.
-                        // The resolver picks one of the following paths:
-                        //   - via-search / via-search-confirm (Phase 2):
-                        //     the host is in `config/sensitive_platforms.toml`;
-                        //     we route through a Google search results page
-                        //     instead of a direct nav. This is the structural
-                        //     fix for Bug #1's referrer-less-bot-detection
-                        //     failure mode.
-                        //   - map-hit: known site, instant
-                        //   - direct-guess: tried `https://{x}.com` and it
-                        //     loaded inside a 4s probe timeout
-                        //   - search-fallback: gave up, sent to Google
-                        // The path taken is logged to the transcript and
-                        // surfaced in the tool result so the next LLM
-                        // iteration knows the URL it ended up on.
-                        let resolution = mew_nav::resolve_with_probe_sensitive(
+                // Per-tool invariants preserved across the batch:
+                //   - pacing guard runs per tool (not per turn);
+                //   - the modal-dismiss override is consumed on
+                //     the first tool only (subsequent tools see
+                //     the post-dismiss page and run the LLM's
+                //     intent);
+                //   - the irreversible-action gate runs per tool
+                //     and halts the batch on Pause;
+                //   - navigate / finish() break the batch loop
+                //     (navigate changes the page; finish ends the
+                //     session).
+                let take_n = calls
+                    .len()
+                    .min(self.config.agent.max_tools_per_turn.max(1));
+                for batch_idx in 0..take_n {
+                    let outcome = self
+                        .dispatch_single_tool_call(
                             page,
-                            url,
-                            &self.sensitive_platforms,
+                            &calls[batch_idx],
+                            &ref_map,
+                            &obs_summary,
+                            take_n,
                         )
-                        .await;
-                        let resolved_url = &resolution.url;
-
-                        // Log the resolution decision to the transcript.
-                        // This is the "transparent in the transcript" line
-                        // 14.1 requires — when reviewing a transcript you
-                        // can see *why* a site did what it did.
-                        if let Some(mut file) = self.transcript_file.as_ref() {
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let line = format!(
-                                "[{}] [{}] NAV-RESOLVE: input=\"{}\" path={} resolved_url={}\n\n",
-                                ts,
-                                self.session_id,
-                                resolution.original_input,
-                                resolution.path.as_str(),
-                                resolved_url
-                            );
-                            let _ = file.write_all(line.as_bytes());
-                        }
-                        println!(
-                            "[nav-resolve] \"{}\" -> {} (via {})",
-                            resolution.original_input,
-                            resolved_url,
-                            resolution.path.as_str()
-                        );
-
-                        // Domain allowlist check — runs against the
-                        // *resolved* URL, not the LLM's raw input. If the
-                        // resolver sent us to a search-engine results
-                        // page, the check still runs against google.com,
-                        // which is already in the default allowlist.
-                        let mut allowed = true;
-                        if let Some(ref allowed_domains) = self.config.agent.allowed_domains {
-                            if let Ok(parsed_url) = url::Url::parse(resolved_url) {
-                                if let Some(domain) = parsed_url.domain() {
-                                    if !allowed_domains.iter().any(|d| domain == d || domain.ends_with(&format!(".{}", d))) {
-                                        allowed = false;
-                                    }
-                                }
-                            }
-                        }
-
-                        if !allowed {
-                            tool_result = format!("ERROR: Action failed (Navigation). Domain for URL '{}' (resolved from '{}' via {}) is not in the allowlist. Do not attempt this domain.", resolved_url, resolution.original_input, resolution.path.as_str());
-                        } else {
-                            // Phase 8: pre-navigate pacing for known
-                            // challengers. The theory of the case:
-                            // a `known_to_challenge_bots = true` host
-                            // is overwhelmingly likely to *serve* a
-                            // challenge page on first hit. Bursting
-                            // in with no delay is the worst possible
-                            // pattern — bot detectors see a fresh
-                            // session with no referrer history, no
-                            // human-like pacing, and no warm-up
-                            // actions. A 1.5-3s "settle in" delay
-                            // before the navigation is the cheapest
-                            // possible signal we can send: this
-                            // browser is moving at human speed, not
-                            // script speed.
-                            //
-                            // The delay is bounded (3s worst case)
-                            // so an unattended task isn't blocked
-                            // indefinitely. It's also *only* fired
-                            // when the sensitive-platforms table
-                            // flags the host — a normal site like
-                            // github.com gets no extra delay.
-                            //
-                            // We sleep *before* the `for attempt in
-                            // 1..=3` retry loop so a 429 / page-
-                            // crash on attempt 1 doesn't double the
-                            // pacing. The `extra_pre_nav_pacing_ms`
-                            // field is read fresh on every navigate
-                            // so a config edit (or a future per-
-                            // session override) takes effect on the
-                            // next call.
-                            if let Ok(parsed) = url::Url::parse(resolved_url) {
-                                if let Some(host) = parsed.host_str() {
-                                    if self.sensitive_platforms.is_known_challenger(host) {
-                                        // Deterministic-but-jittered
-                                        // delay. We use a small
-                                        // window (1500-3000 ms)
-                                        // so the user doesn't see
-                                        // a noticeable hang on
-                                        // most navigations but
-                                        // the bot detector sees
-                                        // a non-script cadence.
-                                        // The `nano_time() ^
-                                        // iteration` salt keeps
-                                        // consecutive navigations
-                                        // from landing on the
-                                        // same exact delay (which
-                                        // would itself be a
-                                        // detectable pattern).
-                                        let nanos = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.subsec_nanos() as u64)
-                                            .unwrap_or(0)
-                                            ^ (self.iterations as u64);
-                                        let jitter = (nanos % 1500) as u64; // 0-1499 ms
-                                        let pre_nav_ms = 1500 + jitter; // 1500-2999 ms
-                                        tracing::info!(
-                                            event = "pre_nav_known_challenger_pacing",
-                                            session_id = %self.session_id,
-                                            host = %host,
-                                            delay_ms = pre_nav_ms,
-                                            "sleeping before navigate on a known challenger"
-                                        );
-                                        crate::resilience::log_resilience_event(
-                                            self.transcript_file.as_ref(),
-                                            &self.session_id,
-                                            "PreNavPacing",
-                                            &format!("host={host} delay_ms={pre_nav_ms}"),
-                                        );
-                                        tokio::time::sleep(
-                                            tokio::time::Duration::from_millis(pre_nav_ms),
-                                        )
-                                        .await;
-                                        // Phase 8: pre-seed the
-                                        // telemetry as `expected`
-                                        // when we *predict* a
-                                        // challenge will fire.
-                                        // The `record()` call
-                                        // (in the captcha
-                                        // detection arm above)
-                                        // will then increment an
-                                        // already-`expected` row
-                                        // — the summary marks
-                                        // these distinctly from
-                                        // "new" rows that
-                                        // appeared without a
-                                        // pre-navigate hint.
-                                        self.captcha_telemetry.mark_expected(host);
-                                    }
-                                }
-                            }
-
-                            let mut success = false;
-                            let mut backoff = 1;
-                            for attempt in 1..=3 {
-                                match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::navigate(page, resolved_url)).await {
-                                    Ok(Ok(_)) => {
-                                        // Phase 4 (Bug 4 fix): replace the
-                                        // fixed 2s sleep with a proper
-                                        // DOM-content wait. The old sleep
-                                        // was a band-aid: on JS-heavy pages
-                                        // (GitHub, SPAs) the page's
-                                        // `loadEventFired` event fires well
-                                        // before the SPA has populated the
-                                        // DOM, so the AX tree at this point
-                                        // was just the RootWebArea + a single
-                                        // `ignored/uninteresting` child with
-                                        // `busy: true` — see the pre-fix
-                                        // capture in
-                                        // `tests-output/phase4_bug4_repro_github_pre_fix.out.txt`.
-                                        //
-                                        // `wait_for_page_settled` polls
-                                        // document.readyState + body +
-                                        // aria-busy + text length, bounded
-                                        // at 10s. Fast pages (example.com)
-                                        // settle on the first poll (~0ms
-                                        // added). Slow pages (GitHub) wait
-                                        // until the SPA actually populates.
-                                        // Total worst case is 10s + 200ms
-                                        // floor, which is correct: we want
-                                        // the page, not the load event.
-                                        let settle = mew_cdp::wait_for_page_settled(page).await;
-                                        if !settle.settled {
-                                            println!(
-                                                "[navigate] page did not fully settle after {}ms ({} polls) — proceeding anyway; perception may need to retry",
-                                                settle.elapsed_ms, settle.polls
-                                            );
-                                        } else {
-                                            println!(
-                                                "[navigate] page settled in {}ms ({} polls)",
-                                                settle.elapsed_ms, settle.polls
-                                            );
-                                        }
-                                        // Tell the LLM (and the user reading
-                                        // logs) which path got us here. If
-                                        // the LLM asked for "instagram" and
-                                        // we ended up on a Google results
-                                        // page, the next turn can see that
-                                        // and adjust.
-                                        tool_result = format!(
-                                            "Navigated successfully (resolved \"{}\" -> \"{}\" via {})",
-                                            resolution.original_input,
-                                            resolved_url,
-                                            resolution.path.as_str()
-                                        );
-                                        success = true;
-                                        break;
-                                    },
-                                    Ok(Err(e)) => {
-                                        // The navigate CDP call errored
-                                        // (rare; usually means the browser
-                                        // hung up). Before we surface the
-                                        // error, give the page one more
-                                        // chance to settle — sometimes the
-                                        // navigation actually succeeded at
-                                        // the browser level and only the
-                                        // future returned an error.
-                                        let _ = mew_cdp::wait_for_page_settled(page).await;
-                                        tool_result = format!("ERROR: Action failed (Navigation). {}. Do not assume success.", e);
-                                    },
-                                    Err(_) => {
-                                        // Navigation timed out at 15s. The
-                                        // page may still be partially
-                                        // loaded (the CDP call hung, not
-                                        // the network). One more settle
-                                        // attempt — if the page eventually
-                                        // finishes loading we still want
-                                        // the LLM to be able to act on it.
-                                        let _ = mew_cdp::wait_for_page_settled(page).await;
-                                        tool_result = "ERROR: Action failed (Timeout while navigating). The navigation timed out and did not complete successfully. Do not assume your action succeeded.".to_string();
-                                    },
-                                }
-                                if attempt < 3 && !success {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
-                                    backoff *= 2;
-                                }
-                            }
-                        }
-                    },
-                    "click" => {
-                        let r = args["ref"].as_str().unwrap_or("");
-                        let r_norm = normalize_ref(r);
-                        if let Some(backend_id) = ref_map.get(&r_norm) {
-                            // Phase 16.1: pre-compute the element's center and slide
-                            // the visible ghost cursor there before the real click.
-                            // This is the *only* place we read `visible_cursor` from
-                            // config at click time — keep it scoped to the click
-                            // branch so other tools (type, scroll, navigate) are
-                            // completely unaffected.
-                            let cursor_enabled = self
-                                .config
-                                .browser
-                                .as_ref()
-                                .map(|b| b.visible_cursor)
-                                .unwrap_or(false);
-                            if cursor_enabled {
-                                if let Ok(Some((cx, cy))) =
-                                    mew_cdp::compute_element_center(page, backend_id.clone()).await
-                                {
-                                    // Slide cursor toward the target first. The CSS
-                                    // transition (180ms) on the cursor div handles
-                                    // the visible motion, so this moveTo starts the
-                                    // slide immediately.
-                                    mew_cdp::move_cursor(page, cx, cy).await;
-                                    // Sleep a touch longer than the transition so the
-                                    // slide is fully complete before the click
-                                    // fires. Spec: 100-200ms.
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(200))
-                                        .await;
-                                }
-                            }
-
-                            let mut success = false;
-                            let mut backoff = 1;
-                            for attempt in 1..=3 {
-                                match tokio::time::timeout(tokio::time::Duration::from_secs(1), mew_cdp::click_ref(page, backend_id.clone())).await {
-                                    Ok(Ok(_)) => {
-                                        // Fire the click ripple exactly once, on the
-                                        // successful attempt. We re-compute the
-                                        // center here rather than caching the cx/cy
-                                        // outside the loop because the element may
-                                        // have moved between attempts; the ripple
-                                        // should land on the actual final target.
-                                        if cursor_enabled {
-                                            if let Ok(Some((cx, cy))) =
-                                                mew_cdp::compute_element_center(page, backend_id.clone()).await
-                                            {
-                                                mew_cdp::move_cursor_and_ripple(page, cx, cy).await;
-                                            }
-                                        }
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                        tool_result = "Clicked successfully".to_string();
-                                        // Phase 6: a successful
-                                        // click resets the
-                                        // ref-recovery budget.
-                                        // The next stale ref
-                                        // event gets a fresh
-                                        // full budget.
-                                        self.ref_recovery_attempts = 0;
-                                        success = true;
-                                        break;
-                                    },
-                                    Ok(Err(e)) => {
-                                        if let mew_cdp::StaleRefError::NotFound(_) = e {
-                                            // Phase 6: ref-recovery
-                                            // hook. The CDP layer
-                                            // returned a stale-ref
-                                            // error; ask the
-                                            // resilience crate to
-                                            // decide retry vs
-                                            // escalate based on
-                                            // the action kind and
-                                            // the current ref map.
-                                            // A `Retry` sets
-                                            // `force_snapshot =
-                                            // true` (existing
-                                            // behavior) but ALSO
-                                            // bumps the per-iter
-                                            // retry counter so
-                                            // the budget can be
-                                            // enforced.
-                                            let current_refs: std::collections::HashMap<String, ()> = ref_map
-                                                .iter()
-                                                .map(|(k, _)| (k.clone(), ()))
-                                                .collect();
-                                            let recovery_inputs = mew_resilience::ref_recovery::RefRecoveryInputs {
-                                                supplied_ref: &r_norm,
-                                                current_ref_map: &current_refs,
-                                                target_desc: None,
-                                                description_index: None,
-                                                action: mew_resilience::ref_recovery::RefActionKind::Click,
-                                                attempts_so_far: self.ref_recovery_attempts,
-                                            };
-                                            let recovery_cfg = mew_resilience::ref_recovery::RefRecoveryConfig::default();
-                                            match mew_resilience::ref_recovery::attempt_recovery(
-                                                &recovery_cfg,
-                                                &recovery_inputs,
-                                            ) {
-                                                mew_resilience::ref_recovery::RefRecoveryOutcome::Retry { new_ref, attempts_so_far } => {
-                                                    crate::resilience::log_resilience_event(
-                                                        self.transcript_file.as_ref(),
-                                                        &self.session_id,
-                                                        "ref_recovery_retry",
-                                                        &format!("old={} new={} attempt={}", r_norm, new_ref, attempts_so_far),
-                                                    );
-                                                    self.ref_recovery_attempts = attempts_so_far;
-                                                    self.force_snapshot = true;
-                                                    tool_result = format!(
-                                                        "Stale ref detected ({}). Recovery: re-snapshot and retry with the new ref. The agent will re-snapshot and pick a fresh ref next iteration.",
-                                                        r_norm
-                                                    );
-                                                    success = true;
-                                                    break;
-                                                }
-                                                mew_resilience::ref_recovery::RefRecoveryOutcome::EscalateToLLM { reason, attempts_so_far } => {
-                                                    crate::resilience::log_resilience_event(
-                                                        self.transcript_file.as_ref(),
-                                                        &self.session_id,
-                                                        "ref_recovery_escalate",
-                                                        &format!("ref={} attempt={}", r_norm, attempts_so_far),
-                                                    );
-                                                    self.ref_recovery_attempts = attempts_so_far;
-                                                    self.force_snapshot = true;
-                                                    tool_result = format!(
-                                                        "ERROR: Action failed (Stale Element Reference). {}. The element was removed from the DOM. Your action had NO effect. Re-evaluate the new page state and decide your next step.",
-                                                        reason
-                                                    );
-                                                    success = true;
-                                                    break;
-                                                }
-                                                mew_resilience::ref_recovery::RefRecoveryOutcome::AbortWithReason { reason, attempts_so_far } => {
-                                                    crate::resilience::log_resilience_event(
-                                                        self.transcript_file.as_ref(),
-                                                        &self.session_id,
-                                                        "ref_recovery_abort",
-                                                        &format!("ref={} attempt={}", r_norm, attempts_so_far),
-                                                    );
-                                                    self.ref_recovery_attempts = attempts_so_far;
-                                                    self.force_snapshot = true;
-                                                    tool_result = format!(
-                                                        "ERROR: Action aborted (Stale Element Reference). {}. Your action had NO effect.",
-                                                        reason
-                                                    );
-                                                    success = true;
-                                                    break;
-                                                }
-                                            }
-                                        } else {
-                                            tool_result = format!("ERROR: Action failed (Click). {}. Do not assume success.", e);
-                                        }
-                                    },
-                                    Err(_) => tool_result = "ERROR: Action failed (Timeout while clicking). The click action timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
-                                }
-                                if attempt < 3 && !success {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
-                                    backoff *= 2;
-                                }
-                            }
-                        } else {
-                            tool_result = format!("ref_id {} (normalized: {}) not found on page", r, r_norm);
-                            println!("{}", tool_result);
-                        }
-                    },
-                    "type" => {
-                        let r = args["ref"].as_str().unwrap_or("");
-                        let r_norm = normalize_ref(r);
-                        let text = args["text"].as_str().unwrap_or("");
-                        if let Some(backend_id) = ref_map.get(&r_norm) {
-                            let mut success = false;
-                            let mut backoff = 1;
-                            for attempt in 1..=3 {
-                                match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::type_ref(page, backend_id.clone(), text)).await {
-                                    Ok(Ok(_)) => {
-                                        tool_result = "Typed successfully".to_string();
-                                        // Phase 6: reset ref-recovery
-                                        // budget on success.
-                                        self.ref_recovery_attempts = 0;
-                                        success = true;
-                                        break;
-                                    },
-                                    Ok(Err(e)) => {
-                                        if let mew_cdp::StaleRefError::NotFound(_) = e {
-                                            // Phase 6: ref-recovery
-                                            // hook (same shape as the
-                                            // click arm above). For
-                                            // `type` the recovery
-                                            // crate's Type-specific
-                                            // rule applies: if the
-                                            // page has gone empty of
-                                            // interactive elements,
-                                            // the recovery is
-                                            // `AbortWithReason` rather
-                                            // than `Retry` — a
-                                            // non-idempotent action
-                                            // shouldn't auto-retry
-                                            // against a guessed
-                                            // target.
-                                            let current_refs: std::collections::HashMap<String, ()> = ref_map
-                                                .iter()
-                                                .map(|(k, _)| (k.clone(), ()))
-                                                .collect();
-                                            let recovery_inputs = mew_resilience::ref_recovery::RefRecoveryInputs {
-                                                supplied_ref: &r_norm,
-                                                current_ref_map: &current_refs,
-                                                target_desc: None,
-                                                description_index: None,
-                                                action: mew_resilience::ref_recovery::RefActionKind::Type,
-                                                attempts_so_far: self.ref_recovery_attempts,
-                                            };
-                                            let recovery_cfg = mew_resilience::ref_recovery::RefRecoveryConfig::default();
-                                            match mew_resilience::ref_recovery::attempt_recovery(
-                                                &recovery_cfg,
-                                                &recovery_inputs,
-                                            ) {
-                                                mew_resilience::ref_recovery::RefRecoveryOutcome::Retry { new_ref, attempts_so_far } => {
-                                                    crate::resilience::log_resilience_event(
-                                                        self.transcript_file.as_ref(),
-                                                        &self.session_id,
-                                                        "ref_recovery_retry",
-                                                        &format!("old={} new={} attempt={}", r_norm, new_ref, attempts_so_far),
-                                                    );
-                                                    self.ref_recovery_attempts = attempts_so_far;
-                                                    self.force_snapshot = true;
-                                                    tool_result = format!(
-                                                        "Stale ref detected ({}). Recovery: re-snapshot and retry with the new ref.",
-                                                        r_norm
-                                                    );
-                                                    success = true;
-                                                    break;
-                                                }
-                                                mew_resilience::ref_recovery::RefRecoveryOutcome::EscalateToLLM { reason, attempts_so_far } => {
-                                                    crate::resilience::log_resilience_event(
-                                                        self.transcript_file.as_ref(),
-                                                        &self.session_id,
-                                                        "ref_recovery_escalate",
-                                                        &format!("ref={} attempt={}", r_norm, attempts_so_far),
-                                                    );
-                                                    self.ref_recovery_attempts = attempts_so_far;
-                                                    self.force_snapshot = true;
-                                                    tool_result = format!(
-                                                        "ERROR: Action failed (Stale Element Reference). {}. The element was removed from the DOM. Your action had NO effect.",
-                                                        reason
-                                                    );
-                                                    success = true;
-                                                    break;
-                                                }
-                                                mew_resilience::ref_recovery::RefRecoveryOutcome::AbortWithReason { reason, attempts_so_far } => {
-                                                    crate::resilience::log_resilience_event(
-                                                        self.transcript_file.as_ref(),
-                                                        &self.session_id,
-                                                        "ref_recovery_abort",
-                                                        &format!("ref={} attempt={}", r_norm, attempts_so_far),
-                                                    );
-                                                    self.ref_recovery_attempts = attempts_so_far;
-                                                    self.force_snapshot = true;
-                                                    tool_result = format!(
-                                                        "ERROR: Action aborted (Stale Element Reference). {}. A type action against a guessed target would be unsafe.",
-                                                        reason
-                                                    );
-                                                    success = true;
-                                                    break;
-                                                }
-                                            }
-                                        } else {
-                                            tool_result = format!("ERROR: Action failed (Type). {}. Do not assume success.", e);
-                                        }
-                                    },
-                                    Err(_) => tool_result = "ERROR: Action failed (Timeout while typing). The type action timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
-                                }
-                                if attempt < 3 && !success { 
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await; 
-                                    backoff *= 2; 
-                                }
-                            }
-                        } else {
-                            tool_result = format!("ref_id {} (normalized: {}) not found on page", r, r_norm);
-                            println!("{}", tool_result);
-                        }
-                    },
-                    "scroll" => {
-                        let dir = args["direction"].as_str().unwrap_or("down");
-                        let d = if dir == "up" { mew_cdp::ScrollDirection::Up } else { mew_cdp::ScrollDirection::Down };
-                        match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::scroll(page, d, 800)).await {
-                            Ok(Ok(_)) => {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                tool_result = "Scrolled successfully".to_string();
-                            },
-                            Ok(Err(e)) => tool_result = format!("ERROR: Action failed (Scroll). {}. Do not assume success.", e),
-                            Err(_) => tool_result = "ERROR: Action failed (Timeout while scrolling). The scroll action timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
-                        }
-                    },
-                    "press_key" => {
-                        let key = args["key"].as_str().unwrap_or("");
-                        match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::press_key(page, key)).await {
-                            Ok(Ok(_)) => {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                tool_result = "Key pressed successfully".to_string();
-                            },
-                            Ok(Err(e)) => tool_result = format!("ERROR: Action failed (Press Key). {}. Do not assume success.", e),
-                            Err(_) => tool_result = "ERROR: Action failed (Timeout while pressing key). The press_key action timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
-                        }
-                    },
-                    "snapshot" => {
-                        // Phase 15.1: the snapshot tool MUST return the
-                        // current page-state signature so the model can
-                        // pass it to `mark_subtask_done` as evidence.
-                        // Without surfacing the signature here, the
-                        // model is forced to guess one, and any guess
-                        // will be rejected by the tracker's evidence
-                        // rule — making the gate look broken when it
-                        // is actually working correctly. The signature
-                        // is recorded in the perception block *after*
-                        // the snapshot, so by the time this tool
-                        // handler runs (next iteration), it's the
-                        // freshest one available.
-                        let sig = self
-                            .completeness
-                            .last_snapshot_signature
-                            .clone()
-                            .unwrap_or_else(|| "(none yet — perception block has not recorded a snapshot for this session)".to_string());
-                        tool_result = format!(
-                            "Snapshot taken. Observe the new page state in the next user message. Current snapshot_signature: {}",
-                            sig
-                        );
-                    },
-                    "vision_inspect" => {
-                        let r = args["ref"].as_str().unwrap_or("");
-                        let r_norm = normalize_ref(r);
-                        if let Some(backend_id) = ref_map.get(&r_norm) {
-                            match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::screenshot_region(page, backend_id.clone())).await {
-                                Ok(Ok((base64_data, x, y, w, h))) => {
-                                    println!("Region screenshot captured: {}x{} at {},{}", w, h, x, y);
-                                    let vision_body = serde_json::json!({
-                                        "model": "mimo-v2.5-free",
-                                        "messages": [
-                                            {
-                                                "role": "user",
-                                                "content": [
-                                                    {"type": "text", "text": "Describe what you see in this cropped UI region. Identify if it looks like a button, icon, or specific widget."},
-                                                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", base64_data)}}
-                                                ]
-                                            }
-                                        ]
-                                    });
-                                    let url = format!("{}/chat/completions", self.config.opencode_zen.base_url);
-                                    let v_res_future = self.client.post(&url)
-                                        .header("Authorization", format!("Bearer {}", self.config.opencode_zen.api_key))
-                                        .json(&vision_body)
-                                        .send();
-                                        
-                                    match tokio::time::timeout(tokio::time::Duration::from_secs(30), v_res_future).await {
-                                        Ok(Ok(resp)) => {
-                                            if let Ok(v_json) = resp.json::<serde_json::Value>().await {
-                                                if let Some(desc) = v_json["choices"][0]["message"]["content"].as_str() {
-                                                    // Phase 6: wrap the
-                                                    // raw description
-                                                    // in the
-                                                    // vision-confidence
-                                                    // gate. The
-                                                    // score() pure
-                                                    // function derives
-                                                    // a confidence
-                                                    // from the LLM's
-                                                    // own text (and
-                                                    // the box size);
-                                                    // the threshold
-                                                    // (0.5) decides
-                                                    // whether the
-                                                    // description is
-                                                    // acceptable. Low
-                                                    // confidence ->
-                                                    // surface a
-                                                    // typed error so
-                                                    // the LLM knows
-                                                    // the vision
-                                                    // result is not
-                                                    // reliable, and
-                                                    // suggest the
-                                                    // tighter-crop
-                                                    // coords the loop
-                                                    // would use to
-                                                    // re-shoot.
-                                                    let verdict = crate::resilience::evaluate_vision(
-                                                        desc,
-                                                        Some((x, y, w, h)),
-                                                    );
-                                                    let threshold = 0.5_f32;
-                                                    if verdict.confidence.is_acceptable(threshold) {
-                                                        tool_result = format!(
-                                                            "Vision fallback result for region {}:\nDescription: {}\nBounds: {}x{} at {},{}\nConfidence: {:.2}",
-                                                            r, desc, w, h, x, y, verdict.confidence.score
-                                                        );
-                                                    } else {
-                                                        crate::resilience::log_resilience_event(
-                                                            self.transcript_file.as_ref(),
-                                                            &self.session_id,
-                                                            "vision_ambiguity",
-                                                            &format!(
-                                                                "ref={} confidence={:.2} threshold={:.2}",
-                                                                r, verdict.confidence.score, threshold
-                                                            ),
-                                                        );
-                                                        let tighten = verdict
-                                                            .tighten_crop
-                                                            .map(|(tx, ty, tw, th)| {
-                                                                format!(
-                                                                    " Suggested tighter crop: x={:.0} y={:.0} w={:.0} h={:.0} (use this for the next screenshot).",
-                                                                    tx, ty, tw, th
-                                                                )
-                                                            })
-                                                            .unwrap_or_default();
-                                                        tool_result = format!(
-                                                            "Vision result is not reliable (confidence {:.2}, threshold {:.2}). The LLM's description was too vague to act on.{} Try a different region or use a structured accessibility-tree element instead of vision.",
-                                                            verdict.confidence.score, threshold, tighten
-                                                        );
-                                                        // Phase 6: do not
-                                                        // mark the vision
-                                                        // call a success
-                                                        // when the
-                                                        // confidence is
-                                                        // below threshold.
-                                                        // The LLM should
-                                                        // pick a different
-                                                        // approach
-                                                        // (snapshot +
-                                                        // accessibility
-                                                        // tree).
-                                                    }
-                                                } else {
-                                                    tool_result = "Vision API returned no description".to_string();
-                                                }
-                                            } else {
-                                                tool_result = "Vision API returned invalid JSON".to_string();
-                                            }
-                                        },
-                                        Ok(Err(e)) => tool_result = format!("Vision API call failed: {}", e),
-                                        Err(_) => tool_result = "Vision API call timed out".to_string(),
-                                    }
-                                },
-                                Ok(Err(e)) => tool_result = format!("Failed to take screenshot of region: {}", e),
-                                Err(_) => tool_result = "Timeout while taking screenshot of region".to_string(),
-                            }
-                        } else {
-                            tool_result = format!("ref_id {} (normalized: {}) not found on page", r, r_norm);
-                            println!("{}", tool_result);
-                        }
-                    },
-                    "finish" => {
-                        // Phase 15.1: the finish() tool is gated by the
-                        // completeness tracker. If subtasks were declared
-                        // and any are still pending, this first call is
-                        // intercepted — we do NOT return Ok(res). Instead
-                        // we set `tool_result` to a re-prompt the LLM sees
-                        // on the next iteration, log the gate-trigger
-                        // event, and continue the loop.
-                        //
-                        // The 15.1 spec is explicit: "force one more
-                        // snapshot() and require the model to explicitly
-                        // justify each incomplete item." We do both: the
-                        // re-prompt is injected as a tool-result error
-                        // (so the LLM is told to act on it next turn)
-                        // AND we set force_snapshot so the next iteration
-                        // gets a fresh tree, not a stale diff.
-                        let res = args["result"].as_str().unwrap_or("").to_string();
-                        self.completeness.record_finish_attempt();
-                        self.finish_calls_this_gate += 1;
-
-                        if self.completeness.gate_open() {
-                            // Gate clear — let finish() through. Write the
-                            // per-subtask summary to the transcript first
-                            // (the spec requires it be logged at the end of
-                            // every session), then return.
-                            let task_summary = self
-                                .messages
-                                .iter()
-                                .find_map(|m| {
-                                    m.get("role").and_then(|r| r.as_str())
-                                        .filter(|r| *r == "user")
-                                        .and_then(|_| m.get("content").and_then(|c| c.as_str()))
-                                })
-                                .unwrap_or("(no task recorded)")
-                                .to_string();
-                            let summary_text = self.completeness.write_summary(
-                                self.transcript_file.as_ref(),
-                                &self.session_id,
-                                &task_summary,
-                            );
-                            if let Some(tx) = &self.event_tx {
-                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                let _ = tx.send(AgentEvent::Summary {
-                                    timestamp_secs: ts,
-                                    text: summary_text,
-                                });
-                            }
-                            self.summary_written = true;
-                            // Phase 5: end-of-task LLM summarizer.
-                            // The agent's raw `finish()` text is
-                            // usually a list of "I clicked X. I
-                            // typed Y. I called finish()" — not
-                            // user-friendly. The LLM call rewrites
-                            // it into a 1-2 sentence reply that
-                            // references the actual people/sites/
-                            // values the steps mention. On any
-                            // failure (network, parse, model
-                            // refusal) we fall back to the raw
-                            // `res` so the user always sees
-                            // *something* — the never-silent
-                            // guarantee.
-                            //
-                            // The task description fed to the
-                            // summarizer strips the "Task: " prefix
-                            // the system prompt adds (the LLM
-                            // already sees the raw task; the
-                            // summary should too).
-                            let task_for_summary = task_summary
-                                .strip_prefix("Task: ")
-                                .unwrap_or(&task_summary);
-                            let final_text = match self
-                                .end_of_task_summarize(task_for_summary, &res)
-                                .await
+                        .await?;
+                    match outcome {
+                        BatchStepOutcome::Continue => {}
+                        BatchStepOutcome::PageChanged
+                        | BatchStepOutcome::Paused => break,
+                        BatchStepOutcome::Finish => {
+                            if let Some(result) =
+                                self.pending_finish_result.take()
                             {
-                                Some(s) if !s.is_empty() => s,
-                                _ => res.clone(),
-                            };
-                            println!("Task finished with result: {}", final_text);
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            if let Some(mut file) = self.transcript_file.as_ref() {
-                                let log_entry = format!(
-                                    "[{}] [{}] TOOL CALL: {} (args: {})\nRESULT: Task finished: {}\n\n",
-                                    timestamp, obs_summary, name, args_str, final_text
-                                );
-                                let _ = file.write_all(log_entry.as_bytes());
+                                return Ok(result);
                             }
-                            if let Some(tx) = &self.event_tx {
-                                let _ = tx.send(AgentEvent::Tool {
-                                    timestamp_secs: timestamp,
-                                    name: name.to_string(),
-                                    args: args_str.to_string(),
-                                    result: format!("Task finished: {}", final_text),
-                                });
-                            }
-                            // Stash the result so the post-match block
-                            // can return it. We use a small String
-                            // captured via `pending_finish_result` so
-                            // the existing match-arm exit path is reused.
-                            self.pending_finish_result = Some(final_text);
-                            // Use a non-error tool_result to satisfy the
-                            // match's fallthrough; the real Ok return
-                            // happens after the match.
-                            tool_result = "(gate open — finish accepted; will return on next iteration)".to_string();
-                        } else {
-                            // Gate closed — first call is a re-prompt.
-                            // Don't return. Mark gate triggered, force a
-                            // fresh snapshot next iteration, and tell the
-                            // LLM exactly what to do.
-                            self.completeness.note_gate_triggered();
-                            self.force_snapshot = true;
-                            let pending_ids: Vec<String> = self
-                                .completeness
-                                .subtasks
-                                .iter()
-                                .filter(|s| !matches!(s.status, SubTaskStatus::Done | SubTaskStatus::Skipped { .. } | SubTaskStatus::Failed { .. }))
-                                .map(|s| s.id.clone())
-                                .collect();
-                            let pending_descs: Vec<String> = self
-                                .completeness
-                                .subtasks
-                                .iter()
-                                .filter(|s| !matches!(s.status, SubTaskStatus::Done | SubTaskStatus::Skipped { .. } | SubTaskStatus::Failed { .. }))
-                                .map(|s| format!("  - id={}: {}", s.id, s.description))
-                                .collect();
-                            let reason = format!(
-                                "GATE BLOCKED: finish() called while {} subtask(s) are still pending. The agent is now forcing a fresh snapshot and re-prompting you. You must, on the next turn, do one of the following for each pending item:\n  - Call mark_subtask_done(id, snapshot_signature) if the most recent snapshot confirms the sub-item is complete on screen. The signature will be in the next observation.\n  - Call mark_subtask_skipped(id, reason) if the sub-item is genuinely out of scope.\n  - Call mark_subtask_failed(id, reason) if you tried and could not verify success.\nPending items:\n{}\nA blanket finish() is not accepted. The next iteration will start with a fresh snapshot so you have on-screen evidence to mark each item done.",
-                                pending_ids.len(),
-                                pending_descs.join("\n")
-                            );
-                            println!("[completeness-gate] finish() blocked: {}", reason.replace("\n", " | "));
-                            if let Some(mut file) = self.transcript_file.as_ref() {
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
-                                let log_entry = format!(
-                                    "[{}] [{}] GATE: finish() intercepted, pending={}, reason={}\n\n",
-                                    timestamp,
-                                    self.session_id,
-                                    pending_ids.len(),
-                                    reason.replace("\n", " | ")
-                                );
-                                let _ = file.write_all(log_entry.as_bytes());
-                            }
-                            tool_result = reason;
-                            // Reset the per-gate counter so the LLM
-                            // gets exactly one more chance after the
-                            // forced re-prompt — if it calls finish()
-                            // again with pending items still open, the
-                            // same gate fires again (not a permanent
-                            // block, just a per-attempt re-prompt).
-                            self.finish_calls_this_gate = 0;
+                            break;
                         }
-                    },
-                    "declare_subtasks" => {
-                        // Phase 15.1: the LLM populates the canonical
-                        // sub-item list. We accept JSON shape
-                        // `{ items: [{ id, description }, ...] }`.
-                        let items_raw = args.get("items").and_then(|v| v.as_array());
-                        let mut declared: Vec<DeclareItem> = Vec::new();
-                        if let Some(arr) = items_raw {
-                            for it in arr {
-                                let id = it.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let desc = it.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                if id.is_empty() {
-                                    tool_result = format!("ERROR: declare_subtasks item missing 'id': {}", it);
-                                    break;
-                                }
-                                if desc.is_empty() {
-                                    tool_result = format!("ERROR: declare_subtasks item '{}' missing 'description'", id);
-                                    break;
-                                }
-                                declared.push(DeclareItem { id, description: desc });
-                            }
-                        }
-                        if tool_result.is_empty() {
-                            match self.completeness.declare(declared.clone()) {
-                                Ok(n) => {
-                                    println!(
-                                        "[completeness] declared {} subtask(s); tracker now: {}",
-                                        n,
-                                        self.completeness.inline_status()
-                                    );
-                                    if let Some(mut file) = self.transcript_file.as_ref() {
-                                        let timestamp = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs();
-                                        let ids: Vec<String> = declared.iter().map(|d| d.id.clone()).collect();
-                                        let log_entry = format!(
-                                            "[{}] [{}] DECLARE: subtasks={} ids={:?}\n\n",
-                                            timestamp,
-                                            self.session_id,
-                                            n,
-                                            ids
-                                        );
-                                        let _ = file.write_all(log_entry.as_bytes());
-                                    }
-                                    let list: Vec<String> = declared
-                                        .iter()
-                                        .map(|d| format!("  - id={} desc=\"{}\"", d.id, d.description))
-                                        .collect();
-                                    tool_result = format!(
-                                        "Declared {} subtask(s). For each, take a snapshot and call mark_subtask_done(id, snapshot_signature) when you see the expected state change. Skipped/failed are also terminal.\n{}",
-                                        n,
-                                        list.join("\n")
-                                    );
-                                }
-                                Err(e) => {
-                                    tool_result = format!("ERROR: declare_subtasks rejected: {}", e);
-                                }
-                            }
-                        }
-                    },
-                    "mark_subtask_done" => {
-                        // Phase 15.1: the LLM marks a subtask complete.
-                        // The tracker rejects the call if the supplied
-                        // signature doesn't match the most recent
-                        // snapshot, forcing the model to actually look
-                        // at the page (or call snapshot() first).
-                        let id = args["id"].as_str().unwrap_or("").to_string();
-                        let sig = args["snapshot_signature"].as_str().unwrap_or("").to_string();
-                        if id.is_empty() {
-                            tool_result = "ERROR: mark_subtask_done requires 'id'".to_string();
-                        } else {
-                            match self.completeness.mark_done(&id, &sig) {
-                                MarkOutcome::MarkedDone { evidence_iteration, evidence_signature } => {
-                                    println!(
-                                        "[completeness] subtask '{}' marked done (evidence: iter {}, sig {})",
-                                        id, evidence_iteration, evidence_signature
-                                    );
-                                    if let Some(mut file) = self.transcript_file.as_ref() {
-                                        let timestamp = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs();
-                                        let log_entry = format!(
-                                            "[{}] [{}] MARK DONE: id={} evidence_iter={} evidence_sig={}\n\n",
-                                            timestamp, self.session_id, id, evidence_iteration, evidence_signature
-                                        );
-                                        let _ = file.write_all(log_entry.as_bytes());
-                                    }
-                                    tool_result = format!(
-                                        "Subtask '{}' marked done with fresh-snapshot evidence (iter {}, sig {}). Tracker: {}",
-                                        id,
-                                        evidence_iteration,
-                                        evidence_signature,
-                                        self.completeness.inline_status()
-                                    );
-                                }
-                                MarkOutcome::StaleEvidence { last_snapshot_iteration, current_iteration } => {
-                                    println!(
-                                        "[completeness] mark_done '{}' REJECTED: stale evidence (last snapshot at iter {}, current iter {})",
-                                        id, last_snapshot_iteration, current_iteration
-                                    );
-                                    tool_result = format!(
-                                        "ERROR: mark_subtask_done for '{}' rejected — your snapshot_signature does not match the most recent on-screen snapshot. Take a fresh snapshot() first, observe the page, and retry with that signature. The agent has recorded snapshot signatures as the perception block runs.",
-                                        id
-                                    );
-                                }
-                                MarkOutcome::UnknownId => {
-                                    tool_result = format!(
-                                        "ERROR: no subtask with id '{}' is currently declared. Call declare_subtasks first or check the id spelling.",
-                                        id
-                                    );
-                                }
-                                MarkOutcome::AlreadyTerminal { current } => {
-                                    tool_result = format!(
-                                        "ERROR: subtask '{}' is already in terminal status '{}' and cannot be marked done again.",
-                                        id,
-                                        current.as_str()
-                                    );
-                                }
-                                MarkOutcome::MarkedSkipped { .. } => {
-                                    // unreachable on mark_done
-                                    unreachable!()
-                                }
-                                MarkOutcome::MarkedExhausted { .. } => {
-                                    // unreachable on mark_done — only the
-                                    // budget guard's `mark_exhausted` call
-                                    // produces this variant (Phase 7).
-                                    unreachable!()
-                                }
-                            }
-                        }
-                    },
-                    "mark_subtask_skipped" => {
-                        let id = args["id"].as_str().unwrap_or("").to_string();
-                        let reason = args["reason"].as_str().unwrap_or("").to_string();
-                        if id.is_empty() {
-                            tool_result = "ERROR: mark_subtask_skipped requires 'id'".to_string();
-                        } else if reason.is_empty() {
-                            tool_result = format!("ERROR: mark_subtask_skipped for '{}' requires a non-empty 'reason'", id);
-                        } else {
-                            match self.completeness.mark_skipped(&id, reason.clone()) {
-                                MarkOutcome::MarkedSkipped { reason: r } => {
-                                    println!(
-                                        "[completeness] subtask '{}' marked skipped: {}",
-                                        id, r
-                                    );
-                                    if let Some(mut file) = self.transcript_file.as_ref() {
-                                        let timestamp = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs();
-                                        let log_entry = format!(
-                                            "[{}] [{}] MARK SKIPPED: id={} reason={}\n\n",
-                                            timestamp, self.session_id, id, r
-                                        );
-                                        let _ = file.write_all(log_entry.as_bytes());
-                                    }
-                                    tool_result = format!(
-                                        "Subtask '{}' marked skipped (reason: {}). Tracker: {}",
-                                        id,
-                                        r,
-                                        self.completeness.inline_status()
-                                    );
-                                }
-                                MarkOutcome::UnknownId => {
-                                    tool_result = format!(
-                                        "ERROR: no subtask with id '{}' is currently declared.",
-                                        id
-                                    );
-                                }
-                                MarkOutcome::AlreadyTerminal { current } => {
-                                    tool_result = format!(
-                                        "ERROR: subtask '{}' is already in terminal status '{}'.",
-                                        id,
-                                        current.as_str()
-                                    );
-                                }
-                                MarkOutcome::StaleEvidence { .. } => unreachable!(),
-                                MarkOutcome::MarkedDone { .. } => unreachable!(),
-                                MarkOutcome::MarkedExhausted { .. } => unreachable!(),
-                            }
-                        }
-                    },
-                    "mark_subtask_failed" => {
-                        let id = args["id"].as_str().unwrap_or("").to_string();
-                        let reason = args["reason"].as_str().unwrap_or("").to_string();
-                        if id.is_empty() {
-                            tool_result = "ERROR: mark_subtask_failed requires 'id'".to_string();
-                        } else if reason.is_empty() {
-                            tool_result = format!("ERROR: mark_subtask_failed for '{}' requires a non-empty 'reason'", id);
-                        } else {
-                            match self.completeness.mark_failed(&id, reason.clone()) {
-                                MarkOutcome::MarkedSkipped { reason: r } => {
-                                    // mark_failed reuses the MarkedSkipped
-                                    // variant in the enum because they
-                                    // share "terminal + reason" semantics
-                                    // for the dispatcher. The tracker
-                                    // itself records Failed.
-                                    println!(
-                                        "[completeness] subtask '{}' marked failed: {}",
-                                        id, r
-                                    );
-                                    if let Some(mut file) = self.transcript_file.as_ref() {
-                                        let timestamp = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs();
-                                        let log_entry = format!(
-                                            "[{}] [{}] MARK FAILED: id={} reason={}\n\n",
-                                            timestamp, self.session_id, id, r
-                                        );
-                                        let _ = file.write_all(log_entry.as_bytes());
-                                    }
-                                    tool_result = format!(
-                                        "Subtask '{}' marked failed (reason: {}). Tracker: {}",
-                                        id,
-                                        r,
-                                        self.completeness.inline_status()
-                                    );
-                                }
-                                MarkOutcome::UnknownId => {
-                                    tool_result = format!(
-                                        "ERROR: no subtask with id '{}' is currently declared.",
-                                        id
-                                    );
-                                }
-                                MarkOutcome::AlreadyTerminal { current } => {
-                                    tool_result = format!(
-                                        "ERROR: subtask '{}' is already in terminal status '{}'.",
-                                        id,
-                                        current.as_str()
-                                    );
-                                }
-                                MarkOutcome::StaleEvidence { .. } => unreachable!(),
-                                MarkOutcome::MarkedDone { .. } => unreachable!(),
-                                MarkOutcome::MarkedExhausted { .. } => unreachable!(),
-                            }
-                        }
-                    },
-                    _ => {
-                        tool_result = format!("Unknown tool '{}'", effective_name);
                     }
-                }
-
-                println!("Tool result: {}", tool_result);
-
-                // Phase 1: log the tool result alongside the
-                // dispatch event. We record the result length (not
-                // the full text) so a quick filter can spot
-                // abnormally long or short results without bloating
-                // the log; the full text is in the transcript. For
-                // navigate specifically, also record the resolved
-                // URL so a grep can find "which branch of the URL
-                // resolver actually fired?" in one place.
-                let tool_result_preview: String = tool_result.chars().take(200).collect();
-                tracing::info!(
-                    event = "tool_result",
-                    iter = self.iterations,
-                    tool = %name,
-                    result_len = tool_result.len(),
-                    result_preview = %tool_result_preview,
-                    "tool finished"
-                );
-                // Append tool response
-                self.messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": &tool_result
-                }));
-
-                // Log to transcript
-                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                if let Some(mut file) = self.transcript_file.as_ref() {
-                    let log_entry = format!("[{}] [{}] TOOL CALL: {} (args: {})\nRESULT: {}\n\n", timestamp, obs_summary, name, args_str, tool_result);
-                    let _ = file.write_all(log_entry.as_bytes());
-                }
-                if let Some(tx) = &self.event_tx {
-                    let _ = tx.send(AgentEvent::Tool {
-                        timestamp_secs: timestamp,
-                        name: name.to_string(),
-                        args: args_str.to_string(),
-                        result: tool_result.clone(),
-                    });
-                }
-
-                // Phase 5: live progress line. Cheap, templated,
-                // no LLM. The line is pushed to the agent's
-                // `LiveProgress` buffer (capped at
-                // `live_lines_cap`) and emitted on the event
-                // channel as `AgentEvent::ProgressLine`. The
-                // frontend's "agent is working" pill and the
-                // per-task live progress sub-list both consume
-                // these events. Unknown tool names are silently
-                // skipped — see `summarizer::summarize`.
-                //
-                // Phase 6: pass `effective_name` /
-                // `effective_args` so when the modal-dismiss
-                // override fired, the progress line says
-                // "Clicked @e1 (modal dismiss)" instead of the
-                // original LLM tool. The user sees what
-                // actually happened, not the redirected intent.
-                self.emit_progress_line(&effective_name, &effective_args, &tool_result);
-
-                // Phase 15.1: if the finish() tool handler stashed a
-                // result (gate open), exit the loop now with that
-                // result. The transcript logging above is the same
-                // shape every other tool uses, so the per-tool log
-                // line still records the finish() call.
-                if let Some(result) = self.pending_finish_result.take() {
-                    return Ok(result);
                 }
             } else {
                 let content = message["content"].as_str().unwrap_or("");
@@ -3739,6 +3044,1797 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
                 }));
             }
         }
+    }
+
+    /// Phase 32: dispatch a single tool call.
+    ///
+    /// Extracted from `run_inner` so the same dispatch body can
+    /// be called multiple times per LLM turn (multi-action
+    /// batch). Returns the `BatchStepOutcome` so the caller can
+    /// decide whether to continue the batch, break (navigate
+    /// changed the page), return (finish was honored), or
+    /// pause (irreversible gate).
+    ///
+    /// Errors are propagated: the helper returns `Result` so a
+    /// session-checkpoint failure (caller called stop() between
+    /// the LLM response and the dispatch) bubbles up to the
+    /// outer `run_inner` and ends the session.
+    pub(crate) async fn dispatch_single_tool_call(
+        &mut self,
+        page: &Page,
+        call: &serde_json::Value,
+        ref_map: &std::collections::HashMap<
+            String,
+            chromiumoxide::cdp::browser_protocol::dom::BackendNodeId,
+        >,
+        obs_summary: &str,
+        // Phase 32: total number of tool calls in the LLM
+        // turn that produced this dispatch. The UI uses this
+        // to display "step N of M" in the working pill when
+        // batch dispatch is enabled. When
+        // `max_tools_per_turn = 1`, this is always 1
+        // (byte-for-byte equivalent to pre-Phase-32 event
+        // payload).
+        tools_per_turn: usize,
+    ) -> anyhow::Result<BatchStepOutcome> {
+        // `call` is the specific tool call from the batch.
+        // The caller passes `&calls[batch_idx]`; we don't re-bind.
+        // Phase 32: navigate sets this so the caller breaks the
+        // batch AFTER the per-tool transcript log runs.
+        let mut page_changed = false;
+        let call_id = call["id"].as_str().unwrap_or("unknown_id");
+        let func = &call["function"];
+        let name = func["name"].as_str().unwrap_or("");
+        let args_str = func["arguments"].as_str().unwrap_or("{}");
+            println!("LLM Called Tool: {} with args: {}", name, args_str);
+            // Phase 1: log the tool dispatch as a structured
+            // event. The args are recorded as the raw JSON string
+            // (not parsed fields) so a `jq` query can pull them
+            // out later without us maintaining a per-tool schema
+            // in the log layer. The result is recorded by the
+            // existing post-match logging block; we just need the
+            // *dispatch* event to anchor the start of a tool call
+            // in the trace.
+            tracing::info!(
+                event = "tool_dispatch",
+                iter = self.iterations,
+                tool = %name,
+                args = %args_str,
+                "tool dispatched"
+            );
+            // Phase 12.1: checkpoint after the tool call is parsed, before
+            // it is executed. This is the point where pause()/resume()/
+            // stop() can safely interrupt without leaving the browser in a
+            // half-mutated state. We log the current state so a pause
+            // shows up in the transcript with a real timestamp; the resume
+            // line is logged the next time the state changes back to
+            // Running.
+            let pre_exec_state = self.session.state().await;
+            if let Err(e) = self.session.checkpoint().await {
+                // If the session went terminal (e.g. caller called
+                // stop() between the LLM response and the dispatch), log
+                // the transition we observed and bail.
+                let post = self.session.history().await;
+                if let Some(last) = post.last() {
+                    if last.from != last.to {
+                        self.write_state_line(last);
+                    }
+                }
+                let _ = pre_exec_state; // documented, retained for the next state read
+                return Err(anyhow::anyhow!(e.to_string()));
+            }
+            // If state changed through the checkpoint (Running -> Paused ->
+            // Running or Running -> Stopped), log it. We use a snapshot of
+            // the history because the post-checkpoint state is the one the
+            // loop will actually use.
+            let post_history = self.session.history().await;
+            if let Some(last) = post_history.last() {
+                if last.from != last.to {
+                    self.write_state_line(last);
+                }
+            }
+            // Phase 6: the original `args_str` and
+            // `args` are kept (the LLM's intent, logged
+            // to the transcript). The dispatch site uses
+            // `effective_name` / `effective_args` which
+            // are the modal-dismiss-override-aware
+            // versions — see the block below. The match
+            // arm reads from `effective_args` so the
+            // override flows through naturally.
+            let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+            let mut tool_result = String::new();
+            // Phase 6: modal-dismiss override. If the
+            // perception step detected a dismissable modal
+            // and stored the close-button ref, *redirect*
+            // the LLM's chosen tool to click that ref first.
+            // The LLM's original choice is logged but not
+            // executed; the LLM sees the dismiss result in
+            // the next observation and re-plans from there.
+            //
+            // Why override at the dispatch boundary: the
+            // perception step is the only place that knows
+            // the modal exists; the dispatch step is the
+            // only place that can actually click something.
+            // Wiring both is cleaner than smuggling the
+            // dismiss ref through `self.messages` as a
+            // system-injected tool call (which would change
+            // the LLM's tool-calling history and break
+            // replay).
+            let mut effective_name = name.to_string();
+            let mut effective_args_str = args_str.to_string();
+            let mut effective_args = args.clone();
+            if let Some(dismiss_ref) = self.pending_modal_dismiss.take() {
+                crate::resilience::log_resilience_event(
+                    self.transcript_file.as_ref(),
+                    &self.session_id,
+                    "modal_dismiss_dispatch",
+                    &format!("dismiss_ref={dismiss_ref} original_tool={name}"),
+                );
+                println!("[resilience] modal-dismiss override: clicking {} instead of {}", dismiss_ref, name);
+                effective_name = "click".to_string();
+                effective_args_str = format!("{{\"ref\":\"{}\"}}", dismiss_ref);
+                effective_args = serde_json::json!({ "ref": dismiss_ref });
+            }
+            // Phase 6: irreversible-action gate. If the
+            // effective tool is in the irreversible table,
+            // transition the session to `Paused` and surface
+            // a confirmation request to the user instead of
+            // executing. The LLM gets a typed tool result
+            // explaining the gate, and the user can resume
+            // (via the Tauri command path) to confirm.
+            if let Some(outcome) = crate::resilience::evaluate_dispatch(
+                &effective_name, &effective_args,
+            ) {
+                if let crate::resilience::ResilienceHookOutcome::PauseForUser { target, action_kind } = outcome {
+                    // Phase 6: auto-apply layer consult. Before
+                    // we surface the gate to the user, run
+                    // the auto-apply decision so the three
+                    // short-circuit paths (dedup hit, cap
+                    // reached, fire-and-forget) get a chance
+                    // to act before the user sees a
+                    // confirmation prompt. The verdict is
+                    // rebuilt from `action_kind` (a string)
+                    // and `target` so the orchestration
+                    // layer's `decide` call does not need
+                    // access to the original `args`.
+                    use mew_resilience::{ActionKind, IrreverisbleVerdict};
+                    let verdict_for_decide = IrreverisbleVerdict {
+                        action: match action_kind.as_str() {
+                            "submit_application" => ActionKind::SubmitApplication,
+                            "send_proposal" => ActionKind::SendProposal,
+                            "send_connection_request" => ActionKind::SendConnectionRequest,
+                            _ => ActionKind::Other,
+                        },
+                        target: target.clone(),
+                    };
+                    // Extract the (platform, posting_id) pair
+                    // from the *original* `args` (the LLM's
+                    // intent), not the modal-override
+                    // `effective_args`. The dedup store
+                    // keys on the real posting identifier,
+                    // not the dismiss ref.
+                    let target_platform = args
+                        .get("platform")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| {
+                            args.get("url")
+                                .and_then(|v| v.as_str())
+                                .and_then(extract_platform_from_url)
+                        });
+                    let target_posting_id = args
+                        .get("job_id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| args.get("project_id").and_then(|v| v.as_str()))
+                        .or_else(|| args.get("to").and_then(|v| v.as_str()))
+                        .or_else(|| args.get("user_id").and_then(|v| v.as_str()));
+                    let auto_apply_decision =
+                        self.auto_apply.decide(&verdict_for_decide, target_platform, target_posting_id);
+                    // Log the decision so a transcript
+                    // reviewer can see which path the
+                    // orchestration layer chose.
+                    crate::resilience::log_resilience_event(
+                        self.transcript_file.as_ref(),
+                        &self.session_id,
+                        "auto_apply_decision",
+                        &self.auto_apply.explain_decision(&auto_apply_decision),
+                    );
+                    match auto_apply_decision {
+                        crate::auto_apply::AutoApplyDecision::AlreadyApplied {
+                            platform,
+                            posting_identifier,
+                        } => {
+                            // Dedup hit: silently drop the
+                            // submission. No pause, no chat
+                            // message, no submission. The LLM
+                            // gets a clean tool result that
+                            // explains the drop so it can
+                            // re-plan.
+                            let result_msg = format!(
+                                "AUTO_APPLY: already applied to {platform} posting {posting_identifier}; submission dropped (dedup store hit)."
+                            );
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            if let Some(tx) = &self.event_tx {
+                                let _ = tx.send(AgentEvent::Tool {
+                                    timestamp_secs: timestamp,
+                                    name: effective_name.clone(),
+                                    args: effective_args_str.clone(),
+                                    result: result_msg.clone(),
+                                    tools_per_turn,
+                                });
+                            }
+                            self.emit_progress_line(
+                                &effective_name,
+                                &effective_args,
+                                &result_msg,
+                            );
+                            return Ok(BatchStepOutcome::Continue);
+                        }
+                        crate::auto_apply::AutoApplyDecision::CapReached { submitted, max } => {
+                            // Per-run cap hit: silently drop
+                            // the submission. Same shape as
+                            // the dedup hit, with a
+                            // different reason.
+                            let result_msg = format!(
+                                "AUTO_APPLY: per-run application cap reached ({submitted} of {max} submitted this session); submission dropped."
+                            );
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            if let Some(tx) = &self.event_tx {
+                                let _ = tx.send(AgentEvent::Tool {
+                                    timestamp_secs: timestamp,
+                                    name: effective_name.clone(),
+                                    args: effective_args_str.clone(),
+                                    result: result_msg.clone(),
+                                    tools_per_turn,
+                                });
+                            }
+                            self.emit_progress_line(
+                                &effective_name,
+                                &effective_args,
+                                &result_msg,
+                            );
+                            return Ok(BatchStepOutcome::Continue);
+                        }
+                        crate::auto_apply::AutoApplyDecision::AutoSubmit { .. } => {
+                            // Fire-and-forget path: the user
+                            // explicitly set
+                            // `require_confirmation_per_application:
+                            // false`. The dedup check passed
+                            // and the cap is not yet hit. We
+                            // commit the per-run counter and
+                            // *let the match arm execute the
+                            // tool call*. The match arm
+                            // dispatches the LLM's intended
+                            // tool without pausing; on
+                            // success we record the
+                            // submission in the dedup store
+                            // via a post-dispatch hook (the
+                            // match arm is responsible for
+                            // calling
+                            // `self.application_dedup()
+                            //  .record_submission(...)` after
+                            // a successful dispatch).
+                            self.auto_apply.increment_count();
+                            // Fall through to the match arm
+                            // by NOT returning here.
+                        }
+                        crate::auto_apply::AutoApplyDecision::PauseForDraft { draft_required, .. } => {
+                            // Standard path: pause for the
+                            // user to confirm. The `draft_required`
+                            // flag is currently a future-
+                            // facing knob — when
+                            // `auto_apply.enabled: true`, the
+                            // existing pause chat message
+                            // already includes the draft
+                            // prompt. We commit the per-run
+                            // counter *before* pausing so a
+                            // runaway loop on a flaky
+                            // platform cannot draft more
+                            // than `max_applications_per_run`
+                            // applications per session.
+                            if draft_required {
+                                self.auto_apply.increment_count();
+                            }
+                            // Fall through to the existing
+                            // pause message below.
+                        }
+                        // `Disabled` and `NotApplicable`
+                        // are unchanged: the auto-apply
+                        // layer does not own the decision;
+                        // the existing pause message is the
+                        // right thing to surface.
+                        crate::auto_apply::AutoApplyDecision::Disabled
+                        | crate::auto_apply::AutoApplyDecision::NotApplicable => {
+                            // Fall through to the existing
+                            // pause message.
+                        }
+                    }
+                    crate::resilience::log_resilience_event(
+                        self.transcript_file.as_ref(),
+                        &self.session_id,
+                        "irreversible_gate",
+                        &format!("action={} target={}", action_kind, target),
+                    );
+                    // Pause the session so the loop parks
+                    // until the user confirms. The state
+                    // machine in `session.rs` already
+                    // supports Running -> Paused; the
+                    // checkpoint at the top of the next
+                    // iteration will block on this.
+                    let pause_reason = format!(
+                        "irreversible action: {} (target: {}) — awaiting user confirmation",
+                        action_kind, target
+                    );
+                    if let Err(e) = self.session.pause(Some(pause_reason.clone())).await {
+                        tracing::warn!(
+                            event = "irreversible_pause_failed",
+                            error = %e,
+                            "could not transition to Paused; continuing with gate-as-error instead"
+                        );
+                    } else {
+                        // Log the state transition so the
+                        // transcript reviewer sees the
+                        // pause fired.
+                        let history = self.session.history().await;
+                        if let Some(last) = history.last() {
+                            if last.from != last.to {
+                                self.write_state_line(last);
+                            }
+                        }
+                    }
+                    // Push a "please confirm" message to
+                    // the chat list so the user sees a
+                    // natural-language prompt — never
+                    // raw JSON, per the Phase 4
+                    // communicator-first guarantee.
+                    self.messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": format!(
+                            "IRREVERSIBLE ACTION GATE: I'm about to {} (target: {}). I need your confirmation before I proceed. The agent is now paused — please confirm in the chat to resume, or send a steering message to redirect.",
+                            action_kind, target
+                        ),
+                    }));
+                    if let Some(mut file) = self.transcript_file.as_ref() {
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let log_entry = format!(
+                            "[{}] [{}] GATE-IRREVERSIBLE: action={} target={}\n\n",
+                            timestamp, self.session_id, action_kind, target
+                        );
+                        let _ = file.write_all(log_entry.as_bytes());
+                    }
+                    // Do not execute the tool. The next
+                    // iteration's checkpoint will park
+                    // here (state == Paused) until the
+                    // user resumes.
+                    tool_result = format!(
+                        "GATE: irreversible action {} (target: {}) paused for user confirmation. Loop will park on next iteration until resumed.",
+                        action_kind, target
+                    );
+                    // Skip the rest of the dispatch. The
+                    // checkpoint at the top of the next
+                    // iteration will catch the Paused
+                    // state and park the loop. We push
+                    // the tool result above so the LLM
+                    // sees the gate in its history.
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(AgentEvent::Tool {
+                            timestamp_secs: timestamp,
+                            name: effective_name.clone(),
+                            args: effective_args_str.clone(),
+                            result: tool_result.clone(),
+                            tools_per_turn,
+                        });
+                    }
+                    self.emit_progress_line(&effective_name, &effective_args, &tool_result);
+                    // Phase 32: in batch mode, the irreversible
+                    // gate halts the entire batch. The user
+                    // sees the pause prompt; the next outer
+                    // iteration's checkpoint parks on Paused.
+                    return Ok(BatchStepOutcome::Paused);
+                }
+            }
+            // Phase 17.1: pacing guard. Decide *before* dispatch
+            // whether the next action should be preceded by a
+            // sleep. The guard is a no-op when the config block
+            // is absent or `enabled: false`, so this is free in
+            // the common case. When pacing *does* fire, we log
+            // the decision to the transcript (so reviewers can
+            // see it) and then sleep.
+            //
+            // Why here, not in each match arm: pacing is a
+            // single decision per tool call, not per tool — we
+            // want exactly one sleep per paced action, and
+            // exactly one transcript line. Putting it at the
+            // dispatch boundary (one call site) makes that
+            // structural rather than convention-based.
+            let pacing_decision = self.pacing.before_action(&effective_name);
+            match &pacing_decision {
+                PacingDecision::NoPacing => {
+                    // No log line, no sleep. (17.1 spec: log
+                    // *when pacing is applied*, not every
+                    // no-op — that would be spam on every
+                    // iteration.)
+                }
+                PacingDecision::Pace { delay, .. } => {
+                    // Log via the shared helper so the format
+                    // matches the other transcript lines.
+                    if let Some(action) = crate::pacing::PacedAction::from_tool_name(name) {
+                        crate::pacing::log_pacing_decision(
+                            self.transcript_file.as_ref(),
+                            &self.session_id,
+                            action,
+                            &pacing_decision,
+                        );
+                    }
+                    tokio::time::sleep(*delay).await;
+                }
+            }
+            let normalize_ref = |r: &str| -> String {
+                if !r.starts_with('@') { format!("@{}", r) } else { r.to_string() }
+            };
+            // Phase 6: the match arm keys on `effective_name`
+            // (which is the modal-dismiss-override-aware
+            // name) rather than the LLM's original `name`.
+            // When the modal-dismiss override fired,
+            // `effective_name == "click"` and the click arm
+            // runs with the dismiss ref as its arg. The
+            // original tool name is preserved in
+            // `effective_args_str` for the transcript.
+            //
+            // `args` (the LLM's original args) is
+            // shadowed to `effective_args` so the match
+            // arm reads the override-aware value without
+            // a per-arm find/replace. The original
+            // `args_str` is unchanged and continues to
+            // be used in the transcript / event-emit
+            // lines below.
+            let args = &effective_args;
+            match effective_name.as_str() {
+                "navigate" => {
+                    let url = args["url"].as_str().unwrap_or("");
+                    if url.contains("force-crash") {
+                        anyhow::bail!("Deliberately forced crash mid-task!");
+                    }
+                    // Phase 14.1: URL resolution layer. The LLM may have
+                    // said `navigate("instagram")` (just a bare name) —
+                    // we don't trust its guess, we resolve it ourselves.
+                    // The resolver picks one of the following paths:
+                    //   - via-search / via-search-confirm (Phase 2):
+                    //     the host is in `config/sensitive_platforms.toml`;
+                    //     we route through a Google search results page
+                    //     instead of a direct nav. This is the structural
+                    //     fix for Bug #1's referrer-less-bot-detection
+                    //     failure mode.
+                    //   - map-hit: known site, instant
+                    //   - direct-guess: tried `https://{x}.com` and it
+                    //     loaded inside a 4s probe timeout
+                    //   - search-fallback: gave up, sent to Google
+                    // The path taken is logged to the transcript and
+                    // surfaced in the tool result so the next LLM
+                    // iteration knows the URL it ended up on.
+                    let resolution = mew_nav::resolve_with_probe_sensitive(
+                        page,
+                        url,
+                        &self.sensitive_platforms,
+                    )
+                    .await;
+                    let resolved_url = &resolution.url;
+                    // Log the resolution decision to the transcript.
+                    // This is the "transparent in the transcript" line
+                    // 14.1 requires — when reviewing a transcript you
+                    // can see *why* a site did what it did.
+                    if let Some(mut file) = self.transcript_file.as_ref() {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let line = format!(
+                            "[{}] [{}] NAV-RESOLVE: input=\"{}\" path={} resolved_url={}\n\n",
+                            ts,
+                            self.session_id,
+                            resolution.original_input,
+                            resolution.path.as_str(),
+                            resolved_url
+                        );
+                        let _ = file.write_all(line.as_bytes());
+                    }
+                    println!(
+                        "[nav-resolve] \"{}\" -> {} (via {})",
+                        resolution.original_input,
+                        resolved_url,
+                        resolution.path.as_str()
+                    );
+                    // Domain allowlist check — runs against the
+                    // *resolved* URL, not the LLM's raw input. If the
+                    // resolver sent us to a search-engine results
+                    // page, the check still runs against google.com,
+                    // which is already in the default allowlist.
+                    let mut allowed = true;
+                    // Phase 40: also capture the rejected
+                    // domain string so the new error message
+                    // (and the AllowlistViolation resilience
+                    // event) can name the offender. Pre-Phase-40
+                    // the check silently dropped the parsed
+                    // `domain` once `allowed` flipped to false;
+                    // we now lift it out so downstream code
+                    // (the resilience event, the user-facing
+                    // error) can reference it.
+                    let mut blocked_domain: Option<String> = None;
+                    if let Some(ref allowed_domains) = self.config.agent.allowed_domains {
+                        if let Ok(parsed_url) = url::Url::parse(resolved_url) {
+                            if let Some(domain) = parsed_url.domain() {
+                                if !allowed_domains.iter().any(|d| domain == d || domain.ends_with(&format!(".{}", d))) {
+                                    allowed = false;
+                                    blocked_domain = Some(domain.to_string());
+                                }
+                            }
+                        }
+                    }
+                    if !allowed {
+                        // Phase 40: hardened the error message
+                        // so the user sees exactly which config
+                        // key to edit. The pre-Phase-40 text
+                        // ("Do not attempt this domain") was
+                        // correct but not actionable — the user
+                        // had to grep the codebase to find
+                        // where the allowlist lived. The new
+                        // text:
+                        //   1. Names the rejected domain.
+                        //   2. Names the YAML key to edit.
+                        //   3. Hints at the auto-expansion
+                        //      path so a Maps / lead-gen user
+                        //      knows the missing domain should
+                        //      have been picked up by the
+                        //      per-vertical `required_domains`
+                        //      config and can debug that
+                        //      first.
+                        let domain_str = blocked_domain
+                            .as_deref()
+                            .unwrap_or("(unknown)");
+                        tool_result = format!(
+                            "Domain '{domain}' is blocked by the allowlist. \
+To allow it: add '{domain}' to the agent.allowed_domains list in config.yaml. \
+If you're running a LocalLeadGen/Maps task, this domain should be auto-added — \
+check that config/maps_vertical.toml lists it in required_domains. \
+(resolved from '{orig}' via {path})",
+                            domain = domain_str,
+                            orig = resolution.original_input,
+                            path = resolution.path.as_str(),
+                        );
+                        // Phase 40: also emit a chat-visible
+                        // progress line so the user sees the
+                        // block in the live progress sub-list
+                        // (the Tauri UI consumes
+                        // `AgentEvent::ProgressLine` and
+                        // appends it to the task card). The
+                        // acceptance criterion is "user
+                        // sees 'domain blocked' within 2s",
+                        // and the templated line below is
+                        // emitted synchronously on the
+                        // blocked branch — well under the
+                        // 2s budget. `success = false` so the
+                        // UI can render the line in red.
+                        let _ = self.emit_allowlist_block_progress_line(
+                            domain_str,
+                            resolution.path.as_str(),
+                        );
+                        // Phase 40: also write a transcript
+                        // line with the
+                        // `RESILIENCE:` prefix used by every
+                        // other resilience finding, so a
+                        // post-mortem grep finds the
+                        // violation next to captcha /
+                        // rate-limit / modal events.
+                        crate::resilience::log_resilience_event(
+                            self.transcript_file.as_ref(),
+                            &self.session_id,
+                            "AllowlistViolation",
+                            &format!(
+                                "domain={} resolved={} path={} hint=\"add to agent.allowed_domains\"",
+                                domain_str,
+                                resolved_url,
+                                resolution.path.as_str(),
+                            ),
+                        );
+                    } else {
+                        // Phase 8: pre-navigate pacing for known
+                        // challengers. The theory of the case:
+                        // a `known_to_challenge_bots = true` host
+                        // is overwhelmingly likely to *serve* a
+                        // challenge page on first hit. Bursting
+                        // in with no delay is the worst possible
+                        // pattern — bot detectors see a fresh
+                        // session with no referrer history, no
+                        // human-like pacing, and no warm-up
+                        // actions. A 1.5-3s "settle in" delay
+                        // before the navigation is the cheapest
+                        // possible signal we can send: this
+                        // browser is moving at human speed, not
+                        // script speed.
+                        //
+                        // The delay is bounded (3s worst case)
+                        // so an unattended task isn't blocked
+                        // indefinitely. It's also *only* fired
+                        // when the sensitive-platforms table
+                        // flags the host — a normal site like
+                        // github.com gets no extra delay.
+                        //
+                        // We sleep *before* the `for attempt in
+                        // 1..=3` retry loop so a 429 / page-
+                        // crash on attempt 1 doesn't double the
+                        // pacing. The `extra_pre_nav_pacing_ms`
+                        // field is read fresh on every navigate
+                        // so a config edit (or a future per-
+                        // session override) takes effect on the
+                        // next call.
+                        if let Ok(parsed) = url::Url::parse(resolved_url) {
+                            if let Some(host) = parsed.host_str() {
+                                if self.sensitive_platforms.is_known_challenger(host) {
+                                    // Deterministic-but-jittered
+                                    // delay. We use a small
+                                    // window (1500-3000 ms)
+                                    // so the user doesn't see
+                                    // a noticeable hang on
+                                    // most navigations but
+                                    // the bot detector sees
+                                    // a non-script cadence.
+                                    // The `nano_time() ^
+                                    // iteration` salt keeps
+                                    // consecutive navigations
+                                    // from landing on the
+                                    // same exact delay (which
+                                    // would itself be a
+                                    // detectable pattern).
+                                    let nanos = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.subsec_nanos() as u64)
+                                        .unwrap_or(0)
+                                        ^ (self.iterations as u64);
+                                    let jitter = (nanos % 1500) as u64; // 0-1499 ms
+                                    let pre_nav_ms = 1500 + jitter; // 1500-2999 ms
+                                    tracing::info!(
+                                        event = "pre_nav_known_challenger_pacing",
+                                        session_id = %self.session_id,
+                                        host = %host,
+                                        delay_ms = pre_nav_ms,
+                                        "sleeping before navigate on a known challenger"
+                                    );
+                                    crate::resilience::log_resilience_event(
+                                        self.transcript_file.as_ref(),
+                                        &self.session_id,
+                                        "PreNavPacing",
+                                        &format!("host={host} delay_ms={pre_nav_ms}"),
+                                    );
+                                    tokio::time::sleep(
+                                        tokio::time::Duration::from_millis(pre_nav_ms),
+                                    )
+                                    .await;
+                                    // Phase 8: pre-seed the
+                                    // telemetry as `expected`
+                                    // when we *predict* a
+                                    // challenge will fire.
+                                    // The `record()` call
+                                    // (in the captcha
+                                    // detection arm above)
+                                    // will then increment an
+                                    // already-`expected` row
+                                    // — the summary marks
+                                    // these distinctly from
+                                    // "new" rows that
+                                    // appeared without a
+                                    // pre-navigate hint.
+                                    self.captcha_telemetry.mark_expected(host);
+                                }
+                            }
+                        }
+                        let mut success = false;
+                        let mut backoff = 1;
+                        for attempt in 1..=3 {
+                            match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::navigate(page, resolved_url)).await {
+                                Ok(Ok(_)) => {
+                                    // Phase 4 (Bug 4 fix): replace the
+                                    // fixed 2s sleep with a proper
+                                    // DOM-content wait. The old sleep
+                                    // was a band-aid: on JS-heavy pages
+                                    // (GitHub, SPAs) the page's
+                                    // `loadEventFired` event fires well
+                                    // before the SPA has populated the
+                                    // DOM, so the AX tree at this point
+                                    // was just the RootWebArea + a single
+                                    // `ignored/uninteresting` child with
+                                    // `busy: true` — see the pre-fix
+                                    // capture in
+                                    // `tests-output/phase4_bug4_repro_github_pre_fix.out.txt`.
+                                    //
+                                    // `wait_for_page_settled` polls
+                                    // document.readyState + body +
+                                    // aria-busy + text length, bounded
+                                    // at 10s. Fast pages (example.com)
+                                    // settle on the first poll (~0ms
+                                    // added). Slow pages (GitHub) wait
+                                    // until the SPA actually populates.
+                                    // Total worst case is 10s + 200ms
+                                    // floor, which is correct: we want
+                                    // the page, not the load event.
+                                    let settle = mew_cdp::wait_for_page_settled(page).await;
+                                    if !settle.settled {
+                                        println!(
+                                            "[navigate] page did not fully settle after {}ms ({} polls) — proceeding anyway; perception may need to retry",
+                                            settle.elapsed_ms, settle.polls
+                                        );
+                                    } else {
+                                        println!(
+                                            "[navigate] page settled in {}ms ({} polls)",
+                                            settle.elapsed_ms, settle.polls
+                                        );
+                                    }
+                                    // Tell the LLM (and the user reading
+                                    // logs) which path got us here. If
+                                    // the LLM asked for "instagram" and
+                                    // we ended up on a Google results
+                                    // page, the next turn can see that
+                                    // and adjust.
+                                    tool_result = format!(
+                                        "Navigated successfully (resolved \"{}\" -> \"{}\" via {})",
+                                        resolution.original_input,
+                                        resolved_url,
+                                        resolution.path.as_str()
+                                    );
+                                                                        success = true;
+                                    // Phase 32: navigate changed
+                                    // the page; the rest of the
+                                    // batch must not act on it.
+                                    page_changed = true;
+                                    break;
+                                },
+                                Ok(Err(e)) => {
+                                    // The navigate CDP call errored
+                                    // (rare; usually means the browser
+                                    // hung up). Before we surface the
+                                    // error, give the page one more
+                                    // chance to settle — sometimes the
+                                    // navigation actually succeeded at
+                                    // the browser level and only the
+                                    // future returned an error.
+                                    let _ = mew_cdp::wait_for_page_settled(page).await;
+                                    tool_result = format!("ERROR: Action failed (Navigation). {}. Do not assume success.", e);
+                                },
+                                Err(_) => {
+                                    // Navigation timed out at 15s. The
+                                    // page may still be partially
+                                    // loaded (the CDP call hung, not
+                                    // the network). One more settle
+                                    // attempt — if the page eventually
+                                    // finishes loading we still want
+                                    // the LLM to be able to act on it.
+                                    let _ = mew_cdp::wait_for_page_settled(page).await;
+                                    tool_result = "ERROR: Action failed (Timeout while navigating). The navigation timed out and did not complete successfully. Do not assume your action succeeded.".to_string();
+                                },
+                            }
+                            if attempt < 3 && !success {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                                backoff *= 2;
+                            }
+                        }
+                    }
+                },
+                "click" => {
+                    let r = args["ref"].as_str().unwrap_or("");
+                    let r_norm = normalize_ref(r);
+                    if let Some(backend_id) = ref_map.get(&r_norm) {
+                        // Phase 16.1: pre-compute the element's center and slide
+                        // the visible ghost cursor there before the real click.
+                        // This is the *only* place we read `visible_cursor` from
+                        // config at click time — keep it scoped to the click
+                        // branch so other tools (type, scroll, navigate) are
+                        // completely unaffected.
+                        let cursor_enabled = self
+                            .config
+                            .browser
+                            .as_ref()
+                            .map(|b| b.visible_cursor)
+                            .unwrap_or(false);
+                        if cursor_enabled {
+                            if let Ok(Some((cx, cy))) =
+                                mew_cdp::compute_element_center(page, backend_id.clone()).await
+                            {
+                                // Slide cursor toward the target first. The CSS
+                                // transition (180ms) on the cursor div handles
+                                // the visible motion, so this moveTo starts the
+                                // slide immediately.
+                                mew_cdp::move_cursor(page, cx, cy).await;
+                                // Sleep a touch longer than the transition so the
+                                // slide is fully complete before the click
+                                // fires. Spec: 100-200ms.
+                                tokio::time::sleep(tokio::time::Duration::from_millis(200))
+                                    .await;
+                            }
+                        }
+                        let mut success = false;
+                        let mut backoff = 1;
+                        for attempt in 1..=3 {
+                            match tokio::time::timeout(tokio::time::Duration::from_secs(1), mew_cdp::click_ref(page, backend_id.clone())).await {
+                                Ok(Ok(_)) => {
+                                    // Fire the click ripple exactly once, on the
+                                    // successful attempt. We re-compute the
+                                    // center here rather than caching the cx/cy
+                                    // outside the loop because the element may
+                                    // have moved between attempts; the ripple
+                                    // should land on the actual final target.
+                                    if cursor_enabled {
+                                        if let Ok(Some((cx, cy))) =
+                                            mew_cdp::compute_element_center(page, backend_id.clone()).await
+                                        {
+                                            mew_cdp::move_cursor_and_ripple(page, cx, cy).await;
+                                        }
+                                    }
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                    tool_result = "Clicked successfully".to_string();
+                                    // Phase 6: a successful
+                                    // click resets the
+                                    // ref-recovery budget.
+                                    // The next stale ref
+                                    // event gets a fresh
+                                    // full budget.
+                                    self.ref_recovery_attempts = 0;
+                                    success = true;
+                                    break;
+                                },
+                                Ok(Err(e)) => {
+                                    if let mew_cdp::StaleRefError::NotFound(_) = e {
+                                        // Phase 6: ref-recovery
+                                        // hook. The CDP layer
+                                        // returned a stale-ref
+                                        // error; ask the
+                                        // resilience crate to
+                                        // decide retry vs
+                                        // escalate based on
+                                        // the action kind and
+                                        // the current ref map.
+                                        // A `Retry` sets
+                                        // `force_snapshot =
+                                        // true` (existing
+                                        let current_refs: std::collections::HashMap<String, ()> = ref_map
+                                            .iter()
+                                            .map(|(k, _)| (k.clone(), ()))
+                                            .collect();
+                                        let recovery_inputs = mew_resilience::ref_recovery::RefRecoveryInputs {
+                                            supplied_ref: &r_norm,
+                                            current_ref_map: &current_refs,
+                                            target_desc: None,
+                                            description_index: None,
+                                            action: mew_resilience::ref_recovery::RefActionKind::Click,
+                                            attempts_so_far: self.ref_recovery_attempts,
+                                            page_navigated: false,
+                                        };
+                                        let recovery_cfg = mew_resilience::ref_recovery::RefRecoveryConfig::default();
+                                        match mew_resilience::ref_recovery::attempt_recovery(
+                                            &recovery_cfg,
+                                            &recovery_inputs,
+                                        ) {
+                                            mew_resilience::ref_recovery::RefRecoveryOutcome::Retry { new_ref, attempts_so_far, force_full_snapshot } => {
+                                                crate::resilience::log_resilience_event(
+                                                    self.transcript_file.as_ref(),
+                                                    &self.session_id,
+                                                    "ref_recovery_retry",
+                                                    &format!("old={} new={} attempt={}", r_norm, new_ref, attempts_so_far),
+                                                );
+                                                self.ref_recovery_attempts = attempts_so_far;
+                                                self.force_snapshot = force_full_snapshot;
+                                                tool_result = format!(
+                                                    "Stale ref detected ({}). Recovery: re-snapshot and retry with the new ref. The agent will re-snapshot and pick a fresh ref next iteration.",
+                                                    r_norm
+                                                );
+                                                success = true;
+                                                break;
+                                            }
+                                            mew_resilience::ref_recovery::RefRecoveryOutcome::EscalateToLLM { reason, attempts_so_far, force_full_snapshot } => {
+                                                crate::resilience::log_resilience_event(
+                                                    self.transcript_file.as_ref(),
+                                                    &self.session_id,
+                                                    "ref_recovery_escalate",
+                                                    &format!("ref={} attempt={}", r_norm, attempts_so_far),
+                                                );
+                                                self.ref_recovery_attempts = attempts_so_far;
+                                                self.force_snapshot = force_full_snapshot;
+                                                tool_result = format!(
+                                                    "ERROR: Action failed (Stale Element Reference). {}. The element was removed from the DOM. Your action had NO effect. Re-evaluate the new page state and decide your next step.",
+                                                    reason
+                                                );
+                                                success = true;
+                                                break;
+                                            }
+                                            mew_resilience::ref_recovery::RefRecoveryOutcome::AbortWithReason { reason, attempts_so_far, force_full_snapshot } => {
+                                                crate::resilience::log_resilience_event(
+                                                    self.transcript_file.as_ref(),
+                                                    &self.session_id,
+                                                    "ref_recovery_abort",
+                                                    &format!("ref={} attempt={}", r_norm, attempts_so_far),
+                                                );
+                                                self.ref_recovery_attempts = attempts_so_far;
+                                                self.force_snapshot = force_full_snapshot;
+                                                tool_result = format!(
+                                                    "ERROR: Action aborted (Stale Element Reference). {}. Your action had NO effect.",
+                                                    reason
+                                                );
+                                                success = true;
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        tool_result = format!("ERROR: Action failed (Click). {}. Do not assume success.", e);
+                                    }
+                                },
+                                Err(_) => tool_result = "ERROR: Action failed (Timeout while clicking). The click action timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
+                            }
+                            if attempt < 3 && !success {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                                backoff *= 2;
+                            }
+                        }
+                    } else {
+                        tool_result = format!("ref_id {} (normalized: {}) not found on page", r, r_norm);
+                        println!("{}", tool_result);
+                    }
+                },
+                "type" => {
+                    let r = args["ref"].as_str().unwrap_or("");
+                    let r_norm = normalize_ref(r);
+                    let text = args["text"].as_str().unwrap_or("");
+                    if let Some(backend_id) = ref_map.get(&r_norm) {
+                        let mut success = false;
+                        let mut backoff = 1;
+                        for attempt in 1..=3 {
+                            match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::type_ref(page, backend_id.clone(), text)).await {
+                                Ok(Ok(_)) => {
+                                    tool_result = "Typed successfully".to_string();
+                                    // Phase 6: reset ref-recovery
+                                    // budget on success.
+                                    self.ref_recovery_attempts = 0;
+                                    success = true;
+                                    break;
+                                },
+                                Ok(Err(e)) => {
+                                    if let mew_cdp::StaleRefError::NotFound(_) = e {
+                                        let current_refs: std::collections::HashMap<String, ()> = ref_map
+                                            .iter()
+                                            .map(|(k, _)| (k.clone(), ()))
+                                            .collect();
+                                        let recovery_inputs = mew_resilience::ref_recovery::RefRecoveryInputs {
+                                            supplied_ref: &r_norm,
+                                            current_ref_map: &current_refs,
+                                            target_desc: None,
+                                            description_index: None,
+                                            action: mew_resilience::ref_recovery::RefActionKind::Type,
+                                            attempts_so_far: self.ref_recovery_attempts,
+                                            page_navigated: false,
+                                        };
+                                        let recovery_cfg = mew_resilience::ref_recovery::RefRecoveryConfig::default();
+                                        match mew_resilience::ref_recovery::attempt_recovery(
+                                            &recovery_cfg,
+                                            &recovery_inputs,
+                                        ) {
+                                            mew_resilience::ref_recovery::RefRecoveryOutcome::Retry { new_ref, attempts_so_far, force_full_snapshot } => {
+                                                crate::resilience::log_resilience_event(
+                                                    self.transcript_file.as_ref(),
+                                                    &self.session_id,
+                                                    "ref_recovery_retry",
+                                                    &format!("old={} new={} attempt={}", r_norm, new_ref, attempts_so_far),
+                                                );
+                                                self.ref_recovery_attempts = attempts_so_far;
+                                                self.force_snapshot = force_full_snapshot;
+                                                tool_result = format!(
+                                                    "Stale ref detected ({}). Recovery: re-snapshot and retry with the new ref.",
+                                                    r_norm
+                                                );
+                                                success = true;
+                                                break;
+                                            }
+                                            mew_resilience::ref_recovery::RefRecoveryOutcome::EscalateToLLM { reason, attempts_so_far, force_full_snapshot } => {
+                                                crate::resilience::log_resilience_event(
+                                                    self.transcript_file.as_ref(),
+                                                    &self.session_id,
+                                                    "ref_recovery_escalate",
+                                                    &format!("ref={} attempt={}", r_norm, attempts_so_far),
+                                                );
+                                                self.ref_recovery_attempts = attempts_so_far;
+                                                self.force_snapshot = force_full_snapshot;
+                                                tool_result = format!(
+                                                    "ERROR: Action failed (Stale Element Reference). {}. The element was removed from the DOM. Your action had NO effect.",
+                                                    reason
+                                                );
+                                                success = true;
+                                                break;
+                                            }
+                                            mew_resilience::ref_recovery::RefRecoveryOutcome::AbortWithReason { reason, attempts_so_far, force_full_snapshot } => {
+                                                crate::resilience::log_resilience_event(
+                                                    self.transcript_file.as_ref(),
+                                                    &self.session_id,
+                                                    "ref_recovery_abort",
+                                                    &format!("ref={} attempt={}", r_norm, attempts_so_far),
+                                                );
+                                                self.ref_recovery_attempts = attempts_so_far;
+                                                self.force_snapshot = force_full_snapshot;
+                                                tool_result = format!(
+                                                    "ERROR: Action aborted (Stale Element Reference). {}. A type action against a guessed target would be unsafe.",
+                                                    reason
+                                                );
+                                                success = true;
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        tool_result = format!("ERROR: Action failed (Type). {}. Do not assume success.", e);
+                                    }
+                                },
+                                Err(_) => tool_result = "ERROR: Action failed (Timeout while typing). The type action timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
+                            }
+                            if attempt < 3 && !success { 
+                                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await; 
+                                backoff *= 2; 
+                            }
+                        }
+                    } else {
+                        tool_result = format!("ref_id {} (normalized: {}) not found on page", r, r_norm);
+                        println!("{}", tool_result);
+                    }
+                },
+                "scroll" => {
+                    let dir = args["direction"].as_str().unwrap_or("down");
+                    let d = if dir == "up" { mew_cdp::ScrollDirection::Up } else { mew_cdp::ScrollDirection::Down };
+                    match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::scroll(page, d, 800)).await {
+                        Ok(Ok(_)) => {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            tool_result = "Scrolled successfully".to_string();
+                        },
+                        Ok(Err(e)) => tool_result = format!("ERROR: Action failed (Scroll). {}. Do not assume success.", e),
+                        Err(_) => tool_result = "ERROR: Action failed (Timeout while scrolling). The scroll action timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
+                    }
+                },
+                "press_key" => {
+                    let key = args["key"].as_str().unwrap_or("");
+                    match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::press_key(page, key)).await {
+                        Ok(Ok(_)) => {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            tool_result = "Key pressed successfully".to_string();
+                        },
+                        Ok(Err(e)) => tool_result = format!("ERROR: Action failed (Press Key). {}. Do not assume success.", e),
+                        Err(_) => tool_result = "ERROR: Action failed (Timeout while pressing key). The press_key action timed out and did not complete successfully. Do not assume your action succeeded.".to_string(),
+                    }
+                },
+                "snapshot" => {
+                    // Phase 15.1: the snapshot tool MUST return the
+                    // current page-state signature so the model can
+                    // pass it to `mark_subtask_done` as evidence.
+                    // Without surfacing the signature here, the
+                    // model is forced to guess one, and any guess
+                    // will be rejected by the tracker's evidence
+                    // rule — making the gate look broken when it
+                    // is actually working correctly. The signature
+                    // is recorded in the perception block *after*
+                    // the snapshot, so by the time this tool
+                    // handler runs (next iteration), it's the
+                    // freshest one available.
+                    let sig = self
+                        .completeness
+                        .last_snapshot_signature
+                        .clone()
+                        .unwrap_or_else(|| "(none yet — perception block has not recorded a snapshot for this session)".to_string());
+                    tool_result = format!(
+                        "Snapshot taken. Observe the new page state in the next user message. Current snapshot_signature: {}",
+                        sig
+                    );
+                },
+                "vision_inspect" => {
+                    let r = args["ref"].as_str().unwrap_or("");
+                    let r_norm = normalize_ref(r);
+                    if let Some(backend_id) = ref_map.get(&r_norm) {
+                        match tokio::time::timeout(tokio::time::Duration::from_secs(15), mew_cdp::screenshot_region(page, backend_id.clone())).await {
+                            Ok(Ok((base64_data, x, y, w, h))) => {
+                                println!("Region screenshot captured: {}x{} at {},{}", w, h, x, y);
+                                let vision_body = serde_json::json!({
+                                    "model": "mimo-v2.5-free",
+                                    "messages": [
+                                        {
+                                            "role": "user",
+                                            "content": [
+                                                {"type": "text", "text": "Describe what you see in this cropped UI region. Identify if it looks like a button, icon, or specific widget."},
+                                                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", base64_data)}}
+                                            ]
+                                        }
+                                    ]
+                                });
+                                let url = format!("{}/chat/completions", self.config.opencode_zen.base_url);
+                                let v_res_future = self.client.post(&url)
+                                    .header("Authorization", format!("Bearer {}", self.config.opencode_zen.api_key))
+                                    .json(&vision_body)
+                                    .send();
+                                        
+                                match tokio::time::timeout(tokio::time::Duration::from_secs(30), v_res_future).await {
+                                    Ok(Ok(resp)) => {
+                                        if let Ok(v_json) = resp.json::<serde_json::Value>().await {
+                                            if let Some(desc) = v_json["choices"][0]["message"]["content"].as_str() {
+                                                // Phase 6: wrap the
+                                                // raw description
+                                                // in the
+                                                // vision-confidence
+                                                // gate. The
+                                                // score() pure
+                                                // function derives
+                                                // a confidence
+                                                // from the LLM's
+                                                // own text (and
+                                                // the box size);
+                                                // the threshold
+                                                // (0.5) decides
+                                                // whether the
+                                                // description is
+                                                // acceptable. Low
+                                                // confidence ->
+                                                // surface a
+                                                // typed error so
+                                                // the LLM knows
+                                                // the vision
+                                                // result is not
+                                                // reliable, and
+                                                // suggest the
+                                                // tighter-crop
+                                                // coords the loop
+                                                // would use to
+                                                // re-shoot.
+                                                let verdict = crate::resilience::evaluate_vision(
+                                                    desc,
+                                                    Some((x, y, w, h)),
+                                                );
+                                                let threshold = 0.5_f32;
+                                                if verdict.confidence.is_acceptable(threshold) {
+                                                    tool_result = format!(
+                                                        "Vision fallback result for region {}:\nDescription: {}\nBounds: {}x{} at {},{}\nConfidence: {:.2}",
+                                                        r, desc, w, h, x, y, verdict.confidence.score
+                                                    );
+                                                } else {
+                                                    crate::resilience::log_resilience_event(
+                                                        self.transcript_file.as_ref(),
+                                                        &self.session_id,
+                                                        "vision_ambiguity",
+                                                        &format!(
+                                                            "ref={} confidence={:.2} threshold={:.2}",
+                                                            r, verdict.confidence.score, threshold
+                                                        ),
+                                                    );
+                                                    let tighten = verdict
+                                                        .tighten_crop
+                                                        .map(|(tx, ty, tw, th)| {
+                                                            format!(
+                                                                " Suggested tighter crop: x={:.0} y={:.0} w={:.0} h={:.0} (use this for the next screenshot).",
+                                                                tx, ty, tw, th
+                                                            )
+                                                        })
+                                                        .unwrap_or_default();
+                                                    tool_result = format!(
+                                                        "Vision result is not reliable (confidence {:.2}, threshold {:.2}). The LLM's description was too vague to act on.{} Try a different region or use a structured accessibility-tree element instead of vision.",
+                                                        verdict.confidence.score, threshold, tighten
+                                                    );
+                                                    // Phase 6: do not
+                                                    // mark the vision
+                                                    // call a success
+                                                    // when the
+                                                    // confidence is
+                                                    // below threshold.
+                                                    // The LLM should
+                                                    // pick a different
+                                                    // approach
+                                                    // (snapshot +
+                                                    // accessibility
+                                                    // tree).
+                                                }
+                                            } else {
+                                                tool_result = "Vision API returned no description".to_string();
+                                            }
+                                        } else {
+                                            tool_result = "Vision API returned invalid JSON".to_string();
+                                        }
+                                    },
+                                    Ok(Err(e)) => tool_result = format!("Vision API call failed: {}", e),
+                                    Err(_) => tool_result = "Vision API call timed out".to_string(),
+                                }
+                            },
+                            Ok(Err(e)) => tool_result = format!("Failed to take screenshot of region: {}", e),
+                            Err(_) => tool_result = "Timeout while taking screenshot of region".to_string(),
+                        }
+                    } else {
+                        tool_result = format!("ref_id {} (normalized: {}) not found on page", r, r_norm);
+                        println!("{}", tool_result);
+                    }
+                },
+                "extract_fields" => {
+                    // Phase 33: structured field extractor. The
+                    // agent passes an array of field names; we
+                    // run a single targeted CDP query against
+                    // the current page and return a JSON object
+                    // with the values (None for missing fields).
+                    //
+                    // The tool is designed to be called in the
+                    // SAME LLM turn as the `click()` that
+                    // selected a listing (Phase 32 batch
+                    // dispatch), so the page is post-click and
+                    // the panel is mounted. We still auto-detect
+                    // Maps mode from the current URL — the
+                    // dispatch site is generic, and the extractor
+                    // picks the right selector set on its own.
+                    //
+                    // The result is intentionally a JSON object
+                    // string, not a human-readable pre-rendered
+                    // blob, so the LLM sees typed field values
+                    // (it can pick which ones to use downstream)
+                    // and the UI summarizer in
+                    // `summarizer::summarize` formats a friendly
+                    // per-listing one-liner from the same JSON.
+                    //
+                    // Hard-bounded to 3s on the CDP side. On
+                    // any page-side error / CSP block / timeout,
+                    // the extractor returns a fully-populated
+                    // map of `None`s — the LLM never sees a raw
+                    // error string here, it just sees "no fields
+                    // found this turn, try the next listing".
+                    let requested: Vec<String> = args
+                        .get("fields")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if requested.is_empty() {
+                        tool_result = "extract_fields: no fields requested".to_string();
+                    } else {
+                        // Borrow as &[&str] for the extractor.
+                        // The vec lives for the duration of this
+                        // match arm so the borrows are valid.
+                        let field_refs: Vec<&str> =
+                            requested.iter().map(|s| s.as_str()).collect();
+                        // Auto-detect Maps mode from the current
+                        // URL. Phase 33 calls for the dispatch
+                        // site to determine `maps_mode` from
+                        // `self.current_url`; we read the live
+                        // page URL instead because it's
+                        // authoritative (the in-memory
+                        // `self.current_url` can lag a
+                        // post-click SPA route change by one
+                        // iteration).
+                        let current_url =
+                            page.url().await.ok().flatten().unwrap_or_default();
+                        let maps_mode = mew_cdp::is_maps_url(&current_url);
+                        match mew_cdp::extract_structured_fields(
+                            page,
+                            &field_refs,
+                            maps_mode,
+                        )
+                        .await
+                        {
+                            Ok(map) => {
+                                // Serialize as a JSON object
+                                // string so the LLM sees typed
+                                // field values, and so the
+                                // summarizer template in
+                                // `summarizer::summarize`
+                                // (the "extract_fields" arm)
+                                // can parse it back into a
+                                // one-liner for the UI.
+                                match serde_json::to_string(&map) {
+                                    Ok(s) => tool_result = s,
+                                    Err(e) => {
+                                        tool_result = format!(
+                                            "extract_fields: serialize failed: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                // The extractor is supposed to
+                                // never error — it has
+                                // all-`None` fallbacks for
+                                // every failure mode. A real
+                                // Err here means the page is
+                                // in a degenerate state and
+                                // the agent should move on.
+                                // Don't loop on it.
+                                tool_result = format!(
+                                    "extract_fields: extractor error: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                },
+                "finish" => {
+                    // Phase 15.1: the finish() tool is gated by the
+                    // completeness tracker. If subtasks were declared
+                    // and any are still pending, this first call is
+                    // intercepted — we do NOT return Ok(res). Instead
+                    // we set `tool_result` to a re-prompt the LLM sees
+                    // on the next iteration, log the gate-trigger
+                    // event, and continue the loop.
+                    //
+                    // The 15.1 spec is explicit: "force one more
+                    // snapshot() and require the model to explicitly
+                    // justify each incomplete item." We do both: the
+                    // re-prompt is injected as a tool-result error
+                    // (so the LLM is told to act on it next turn)
+                    // AND we set force_snapshot so the next iteration
+                    // gets a fresh tree, not a stale diff.
+                    let res = args["result"].as_str().unwrap_or("").to_string();
+                    self.completeness.record_finish_attempt();
+                    self.finish_calls_this_gate += 1;
+                    if self.completeness.gate_open() {
+                        // Gate clear — let finish() through. Write the
+                        // per-subtask summary to the transcript first
+                        // (the spec requires it be logged at the end of
+                        // every session), then return.
+                        let task_summary = self
+                            .messages
+                            .iter()
+                            .find_map(|m| {
+                                m.get("role").and_then(|r| r.as_str())
+                                    .filter(|r| *r == "user")
+                                    .and_then(|_| m.get("content").and_then(|c| c.as_str()))
+                            })
+                            .unwrap_or("(no task recorded)")
+                            .to_string();
+                        let summary_text = self.completeness.write_summary(
+                            self.transcript_file.as_ref(),
+                            &self.session_id,
+                            &task_summary,
+                        );
+                        if let Some(tx) = &self.event_tx {
+                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                            let _ = tx.send(AgentEvent::Summary {
+                                timestamp_secs: ts,
+                                text: summary_text,
+                            });
+                        }
+                        self.summary_written = true;
+                        // Phase 5: end-of-task LLM summarizer.
+                        // The agent's raw `finish()` text is
+                        // usually a list of "I clicked X. I
+                        // typed Y. I called finish()" — not
+                        // user-friendly. The LLM call rewrites
+                        // it into a 1-2 sentence reply that
+                        // references the actual people/sites/
+                        // values the steps mention. On any
+                        // failure (network, parse, model
+                        // refusal) we fall back to the raw
+                        // `res` so the user always sees
+                        // *something* — the never-silent
+                        // guarantee.
+                        //
+                        // The task description fed to the
+                        // summarizer strips the "Task: " prefix
+                        // the system prompt adds (the LLM
+                        // already sees the raw task; the
+                        // summary should too).
+                        let task_for_summary = task_summary
+                            .strip_prefix("Task: ")
+                            .unwrap_or(&task_summary);
+                        let final_text = match self
+                            .end_of_task_summarize(task_for_summary, &res)
+                            .await
+                        {
+                            Some(s) if !s.is_empty() => s,
+                            _ => res.clone(),
+                        };
+                        println!("Task finished with result: {}", final_text);
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if let Some(mut file) = self.transcript_file.as_ref() {
+                            let log_entry = format!(
+                                "[{}] [{}] TOOL CALL: {} (args: {})\nRESULT: Task finished: {}\n\n",
+                                timestamp, obs_summary, name, args_str, final_text
+                            );
+                            let _ = file.write_all(log_entry.as_bytes());
+                        }
+                        if let Some(tx) = &self.event_tx {
+                            let _ = tx.send(AgentEvent::Tool {
+                                timestamp_secs: timestamp,
+                                name: name.to_string(),
+                                args: args_str.to_string(),
+                                result: format!("Task finished: {}", final_text),
+                                tools_per_turn,
+                            });
+                        }
+                        // Stash the result so the post-match block
+                        // can return it. We use a small String
+                        // captured via `pending_finish_result` so
+                        // the existing match-arm exit path is reused.
+                        self.pending_finish_result = Some(final_text);
+                        // Use a non-error tool_result to satisfy the
+                        // match's fallthrough; the real Ok return
+                        // happens after the match.
+                        tool_result = "(gate open — finish accepted; will return on next iteration)".to_string();
+                    } else {
+                        // Gate closed — first call is a re-prompt.
+                        // Don't return. Mark gate triggered, force a
+                        // fresh snapshot next iteration, and tell the
+                        // LLM exactly what to do.
+                        self.completeness.note_gate_triggered();
+                        self.force_snapshot = true;
+                        let pending_ids: Vec<String> = self
+                            .completeness
+                            .subtasks
+                            .iter()
+                            .filter(|s| !matches!(s.status, SubTaskStatus::Done | SubTaskStatus::Skipped { .. } | SubTaskStatus::Failed { .. }))
+                            .map(|s| s.id.clone())
+                            .collect();
+                        let pending_descs: Vec<String> = self
+                            .completeness
+                            .subtasks
+                            .iter()
+                            .filter(|s| !matches!(s.status, SubTaskStatus::Done | SubTaskStatus::Skipped { .. } | SubTaskStatus::Failed { .. }))
+                            .map(|s| format!("  - id={}: {}", s.id, s.description))
+                            .collect();
+                        let reason = format!(
+                            "GATE BLOCKED: finish() called while {} subtask(s) are still pending. The agent is now forcing a fresh snapshot and re-prompting you. You must, on the next turn, do one of the following for each pending item:\n  - Call mark_subtask_done(id, snapshot_signature) if the most recent snapshot confirms the sub-item is complete on screen. The signature will be in the next observation.\n  - Call mark_subtask_skipped(id, reason) if the sub-item is genuinely out of scope.\n  - Call mark_subtask_failed(id, reason) if you tried and could not verify success.\nPending items:\n{}\nA blanket finish() is not accepted. The next iteration will start with a fresh snapshot so you have on-screen evidence to mark each item done.",
+                            pending_ids.len(),
+                            pending_descs.join("\n")
+                        );
+                        println!("[completeness-gate] finish() blocked: {}", reason.replace("\n", " | "));
+                        if let Some(mut file) = self.transcript_file.as_ref() {
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let log_entry = format!(
+                                "[{}] [{}] GATE: finish() intercepted, pending={}, reason={}\n\n",
+                                timestamp,
+                                self.session_id,
+                                pending_ids.len(),
+                                reason.replace("\n", " | ")
+                            );
+                            let _ = file.write_all(log_entry.as_bytes());
+                        }
+                        tool_result = reason;
+                        // Reset the per-gate counter so the LLM
+                        // gets exactly one more chance after the
+                        // forced re-prompt — if it calls finish()
+                        // again with pending items still open, the
+                        // same gate fires again (not a permanent
+                        // block, just a per-attempt re-prompt).
+                        self.finish_calls_this_gate = 0;
+                    }
+                },
+                "declare_subtasks" => {
+                    // Phase 15.1: the LLM populates the canonical
+                    // sub-item list. We accept JSON shape
+                    // `{ items: [{ id, description }, ...] }`.
+                    let items_raw = args.get("items").and_then(|v| v.as_array());
+                    let mut declared: Vec<DeclareItem> = Vec::new();
+                    if let Some(arr) = items_raw {
+                        for it in arr {
+                            let id = it.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let desc = it.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            if id.is_empty() {
+                                tool_result = format!("ERROR: declare_subtasks item missing 'id': {}", it);
+                                break;
+                            }
+                            if desc.is_empty() {
+                                tool_result = format!("ERROR: declare_subtasks item '{}' missing 'description'", id);
+                                break;
+                            }
+                            declared.push(DeclareItem { id, description: desc });
+                        }
+                    }
+                    if tool_result.is_empty() {
+                        match self.completeness.declare(declared.clone()) {
+                            Ok(n) => {
+                                println!(
+                                    "[completeness] declared {} subtask(s); tracker now: {}",
+                                    n,
+                                    self.completeness.inline_status()
+                                );
+                                if let Some(mut file) = self.transcript_file.as_ref() {
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let ids: Vec<String> = declared.iter().map(|d| d.id.clone()).collect();
+                                    let log_entry = format!(
+                                        "[{}] [{}] DECLARE: subtasks={} ids={:?}\n\n",
+                                        timestamp,
+                                        self.session_id,
+                                        n,
+                                        ids
+                                    );
+                                    let _ = file.write_all(log_entry.as_bytes());
+                                }
+                                let list: Vec<String> = declared
+                                    .iter()
+                                    .map(|d| format!("  - id={} desc=\"{}\"", d.id, d.description))
+                                    .collect();
+                                tool_result = format!(
+                                    "Declared {} subtask(s). For each, take a snapshot and call mark_subtask_done(id, snapshot_signature) when you see the expected state change. Skipped/failed are also terminal.\n{}",
+                                    n,
+                                    list.join("\n")
+                                );
+                            }
+                            Err(e) => {
+                                tool_result = format!("ERROR: declare_subtasks rejected: {}", e);
+                            }
+                        }
+                    }
+                },
+                "mark_subtask_done" => {
+                    // Phase 15.1: the LLM marks a subtask complete.
+                    // The tracker rejects the call if the supplied
+                    // signature doesn't match the most recent
+                    // snapshot, forcing the model to actually look
+                    // at the page (or call snapshot() first).
+                    let id = args["id"].as_str().unwrap_or("").to_string();
+                    let sig = args["snapshot_signature"].as_str().unwrap_or("").to_string();
+                    if id.is_empty() {
+                        tool_result = "ERROR: mark_subtask_done requires 'id'".to_string();
+                    } else {
+                        match self.completeness.mark_done(&id, &sig) {
+                            MarkOutcome::MarkedDone { evidence_iteration, evidence_signature } => {
+                                println!(
+                                    "[completeness] subtask '{}' marked done (evidence: iter {}, sig {})",
+                                    id, evidence_iteration, evidence_signature
+                                );
+                                if let Some(mut file) = self.transcript_file.as_ref() {
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let log_entry = format!(
+                                        "[{}] [{}] MARK DONE: id={} evidence_iter={} evidence_sig={}\n\n",
+                                        timestamp, self.session_id, id, evidence_iteration, evidence_signature
+                                    );
+                                    let _ = file.write_all(log_entry.as_bytes());
+                                }
+                                tool_result = format!(
+                                    "Subtask '{}' marked done with fresh-snapshot evidence (iter {}, sig {}). Tracker: {}",
+                                    id,
+                                    evidence_iteration,
+                                    evidence_signature,
+                                    self.completeness.inline_status()
+                                );
+                            }
+                            MarkOutcome::StaleEvidence { last_snapshot_iteration, current_iteration } => {
+                                println!(
+                                    "[completeness] mark_done '{}' REJECTED: stale evidence (last snapshot at iter {}, current iter {})",
+                                    id, last_snapshot_iteration, current_iteration
+                                );
+                                tool_result = format!(
+                                    "ERROR: mark_subtask_done for '{}' rejected — your snapshot_signature does not match the most recent on-screen snapshot. Take a fresh snapshot() first, observe the page, and retry with that signature. The agent has recorded snapshot signatures as the perception block runs.",
+                                    id
+                                );
+                            }
+                            MarkOutcome::UnknownId => {
+                                tool_result = format!(
+                                    "ERROR: no subtask with id '{}' is currently declared. Call declare_subtasks first or check the id spelling.",
+                                    id
+                                );
+                            }
+                            MarkOutcome::AlreadyTerminal { current } => {
+                                tool_result = format!(
+                                    "ERROR: subtask '{}' is already in terminal status '{}' and cannot be marked done again.",
+                                    id,
+                                    current.as_str()
+                                );
+                            }
+                            MarkOutcome::MarkedSkipped { .. } => {
+                                // unreachable on mark_done
+                                unreachable!()
+                            }
+                            MarkOutcome::MarkedExhausted { .. } => {
+                                // unreachable on mark_done — only the
+                                // budget guard's `mark_exhausted` call
+                                // produces this variant (Phase 7).
+                                unreachable!()
+                            }
+                        }
+                    }
+                },
+                "mark_subtask_skipped" => {
+                    let id = args["id"].as_str().unwrap_or("").to_string();
+                    let reason = args["reason"].as_str().unwrap_or("").to_string();
+                    if id.is_empty() {
+                        tool_result = "ERROR: mark_subtask_skipped requires 'id'".to_string();
+                    } else if reason.is_empty() {
+                        tool_result = format!("ERROR: mark_subtask_skipped for '{}' requires a non-empty 'reason'", id);
+                    } else {
+                        match self.completeness.mark_skipped(&id, reason.clone()) {
+                            MarkOutcome::MarkedSkipped { reason: r } => {
+                                println!(
+                                    "[completeness] subtask '{}' marked skipped: {}",
+                                    id, r
+                                );
+                                if let Some(mut file) = self.transcript_file.as_ref() {
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let log_entry = format!(
+                                        "[{}] [{}] MARK SKIPPED: id={} reason={}\n\n",
+                                        timestamp, self.session_id, id, r
+                                    );
+                                    let _ = file.write_all(log_entry.as_bytes());
+                                }
+                                tool_result = format!(
+                                    "Subtask '{}' marked skipped (reason: {}). Tracker: {}",
+                                    id,
+                                    r,
+                                    self.completeness.inline_status()
+                                );
+                            }
+                            MarkOutcome::UnknownId => {
+                                tool_result = format!(
+                                    "ERROR: no subtask with id '{}' is currently declared.",
+                                    id
+                                );
+                            }
+                            MarkOutcome::AlreadyTerminal { current } => {
+                                tool_result = format!(
+                                    "ERROR: subtask '{}' is already in terminal status '{}'.",
+                                    id,
+                                    current.as_str()
+                                );
+                            }
+                            MarkOutcome::StaleEvidence { .. } => unreachable!(),
+                            MarkOutcome::MarkedDone { .. } => unreachable!(),
+                            MarkOutcome::MarkedExhausted { .. } => unreachable!(),
+                        }
+                    }
+                },
+                "mark_subtask_failed" => {
+                    let id = args["id"].as_str().unwrap_or("").to_string();
+                    let reason = args["reason"].as_str().unwrap_or("").to_string();
+                    if id.is_empty() {
+                        tool_result = "ERROR: mark_subtask_failed requires 'id'".to_string();
+                    } else if reason.is_empty() {
+                        tool_result = format!("ERROR: mark_subtask_failed for '{}' requires a non-empty 'reason'", id);
+                    } else {
+                        match self.completeness.mark_failed(&id, reason.clone()) {
+                            MarkOutcome::MarkedSkipped { reason: r } => {
+                                // mark_failed reuses the MarkedSkipped
+                                // variant in the enum because they
+                                // share "terminal + reason" semantics
+                                // for the dispatcher. The tracker
+                                // itself records Failed.
+                                println!(
+                                    "[completeness] subtask '{}' marked failed: {}",
+                                    id, r
+                                );
+                                if let Some(mut file) = self.transcript_file.as_ref() {
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let log_entry = format!(
+                                        "[{}] [{}] MARK FAILED: id={} reason={}\n\n",
+                                        timestamp, self.session_id, id, r
+                                    );
+                                    let _ = file.write_all(log_entry.as_bytes());
+                                }
+                                tool_result = format!(
+                                    "Subtask '{}' marked failed (reason: {}). Tracker: {}",
+                                    id,
+                                    r,
+                                    self.completeness.inline_status()
+                                );
+                            }
+                            MarkOutcome::UnknownId => {
+                                tool_result = format!(
+                                    "ERROR: no subtask with id '{}' is currently declared.",
+                                    id
+                                );
+                            }
+                            MarkOutcome::AlreadyTerminal { current } => {
+                                tool_result = format!(
+                                    "ERROR: subtask '{}' is already in terminal status '{}'.",
+                                    id,
+                                    current.as_str()
+                                );
+                            }
+                            MarkOutcome::StaleEvidence { .. } => unreachable!(),
+                            MarkOutcome::MarkedDone { .. } => unreachable!(),
+                            MarkOutcome::MarkedExhausted { .. } => unreachable!(),
+                        }
+                    }
+                },
+                _ => {
+                    tool_result = format!("Unknown tool '{}'", effective_name);
+                }
+            }
+            println!("Tool result: {}", tool_result);
+            // Phase 1: log the tool result alongside the
+            // dispatch event. We record the result length (not
+            // the full text) so a quick filter can spot
+            // abnormally long or short results without bloating
+            // the log; the full text is in the transcript. For
+            // navigate specifically, also record the resolved
+            // URL so a grep can find "which branch of the URL
+            // resolver actually fired?" in one place.
+            let tool_result_preview: String = tool_result.chars().take(200).collect();
+            tracing::info!(
+                event = "tool_result",
+                iter = self.iterations,
+                tool = %name,
+                result_len = tool_result.len(),
+                result_preview = %tool_result_preview,
+                "tool finished"
+            );
+            // Append tool response
+            self.messages.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": &tool_result
+            }));
+            // Log to transcript
+            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            if let Some(mut file) = self.transcript_file.as_ref() {
+                let log_entry = format!("[{}] [{}] TOOL CALL: {} (args: {})\nRESULT: {}\n\n", timestamp, obs_summary, name, args_str, tool_result);
+                let _ = file.write_all(log_entry.as_bytes());
+            }
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(AgentEvent::Tool {
+                    timestamp_secs: timestamp,
+                    name: name.to_string(),
+                    args: args_str.to_string(),
+                    result: tool_result.clone(),
+                    tools_per_turn,
+                });
+            }
+            // Phase 5: live progress line. Cheap, templated,
+            // no LLM. The line is pushed to the agent's
+            // `LiveProgress` buffer (capped at
+            // `live_lines_cap`) and emitted on the event
+            // channel as `AgentEvent::ProgressLine`. The
+            // frontend's "agent is working" pill and the
+            // per-task live progress sub-list both consume
+            // these events. Unknown tool names are silently
+            // skipped — see `summarizer::summarize`.
+            //
+            // Phase 6: pass `effective_name` /
+            // `effective_args` so when the modal-dismiss
+            // override fired, the progress line says
+            // "Clicked @e1 (modal dismiss)" instead of the
+            // original LLM tool. The user sees what
+            // actually happened, not the redirected intent.
+            self.emit_progress_line(&effective_name, &effective_args, &tool_result);
+            // Phase 32: navigate changed the page; remaining
+            // tools in the batch would act on the wrong page.
+            // We still logged the per-tool transcript +
+            // emitted AgentEvent::Tool so the LLM sees the
+            // result of the last tool in the batch.
+            if page_changed {
+                return Ok(BatchStepOutcome::PageChanged);
+            }
+            if self.pending_finish_result.is_some() {
+                return Ok(BatchStepOutcome::Finish);
+            }
+            // Phase 15.1: if the finish() tool handler stashed a
+            // result (gate open), exit the loop now with that
+            // result. The transcript logging above is the same
+            // shape every other tool uses, so the per-tool log
+            // line still records the finish() call.
+        Ok(BatchStepOutcome::Continue)
     }
 }
 
@@ -3760,6 +4856,64 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
 /// When the plan is empty (single-clause task), the block says
 /// so explicitly so the LLM doesn't try to declare a 1-item
 /// subtask list and trigger a re-declaration churn loop.
+
+// ---------------------------------------------------------------------------
+// Phase 38: AX-tree perception tuning helpers
+// ---------------------------------------------------------------------------
+// `count_tree_nodes` is the underlying-tree node count used in the
+// PERCEPTION log line. It walks the source `TreeNode` (not the rendered
+// `obs_text`) so a truncated snapshot is visibly distinct from an
+// unbounded one — a reviewer auditing a Maps enumeration run can see
+// "underlying tree had 2400 nodes, snapshot was capped at 800".
+// `write_perception_line` is the agent-side transcript writer that
+// matches the same shape as `write_state_line` so the file is
+// uniform.
+fn count_tree_nodes(node: &mew_perception::TreeNode) -> usize {
+    fn walk(n: &mew_perception::TreeNode, acc: &mut usize) {
+        *acc += 1;
+        for c in &n.children {
+            walk(c, acc);
+        }
+    }
+    let mut total = 0usize;
+    walk(node, &mut total);
+    total
+}
+
+impl Agent {
+    /// Phase 38: write a `PERCEPTION:` line to the transcript
+    /// (matching the `NAV-KIND:` shape from phase 31) so a
+    /// reviewer can audit the perception block's per-iteration
+    /// cost and detect performance regressions without a
+    /// profiler. Mirrors [`Self::write_state_line`]'s file
+    /// guard + `flush` semantics; falls through silently when
+    /// no transcript is open (e.g. in `eval` harnesses).
+    fn write_perception_line(
+        &self,
+        kind: mew_cdp::NavigationKind,
+        latency_ms: u128,
+        nodes: usize,
+        snapshot_bytes: usize,
+    ) {
+        if let Some(mut f) = self.transcript_file.as_ref() {
+            use std::io::Write;
+            // The same epoch-seconds timestamp the state line
+            // uses; a `flush` follows so the line is on disk
+            // before any crash.
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let line = format!(
+                "[{}] [{}] PERCEPTION: kind={} latency_ms={} nodes={} snapshot_bytes={}\n\n",
+                ts, self.session_id, kind.as_str(), latency_ms, nodes, snapshot_bytes
+            );
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.flush();
+        }
+    }
+}
+
 fn render_plan_block(plan: &crate::planner::Plan) -> String {
     if plan.subtasks.is_empty() {
         return "PLAN (pre-flight decomposition):\n  (none — single undifferentiated task)\nYou are not required to call declare_subtasks. Call finish() directly when the task is complete.".to_string();
@@ -3779,4 +4933,222 @@ fn render_plan_block(plan: &crate::planner::Plan) -> String {
         "You must complete each subtask in order. After verifying each one on a fresh snapshot, call mark_subtask_done(id) where `id` is the bracketed id above. You may re-declare via declare_subtasks while every subtask is still Pending, but the canonical list above is owned by the code — re-declaration is for refinement, not replacement. Calling finish() while any subtask is Pending is intercepted; the gate will force a snapshot re-prompt.",
     );
     out
+}
+
+/// Phase 34: infer the `TaskShape` from a free-text task string,
+/// used by `run_preflight_plan` to decide whether to inject the
+/// Google Maps execution-strategy hint block.
+///
+/// This is the *agent-side* counterpart to
+/// `chat_agent::is_local_lead_gen_task` and the LLM-classifier's
+/// `task_shape` field. The two should agree on the same task;
+/// the agent-side check is the safety net for the case where
+/// the LLM classifier mis-classified a Maps task as
+/// `GenericBrowse`. The function is intentionally cheap (no
+/// LLM call) so it can run inside `run_preflight_plan` on
+/// every session start without cost.
+///
+/// The precedence matches `ChatAgent::build_handoff_inner`:
+///   1. "job" / "internship" in the task -> `JobSearch`
+///   2. "lead" / "client" in the task     -> `LeadGen`
+///   3. Maps-shaped keywords              -> `LocalLeadGen`
+///   4. otherwise                          -> `GenericResearch`
+pub fn infer_task_shape_from_task(task: &str) -> TaskShape {
+    let lower = task.to_lowercase();
+    if lower.contains("job") || lower.contains("internship") {
+        return TaskShape::JobSearch;
+    }
+    if lower.contains("lead") || lower.contains("client") {
+        return TaskShape::LeadGen;
+    }
+    if crate::chat_agent::is_local_lead_gen_task(task) {
+        return TaskShape::LocalLeadGen;
+    }
+    TaskShape::GenericResearch
+}
+
+/// Phase 34: render the `GOOGLE MAPS EXECUTION STRATEGY:` block
+/// that is appended to the agent's system prompt when the task
+/// is a Maps local-lead-gen request. The block tells the LLM
+/// the exact rules the Maps SPA demands (panel vs. sidebar
+/// semantics, `extract_fields` usage, escape-to-close, etc.).
+///
+/// The block content is the literal spec text from
+/// `work.md` line 113 — verbatim, no paraphrasing — so a
+/// future editor reviewing the work plan against the
+/// system-prompt hint can match them line-for-line. Re-ordering
+/// the rules would change the LLM's behavior in subtle ways
+/// and break a regression test that compares the block to
+/// the spec.
+pub fn render_maps_hint_block(task: &str) -> String {
+    // Pre-parse the task so the hint block can show the
+    // extracted listing_count / min_rating / require_no_website
+    // to the LLM. The agent doesn't strictly need these in the
+    // prompt (the agent calls `MapsQuery::parse` itself when
+    // it sees the JSON) but listing them inline helps the LLM
+    // stay on-task and makes the prompt auditable.
+    let query = crate::handoff::MapsQuery::parse(task);
+    let count_str = query.listing_count.to_string();
+    let mut constraints: Vec<String> = Vec::new();
+    if let Some(min) = query.min_rating {
+        constraints.push(format!("rating >= {}", min));
+    }
+    if query.require_no_website {
+        constraints.push("no website required".to_string());
+    }
+    if query.require_phone {
+        constraints.push("phone required".to_string());
+    }
+    let filter_line = if constraints.is_empty() {
+        String::from("No additional filters.")
+    } else {
+        format!("Active filters: {}.", constraints.join("; "))
+    };
+
+    let template = format!(
+        "GOOGLE MAPS EXECUTION STRATEGY (Phase 34 — applies to this task only):\n\
+         You are on Google Maps. CRITICAL RULES: (1) Business panels open as side-panel overlays — the URL changes but this is an SPA transition, NOT a full navigation. Do NOT reset your mental model of which listings you've visited. (2) After clicking a listing name in the left sidebar to open its panel, immediately call extract_fields(fields=['phone','address','rating','website','name','review_count']) to get structured data. Do NOT try to parse the accessibility tree manually. (3) To close a panel and return to the search results list, call press_key(key='Escape'). (4) The search results are in the left sidebar. Scroll the sidebar (not the map viewport) to find more listings. (5) Do NOT call declare_subtasks for this task. Track listings internally and call finish() with a markdown table when done. (6) For each listing, record: name, phone, address, rating, review_count, has_website (yes/no). After checking all listings, output a markdown table sorted by: no-website + highest-rating first.\n\
+         \n\
+         PARSED QUERY: listings_to_visit={count_str}. {filter_line}\n\
+         \n\
+         You must visit exactly {count_str} listings. If the sidebar runs out of listings before you reach {count_str}, stop and call finish() with what you have.",
+        count_str = count_str,
+        filter_line = filter_line,
+    );
+    template
+}
+
+/// Phase 24 stub: render the `LEARNED (from past sessions):` block
+/// that is injected into the agent's system prompt from the
+/// episodic memory store.
+///
+/// **Pre-existing gap (flagged, not a Phase 32 fix):** the full
+/// implementation belongs to Phase 24 (Episodic memory retrieval
+/// & prompt injection) and was lost when the
+/// `mew-resilience::mock_fixtures`-based eval scenarios landed.
+/// Without this stub, `cargo check --features eval -p mew-agent`
+/// fails to compile because the eval scenarios in
+/// `eval::scenarios::{memory_retrieval,phase30_integration}`
+/// call this function. The stub serializes each lesson to JSON
+/// and pulls the `situation` / `lesson_text` (or `lesson`)
+/// fields so the existing memory scenarios can run; a full
+/// implementation is a Phase 24 follow-up.
+pub fn render_learned_block<T: serde::Serialize>(
+    lessons: &[T],
+) -> String {
+    if lessons.is_empty() {
+        return "LEARNED (from past sessions):\n  (none matching prior tasks)".to_string();
+    }
+    let mut out = String::from("LEARNED (from past sessions):\n");
+    for lesson in lessons {
+        let value = match serde_json::to_value(lesson) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let situation = value
+            .get("situation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let lesson_text = value
+            .get("lesson_text")
+            .or_else(|| value.get("lesson"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !situation.is_empty() {
+            out.push_str(&format!("- situation: {situation}\n"));
+        }
+        if !lesson_text.is_empty() {
+            out.push_str(&format!("  action: {lesson_text}\n"));
+        }
+    }
+    out
+}
+
+/// Phase 6: extract a bare hostname from a URL string for
+/// the auto-apply dedup lookup. The LLM sometimes passes
+/// a `url` arg instead of an explicit `platform` field
+/// — e.g. `apply_to_job` with `{"url":
+/// "https://linkedin.com/jobs/view/12345"}`. We need
+/// the bare host so the dedup store can normalize it
+/// the same way the LLM-supplied `platform` field
+/// would be normalized. Returns `None` when the input
+/// is not a parseable URL (the call site then falls
+/// back to no-platform, which is fine — the dedup
+/// check requires both a platform and a posting id
+/// and the LLM's missing arg is its own problem).
+fn extract_platform_from_url(url: &str) -> Option<&str> {
+    // Strip the scheme. We use a manual check rather
+    // than pulling in the `url` crate as a dependency
+    // for the dispatch site — the shape is bounded
+    // (`http://`, `https://`) and the helper is
+    // infallible for non-URL input.
+    let after_scheme = if let Some(rest) = url.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        rest
+    } else {
+        return None;
+    };
+    // The host is the substring up to the first `/`,
+    // `?`, or `#` (in that priority order).
+    let end = after_scheme
+        .find('/')
+        .or_else(|| after_scheme.find('?'))
+        .or_else(|| after_scheme.find('#'))
+        .unwrap_or(after_scheme.len());
+    Some(&after_scheme[..end])
+}
+
+#[cfg(test)]
+mod phase6_helpers_tests {
+    use super::extract_platform_from_url;
+
+    #[test]
+    fn extract_platform_handles_https() {
+        assert_eq!(
+            extract_platform_from_url("https://linkedin.com/jobs/view/12345"),
+            Some("linkedin.com")
+        );
+    }
+
+    #[test]
+    fn extract_platform_handles_http() {
+        assert_eq!(
+            extract_platform_from_url("http://upwork.com/projects/~abc"),
+            Some("upwork.com")
+        );
+    }
+
+    #[test]
+    fn extract_platform_handles_url_without_path() {
+        assert_eq!(
+            extract_platform_from_url("https://contra.com"),
+            Some("contra.com")
+        );
+    }
+
+    #[test]
+    fn extract_platform_strips_query_and_fragment() {
+        // The `jk` query parameter is the Indeed
+        // posting identifier; the platform is
+        // `indeed.com`, not the full query string.
+        assert_eq!(
+            extract_platform_from_url("https://indeed.com/jobs?jk=abc123"),
+            Some("indeed.com")
+        );
+    }
+
+    #[test]
+    fn extract_platform_returns_none_for_non_url() {
+        // A bare domain without a scheme. The
+        // call site should still try to use it
+        // as a platform — `mew_resilience` does
+        // its own normalization.
+        assert_eq!(extract_platform_from_url("linkedin.com"), None);
+    }
+
+    #[test]
+    fn extract_platform_returns_none_for_empty_input() {
+        assert_eq!(extract_platform_from_url(""), None);
+    }
 }

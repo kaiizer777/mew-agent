@@ -37,11 +37,7 @@ impl BrowserAgentWorker {
     }
 
     #[tracing::instrument(skip_all, fields(todo_id = %todo.id))]
-    pub fn submit(
-        &self,
-        todo: Todo,
-        handoff: Handoff,
-    ) -> oneshot::Receiver<TodoResult> {
+    pub fn submit(&self, todo: Todo, handoff: Handoff) -> oneshot::Receiver<TodoResult> {
         {
             let mut unawaited = self.unawaited_receiver.lock().unwrap();
             if *unawaited {
@@ -81,9 +77,7 @@ impl BrowserAgentWorker {
                 todo.intent.clone(),
             )];
 
-            let factory_fut = async {
-                factory.run_browser_task(scoped_handoff).await
-            };
+            let factory_fut = async { factory.run_browser_task(scoped_handoff).await };
 
             tokio::pin!(factory_fut);
 
@@ -97,9 +91,29 @@ impl BrowserAgentWorker {
                                 let sig = b_res.final_snapshot_signature.clone().unwrap_or_default();
                                 let obs = b_res.summary.clone();
                                 if b_res.status == BrowserStatus::Done {
-                                    final_result = Some(TodoResult::success(todo_id.clone(), sig, obs, 1));
+                                    final_result = Some(
+                                        TodoResult::success(todo_id.clone(), sig, obs, 1)
+                                            .with_findings(
+                                                b_res.findings,
+                                                b_res.job_findings,
+                                                b_res.lead_findings,
+                                            ),
+                                    );
                                 } else {
-                                    final_result = Some(TodoResult::failure(todo_id.clone(), b_res.summary, sig, obs, 1));
+                                    final_result = Some(
+                                        TodoResult::failure(
+                                            todo_id.clone(),
+                                            b_res.summary,
+                                            sig,
+                                            obs,
+                                            1,
+                                        )
+                                        .with_findings(
+                                            b_res.findings,
+                                            b_res.job_findings,
+                                            b_res.lead_findings,
+                                        ),
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -125,6 +139,16 @@ impl BrowserAgentWorker {
                                 SupervisorSignal::Pause => {}
                                 SupervisorSignal::Resume => {}
                                 SupervisorSignal::Replan(_) => {}
+                                SupervisorSignal::Respawn(reason) => {
+                                    final_result = Some(TodoResult::failure(
+                                        todo_id.clone(),
+                                        format!("respawn requested: {}", reason.as_str()),
+                                        "",
+                                        "",
+                                        0,
+                                    ));
+                                    break;
+                                }
                             }
                         }
                     }

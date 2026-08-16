@@ -34,10 +34,8 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("[smoke] jsonl path: {}", jsonl_path.display());
 
     // 2. Build the layer.
-    let layer = mew_agent::tracing_layer::SessionJsonLayer::new(
-        "smoke_session",
-        jsonl_path.clone(),
-    )?;
+    let layer =
+        mew_agent::tracing_layer::SessionJsonLayer::new("smoke_session", jsonl_path.clone())?;
     let layer = Arc::new(layer);
 
     // 3. Simulate the CLI having installed a fmt subscriber first.
@@ -63,9 +61,7 @@ async fn main() -> anyhow::Result<()> {
             "[smoke] WARN: JSONL layer installed as global (fmt was not). \
              This is fine in this test but unexpected in CLI mode."
         ),
-        Err(e) => eprintln!(
-            "[smoke] JSONL layer global install returned Err as expected: {e}"
-        ),
+        Err(e) => eprintln!("[smoke] JSONL layer global install returned Err as expected: {e}"),
     }
 
     // 5. Stage 2: install the layer as a thread-local override.
@@ -78,7 +74,11 @@ async fn main() -> anyhow::Result<()> {
     //    override in place, the JSONL layer should receive every
     //    one of them in addition to the global fmt subscriber.
     tracing::info!(event = "smoke_event_one", "first event");
-    tracing::info!(event = "smoke_event_two", iter = 2, "second event with fields");
+    tracing::info!(
+        event = "smoke_event_two",
+        iter = 2,
+        "second event with fields"
+    );
     tracing::info!(event = "smoke_event_three", "third event");
 
     // 7. Drop the guard and confirm subsequent events do NOT land
@@ -86,7 +86,10 @@ async fn main() -> anyhow::Result<()> {
     //    dropping the guard reverts the thread-local default back
     //    to the global fmt subscriber.
     drop(_guard);
-    tracing::info!(event = "smoke_event_after_drop", "this MUST NOT land in the file");
+    tracing::info!(
+        event = "smoke_event_after_drop",
+        "this MUST NOT land in the file"
+    );
 
     // 8. Read the file back and confirm exactly the first three
     //    events are present, the fourth is not.

@@ -57,7 +57,11 @@ async fn run_browser_task_real(
 
     let (browser, page, handler_task, job) = mew_cdp::launch(
         config.browser.as_ref().and_then(|b| b.binary_path.clone()),
-        config.browser.as_ref().map(|b| b.visible_cursor).unwrap_or(false),
+        config
+            .browser
+            .as_ref()
+            .map(|b| b.visible_cursor)
+            .unwrap_or(false),
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to launch Chrome: {e}"))?;
@@ -129,23 +133,19 @@ async fn try_route_to_running_session(
 }
 
 fn read_transcript(session_id: &str) -> String {
-    let path = std::path::PathBuf::from("transcripts")
-        .join(format!("transcript_{}.log", session_id));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        format!(
-            "<could not read transcript at {}: {}>",
-            path.display(),
-            e
-        )
-    })
+    let path =
+        std::path::PathBuf::from("transcripts").join(format!("transcript_{}.log", session_id));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| format!("<could not read transcript at {}: {}>", path.display(), e))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("PHASE33=redirect_assert — hard-assert regression for the redirect-during-task bug");
 
-    let baseline_task = std::env::var("BASELINE_TASK")
-        .unwrap_or_else(|_| "Navigate to https://example.com and report the main heading text.".to_string());
+    let baseline_task = std::env::var("BASELINE_TASK").unwrap_or_else(|_| {
+        "Navigate to https://example.com and report the main heading text.".to_string()
+    });
     let redirect_text = std::env::var("REDIRECT_TEXT").unwrap_or_else(|_| {
         "Actually, switch tasks: navigate to https://github.com/rust-lang/rust and report the repository description shown at the top of the README."
             .to_string()
@@ -210,7 +210,10 @@ async fn main() -> anyhow::Result<()> {
         slot_populated,
         "agent never installed its ActiveSession in the slot"
     );
-    println!("[harness] session running; waiting {}ms before pushing redirect", redirect_after_ms);
+    println!(
+        "[harness] session running; waiting {}ms before pushing redirect",
+        redirect_after_ms
+    );
     sleep(Duration::from_millis(redirect_after_ms)).await;
 
     let route_result = try_route_to_running_session(&slot, &redirect_text).await;
@@ -301,7 +304,9 @@ async fn main() -> anyhow::Result<()> {
     // ASSERTION 3: original baseline task is still in the transcript.
     assert!(
         body.contains(&baseline_task)
-            || body.lines().any(|l| l.contains("Task:") && l.contains(&baseline_task)),
+            || body
+                .lines()
+                .any(|l| l.contains("Task:") && l.contains(&baseline_task)),
         "Original baseline task string was not in the transcript — history was \
          wiped or replaced. The drain fix may have broken the truncate path."
     );
@@ -315,8 +320,7 @@ async fn main() -> anyhow::Result<()> {
         .lines()
         .any(|l| l.contains("NAV-RESOLVE:") && l.contains("github.com/rust-lang/rust"));
     let finished_with_redirect = body.lines().any(|l| {
-        l.contains("TOOL CALL: finish")
-            && (l.contains("rust-lang") || l.contains("rust-lang/rust"))
+        l.contains("TOOL CALL: finish") && (l.contains("rust-lang") || l.contains("rust-lang/rust"))
     });
     assert!(
         redirected_via_navigate || finished_with_redirect,

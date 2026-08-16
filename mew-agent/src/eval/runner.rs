@@ -46,16 +46,10 @@ use super::assertions::{assert_handoff_contract, AssertionResult};
 use super::harness::{Scenario, ScenarioOutcome};
 use super::report::{EvalReport, RunMetrics};
 
-
-
-
 /// Run a single scenario. Returns the outcome; the
 /// caller decides whether a failed outcome is a test
 /// failure. Pure-Rust; no I/O.
-pub fn run_scenario(
-    scenario: &Scenario,
-    chat_agent: &ChatAgent,
-) -> ScenarioOutcome {
+pub fn run_scenario(scenario: &Scenario, chat_agent: &ChatAgent) -> ScenarioOutcome {
     let started = Instant::now();
     let originating_message_id = format!("eval:{}:{}", scenario.id, unix_secs());
 
@@ -109,9 +103,9 @@ pub fn run_scenario(
     let passed = contract.is_ok() && detection_ok;
     let failure_reason = match (&contract, detection_ok) {
         (Err(e), _) => format!("contract: {e}"),
-        (Ok(_), false) => format!(
-            "detector missed a known mode: known={known:?}, detected={detected:?}"
-        ),
+        (Ok(_), false) => {
+            format!("detector missed a known mode: known={known:?}, detected={detected:?}")
+        }
         (Ok(_), true) => String::new(),
     };
 
@@ -148,10 +142,7 @@ pub fn run_scenario(
 /// runner returns `Err` on any failed scenario — the
 /// eval binary sets this to `true` so `cargo test
 /// --features eval` fails loudly on regression.
-pub fn run_scenarios(
-    scenarios: &[Scenario],
-    chat_agent: &ChatAgent,
-) -> EvalReport {
+pub fn run_scenarios(scenarios: &[Scenario], chat_agent: &ChatAgent) -> EvalReport {
     let mut report = EvalReport::new(unix_secs());
     for s in scenarios {
         let started = Instant::now();
@@ -179,7 +170,11 @@ pub fn run_planner_scenarios() -> EvalReport {
         let m = RunMetrics {
             scenario_id: s.id.to_string(),
             passed,
-            status: if passed { BrowserStatus::Done } else { BrowserStatus::Failed },
+            status: if passed {
+                BrowserStatus::Done
+            } else {
+                BrowserStatus::Failed
+            },
             subtask_count: 1,
             step_count: 1,
             elapsed,
@@ -192,7 +187,6 @@ pub fn run_planner_scenarios() -> EvalReport {
     }
     report
 }
-
 
 /// Build a default `ChatAgent` for the runner. Uses a
 /// minimal `ProviderConfig` (the synthesizer is
@@ -252,9 +246,8 @@ pub fn report_from_outcome(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::harness::FailureMode;
-
+    use super::*;
 
     #[test]
     fn runner_passes_all_default_scenarios() {
@@ -282,7 +275,10 @@ mod tests {
             .find(|s| s.id == "instagram_text_friend")
             .expect("instagram_text_friend scenario");
         let outcome = run_scenario(ig, &agent);
-        assert_eq!(outcome.subtask_count, 2, "instagram phrasing should split into 2 subtasks");
+        assert_eq!(
+            outcome.subtask_count, 2,
+            "instagram phrasing should split into 2 subtasks"
+        );
     }
 
     #[test]
@@ -363,12 +359,10 @@ mod tests {
             .find(|s| s.id == "captcha_turnstile")
             .expect("captcha_turnstile scenario");
         let outcome = run_scenario(r, &agent);
-        assert!(
-            outcome
-                .failure_modes_hit
-                .iter()
-                .any(|m| m == FailureMode::CaptchaChallenge.as_str()),
-        );
+        assert!(outcome
+            .failure_modes_hit
+            .iter()
+            .any(|m| m == FailureMode::CaptchaChallenge.as_str()),);
     }
 
     #[test]
@@ -389,7 +383,11 @@ mod tests {
     #[test]
     fn runner_passes_all_planner_shortcut_scenarios() {
         let report = run_planner_scenarios();
-        assert_eq!(report.rows.len(), 3, "expected 3 planner shortcut scenarios");
+        assert_eq!(
+            report.rows.len(),
+            3,
+            "expected 3 planner shortcut scenarios"
+        );
         for row in &report.rows {
             assert!(
                 row.passed,
@@ -399,4 +397,3 @@ mod tests {
         }
     }
 }
-

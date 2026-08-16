@@ -36,7 +36,7 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-    .unwrap_or(0)
+        .unwrap_or(0)
 }
 
 fn write_transcript_header(scenario: &str, config: &PacingConfig) {
@@ -48,11 +48,7 @@ fn write_transcript_header(scenario: &str, config: &PacingConfig) {
     let _ = writeln!(
         f,
         "\n===== SCENARIO: {} (config: enabled={} min={}ms max={}ms threshold={}) =====",
-        scenario,
-        config.enabled,
-        config.min_delay_ms,
-        config.max_delay_ms,
-        config.streak_threshold
+        scenario, config.enabled, config.min_delay_ms, config.max_delay_ms, config.streak_threshold
     );
 }
 
@@ -219,7 +215,10 @@ fn scenario_b_one_off_is_not_paced() {
         "at least one one-off action was paced (max elapsed {:?})",
         max_elapsed
     );
-    println!("  PASS: 5 mixed actions, max elapsed {:?} (no pacing anywhere)", max_elapsed);
+    println!(
+        "  PASS: 5 mixed actions, max elapsed {:?} (no pacing anywhere)",
+        max_elapsed
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -250,11 +249,7 @@ fn scenario_c_zero_range_still_logs() {
     let mut elapsed = Vec::new();
     for _ in 0..3 {
         let e = dispatch(&mut guard, "click");
-        let line = format!(
-            "[{}] CLICK fired (elapsed={}us)",
-            now_secs(),
-            e.as_micros()
-        );
+        let line = format!("[{}] CLICK fired (elapsed={}us)", now_secs(), e.as_micros());
         println!("  {line}");
         write_transcript_line(&line);
         elapsed.push(e);
@@ -283,10 +278,7 @@ fn scenario_c_zero_range_still_logs() {
 fn print_transcript_summary() {
     println!("\n=== Transcript summary ({TRANSCRIPT}) ===");
     let content = std::fs::read_to_string(TRANSCRIPT).expect("read transcript");
-    let pacing_lines: Vec<&str> = content
-        .lines()
-        .filter(|l| l.contains("PACING:"))
-        .collect();
+    let pacing_lines: Vec<&str> = content.lines().filter(|l| l.contains("PACING:")).collect();
     println!("  Total PACING lines: {}", pacing_lines.len());
     for line in &pacing_lines {
         println!("    {line}");
@@ -315,9 +307,8 @@ fn print_transcript_summary() {
         .split("===== SCENARIO:")
         .filter(|s| !s.trim().is_empty())
         .collect();
-    let count_pacing = |section: &str| -> usize {
-        section.lines().filter(|l| l.contains("PACING:")).count()
-    };
+    let count_pacing =
+        |section: &str| -> usize { section.lines().filter(|l| l.contains("PACING:")).count() };
     let a_pacing = sections
         .iter()
         .find(|s| s.contains("A_repeated_actions"))

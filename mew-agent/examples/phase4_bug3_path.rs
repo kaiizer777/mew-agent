@@ -48,9 +48,16 @@ async fn main() -> anyhow::Result<()> {
     drop(agent1);
     let s1 = agent1_session_id_via_dir(&custom_dir);
     match s1 {
-        Some(sid) => println!("[bug3] PASS: transcript file created in {} (session={})", custom_dir.display(), sid),
+        Some(sid) => println!(
+            "[bug3] PASS: transcript file created in {} (session={})",
+            custom_dir.display(),
+            sid
+        ),
         None => {
-            println!("[bug3] FAIL: no transcript file found in {}", custom_dir.display());
+            println!(
+                "[bug3] FAIL: no transcript file found in {}",
+                custom_dir.display()
+            );
             std::process::exit(1);
         }
     }
@@ -76,7 +83,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     if found_in_src == 0 {
-        println!("[bug3] PASS: zero transcript files under {}/ (this run)", src_transcripts.display());
+        println!(
+            "[bug3] PASS: zero transcript files under {}/ (this run)",
+            src_transcripts.display()
+        );
     } else {
         // The dir may legitimately have OLD files from prior
         // pre-fix runs. We only care about files created
@@ -95,7 +105,11 @@ async fn main() -> anyhow::Result<()> {
         if our_id_files.is_empty() {
             println!("[bug3] PASS: zero transcript files under {} for this session ({} prior files exist from old runs)", src_transcripts.display(), found_in_src);
         } else {
-            println!("[bug3] FAIL: transcript file landed under {} this run: {:?}", src_transcripts.display(), our_id_files);
+            println!(
+                "[bug3] FAIL: transcript file landed under {} this run: {:?}",
+                src_transcripts.display(),
+                our_id_files
+            );
             std::process::exit(1);
         }
     }
@@ -108,9 +122,15 @@ async fn main() -> anyhow::Result<()> {
     drop(agent2);
     let after = count_files_with_session_id(&default_dir, &stamp.to_string());
     if after > before {
-        println!("[bug3] PASS: default behavior preserved (file landed in {}/)", default_dir.display());
+        println!(
+            "[bug3] PASS: default behavior preserved (file landed in {}/)",
+            default_dir.display()
+        );
     } else {
-        println!("[bug3] FAIL: no file landed in {} for default (None) call", default_dir.display());
+        println!(
+            "[bug3] FAIL: no file landed in {} for default (None) call",
+            default_dir.display()
+        );
         std::process::exit(1);
     }
 

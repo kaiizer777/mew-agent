@@ -6,7 +6,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt().try_init();
 
     let (browser, page, handler_task, job) = launch(None, false).await?;
-    
+
     // Create an HTML file that has an input text field and something else
     let html = r#"
 <!DOCTYPE html>
@@ -17,38 +17,45 @@ async fn main() -> anyhow::Result<()> {
 </body>
 </html>
     "#;
-    
+
     let out_dir = std::path::PathBuf::from("tests-output").join("test_stale_type");
     let _ = std::fs::create_dir_all(&out_dir);
     let html_path = out_dir.join("test_type.html");
     std::fs::write(&html_path, html)?;
     let file_url = format!("file:///{}", html_path.to_string_lossy().replace('\\', "/"));
-    
+
     page.goto(&file_url).await?.wait_for_navigation().await?;
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    
+
     let (tree, ref_map, _) = extract_tree(&page, true).await?;
     println!("--- Initial Tree (Type Test) ---");
     tree.print(0);
-    
+
     // Find the input text field ref
-    let i1_ref = ref_map.keys().find(|r| {
-        let mut found = false;
-        fn search(node: &mew_perception::TreeNode, r: &str, f: &mut bool) {
-            if node.ref_id.as_deref() == Some(r) && node.role.eq_ignore_ascii_case("textbox") { *f = true; }
-            for child in &node.children { search(child, r, f); }
-        }
-        search(&tree, r, &mut found);
-        found
-    }).unwrap();
-    
-    let i1_id = ref_map.get(i1_ref).unwrap().clone();
-    
+    let i1_ref = ref_map
+        .keys()
+        .find(|r| {
+            let mut found = false;
+            fn search(node: &mew_perception::TreeNode, r: &str, f: &mut bool) {
+                if node.ref_id.as_deref() == Some(r) && node.role.eq_ignore_ascii_case("textbox") {
+                    *f = true;
+                }
+                for child in &node.children {
+                    search(child, r, f);
+                }
+            }
+            search(&tree, r, &mut found);
+            found
+        })
+        .unwrap();
+
+    let i1_id = *ref_map.get(i1_ref).unwrap();
+
     // Type into it
     println!("Typing 'hello ' into Textbox...");
-    type_ref(&page, i1_id.clone(), "hello ").await?;
+    type_ref(&page, i1_id, "hello ").await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    
+
     // Verify it was typed
     let (tree2, _, _) = extract_tree(&page, true).await?;
     println!("--- Tree after typing 'hello ' ---");
@@ -56,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Type 'destroy' which will remove it
     println!("Typing 'destroy' to trigger self-removal...");
-    type_ref(&page, i1_id.clone(), "destroy").await?;
+    type_ref(&page, i1_id, "destroy").await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Verify it was removed
@@ -66,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Try typing into the same old ref
     println!("Attempting to type into the removed Textbox using the SAME old ref...");
-    match type_ref(&page, i1_id.clone(), " more").await {
+    match type_ref(&page, i1_id, " more").await {
         Ok(_) => println!("WARNING: Type succeeded unexpectedly on a stale ref!"),
         Err(e) => println!("SUCCESS: Caught expected stale ref error: {:?}", e),
     }

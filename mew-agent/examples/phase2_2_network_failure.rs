@@ -111,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => {
                 let (prefix, meaningful) = classify_failure_text(&e);
                 println!("  err: {e}");
-                println!("  wraps with one of the documented classifier error strings: {meaningful}");
+                println!(
+                    "  wraps with one of the documented classifier error strings: {meaningful}"
+                );
                 outcomes.push(Outcome {
                     label: label.to_string(),
                     err: format!("{e}"),
@@ -151,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(Intent::Chat(reply)) => {
             println!("  Ok(Chat({:?}))", reply);
         }
-        Ok(Intent::BrowserTask(t)) => {
+        Ok(Intent::BrowserTask { task: t, .. }) => {
             println!("  UNEXPECTED BrowserTask({:?}) on a plain greeting", t);
         }
         Err(e) => {

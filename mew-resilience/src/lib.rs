@@ -59,18 +59,23 @@ pub mod modal_interrupts;
 pub mod rate_limit;
 pub mod ref_recovery;
 pub mod session_loss;
+pub mod stuck_detector;
 pub mod vision_confidence;
 
-pub use captcha::{Challenge, ChallengeKind, detect as detect_captcha};
-pub use irreversible_actions::{ActionKind, IrreverisbleVerdict, classify as classify_irreversible};
-pub use modal_interrupts::{ModalKind, ModalReport, detect as detect_modal};
-pub use rate_limit::{RateLimitSignal, detect as detect_rate_limit};
-pub use ref_recovery::{
-    RefActionKind, RefRecoveryConfig, RefRecoveryInputs, RefRecoveryOutcome,
-    attempt_recovery,
+pub use captcha::{detect as detect_captcha, Challenge, ChallengeKind};
+pub use irreversible_actions::{
+    classify as classify_irreversible, ActionKind, IrreverisbleVerdict,
 };
-pub use session_loss::{SessionLossInputs, SessionLossReport, detect as detect_session_loss};
-pub use vision_confidence::{VisionConfidence, VisionVerdict, score as score_vision};
+pub use modal_interrupts::{detect as detect_modal, ModalKind, ModalReport};
+pub use rate_limit::{detect as detect_rate_limit, RateLimitSignal};
+pub use ref_recovery::{
+    attempt_recovery, RefActionKind, RefRecoveryConfig, RefRecoveryInputs, RefRecoveryOutcome,
+};
+pub use session_loss::{detect as detect_session_loss, SessionLossInputs, SessionLossReport};
+pub use stuck_detector::{
+    detect_stuck, StuckDetectorConfig, StuckReason, WorkerHealth, WorkerHealthReport,
+};
+pub use vision_confidence::{score as score_vision, VisionConfidence, VisionVerdict};
 
 /// A page-state finding produced by one of the six failure-mode
 /// detectors. The `severity` field is a stable ordering — the agent
@@ -129,6 +134,24 @@ pub enum ResilienceFinding {
     /// solve it in-window — mew runs a real visible headed
     /// browser and the human is the safest solver.
     Captcha(Challenge),
+    /// Phase 26: Worker health report indicating suspected stuck or token limit approaching.
+    Stuck(WorkerHealthReport),
+    /// Phase 40: the navigate tool's domain allowlist check
+    /// rejected the resolved URL. The agent surfaces this as a
+    /// chat-visible event (per the spec) so the user can either
+    /// (a) edit `config.yaml` to add the domain, or (b) check
+    /// the per-vertical `required_domains` to confirm the
+    /// domain should have been auto-expanded. The `hint`
+    /// field carries the actionable instruction (e.g. "add
+    /// 'example.com' to agent.allowed_domains in config.yaml")
+    /// and the `path` field is the resolver decision string
+    /// (DirectNav / SearchRedirect / SensitiveRedirect /
+    /// AuthProbeRedirect / Unknown) so a post-mortem reviewer
+    /// can see *why* the resolver sent the agent to a
+    /// non-allowlisted domain. The `domain` is the bare
+    /// hostname (no scheme, no path) that the allowlist check
+    /// rejected — pre-Phase-40 this was dropped silently.
+    AllowlistViolation(AllowlistViolationDetail),
 }
 
 impl ResilienceFinding {
@@ -144,6 +167,8 @@ impl ResilienceFinding {
             ResilienceFinding::IrreversibleGate(_) => 5,
             ResilienceFinding::VisionAmbiguity(_) => 4,
             ResilienceFinding::Captcha(_) => 6,
+            ResilienceFinding::Stuck(_) => 7,
+            ResilienceFinding::AllowlistViolation(_) => 8,
         }
     }
 
@@ -157,6 +182,8 @@ impl ResilienceFinding {
             ResilienceFinding::IrreversibleGate(_) => "irreversible_action",
             ResilienceFinding::VisionAmbiguity(_) => "vision_ambiguity",
             ResilienceFinding::Captcha(_) => "captcha_challenge",
+            ResilienceFinding::Stuck(_) => "stuck_worker",
+            ResilienceFinding::AllowlistViolation(_) => "allowlist_violation",
         }
     }
 
@@ -167,7 +194,10 @@ impl ResilienceFinding {
     pub fn summary(&self) -> String {
         match self {
             ResilienceFinding::RefDrift(d) => {
-                format!("stale ref {} (auto-recovering via fresh snapshot)", d.supplied_ref)
+                format!(
+                    "stale ref {} (auto-recovering via fresh snapshot)",
+                    d.supplied_ref
+                )
             }
             ResilienceFinding::Modal(m) => {
                 format!("modal overlay detected ({})", m.kind.as_str())
@@ -179,13 +209,37 @@ impl ResilienceFinding {
                 format!("rate-limit signal: {}", r.label)
             }
             ResilienceFinding::IrreversibleGate(v) => {
-                format!("irreversible action: {} (paused for confirmation)", v.action.as_str())
+                format!(
+                    "irreversible action: {} (paused for confirmation)",
+                    v.action.as_str()
+                )
             }
             ResilienceFinding::VisionAmbiguity(v) => {
                 format!("vision confidence too low ({:.2})", v.confidence.score)
             }
             ResilienceFinding::Captcha(c) => {
                 format!("challenge detected: {}", c.label)
+            }
+            ResilienceFinding::Stuck(r) => {
+                format!(
+                    "worker health signal: suspected_stuck={}, token_limit_approaching={}",
+                    r.suspected_stuck, r.token_limit_approaching
+                )
+            }
+            ResilienceFinding::AllowlistViolation(v) => {
+                // Compact one-liner: domain + the short
+                // "edit config.yaml" hint. The full hint
+                // text is available on the
+                // `AllowlistViolationDetail` field for the
+                // transcript writer; the chat-visible
+                // `ProgressLine` uses the same string the
+                // `summary()` returns so the user reads
+                // one consistent message.
+                format!(
+                    "domain '{dom}' not in allowlist ({}); edit config.yaml `agent.allowed_domains`",
+                    v.path,
+                    dom = v.domain,
+                )
             }
         }
     }
@@ -217,6 +271,18 @@ pub fn severity_rank(finding: &ResilienceFinding) -> u8 {
         ResilienceFinding::IrreversibleGate(_) => 4,
         ResilienceFinding::Captcha(_) => 5,
         ResilienceFinding::RefDrift(_) => 6,
+        ResilienceFinding::Stuck(_) => 7,
+        // Phase 40: an allowlist violation is a hard stop
+        // (the LLM cannot navigate to a blocked domain no
+        // matter what it does), so the severity is on par
+        // with the other "this run is blocked" findings
+        // (`SessionLoss` / `Captcha`). We slot it
+        // between `Stuck` and `RefDrift` so the order is
+        // monotonic with the doc comment above — `Stuck`
+        // stays a `7`, `AllowlistViolation` takes `8`, and
+        // the enum match is still exhaustive without a
+        // `_ => unreachable!()` arm.
+        ResilienceFinding::AllowlistViolation(_) => 8,
     }
 }
 
@@ -226,10 +292,7 @@ pub fn severity_rank(finding: &ResilienceFinding) -> u8 {
 /// exact finding for a given page state without worrying about
 /// ordering accidents.
 pub fn categorize(findings: &[ResilienceFinding]) -> Option<ResilienceFinding> {
-    findings
-        .iter()
-        .min_by_key(|f| severity_rank(f))
-        .cloned()
+    findings.iter().min_by_key(|f| severity_rank(f)).cloned()
 }
 
 /// Detail for the `RefDrift` variant. Carries the original ref the
@@ -239,6 +302,38 @@ pub fn categorize(findings: &[ResilienceFinding]) -> Option<ResilienceFinding> {
 pub struct RefDriftDetail {
     pub supplied_ref: String,
     pub reason: &'static str,
+}
+
+/// Phase 40: detail for the `AllowlistViolation` variant.
+/// Carries the bare hostname the allowlist rejected, the
+/// resolver decision string (DirectNav / SearchRedirect /
+/// SensitiveRedirect / AuthProbeRedirect / Unknown), and
+/// the full actionable hint the navigate handler wrote into
+/// the tool result. The hint is the load-bearing field — the
+/// chat-visible `ProgressLine` consumes it verbatim so the
+/// user sees the same text in the live progress sub-list and
+/// in the LLM's next-turn tool result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowlistViolationDetail {
+    /// Bare hostname the allowlist rejected. No scheme, no
+    /// port, no path. e.g. `"notallowed.example.com"`.
+    pub domain: String,
+    /// The resolver decision string — see
+    /// `mew_nav::ResolutionPath::as_str()`. Stored as a
+    /// `String` (not `&'static str`) so the navigate
+    /// handler doesn't have to thread the lifetime of the
+    /// `ResolutionPath` enum through the resilience
+    /// finding. The variants are a small fixed set, so
+    /// the `String` cost is negligible.
+    pub path: String,
+    /// The full hint string the navigate handler wrote
+    /// into the tool result. Consumed verbatim by the
+    /// `AgentEvent::ProgressLine` emit. Pre-Phase-40 the
+    /// tool result was a generic "Do not attempt this
+    /// domain"; the new text is the spec's hardened
+    /// error: "add '<domain>' to the
+    /// agent.allowed_domains list in config.yaml...".
+    pub hint: String,
 }
 
 #[cfg(test)]
@@ -336,19 +431,28 @@ mod tests {
         // solving service (an opt-in capability), and the default
         // is to hand off to the human in the visible browser.
         let cases = vec![
-            (ResilienceFinding::RateLimit(RateLimitSignal {
-                label: "x".into(),
-                kind: rate_limit::RateLimitKind::Http429,
-            }), false),
-            (ResilienceFinding::IrreversibleGate(IrreverisbleVerdict {
-                action: ActionKind::Send,
-                target: "x".into(),
-            }), true),
-            (ResilienceFinding::Captcha(Challenge {
-                kind: ChallengeKind::RecaptchaV2,
-                domain_hint: Some("example.com".into()),
-                label: "x".into(),
-            }), true),
+            (
+                ResilienceFinding::RateLimit(RateLimitSignal {
+                    label: "x".into(),
+                    kind: rate_limit::RateLimitKind::Http429,
+                }),
+                false,
+            ),
+            (
+                ResilienceFinding::IrreversibleGate(IrreverisbleVerdict {
+                    action: ActionKind::Send,
+                    target: "x".into(),
+                }),
+                true,
+            ),
+            (
+                ResilienceFinding::Captcha(Challenge {
+                    kind: ChallengeKind::RecaptchaV2,
+                    domain_hint: Some("example.com".into()),
+                    label: "x".into(),
+                }),
+                true,
+            ),
         ];
         for (f, expected) in cases {
             assert_eq!(f.requires_pause(), expected, "for {:?}", f);

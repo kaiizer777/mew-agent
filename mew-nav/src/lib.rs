@@ -260,6 +260,38 @@ pub struct SensitivePlatformEntry {
 pub struct SensitivePlatforms {
     #[serde(default, rename = "entry")]
     pub entries: Vec<SensitivePlatformEntry>,
+    /// Phase 31: hosts that should short-circuit the agent's
+    /// per-iteration navigation detector to `SpaTransition` on any
+    /// same-domain URL change. Pre-seeded with Maps / Yelp /
+    /// TripAdvisor / JustDial / Sulekha in
+    /// `config/sensitive_platforms.toml`. See the spec block at
+    /// the bottom of that file for the rationale.
+    #[serde(default, rename = "spa_domain")]
+    pub spa_domains: Vec<SpaDomainEntry>,
+}
+
+/// Phase 31: one row in the new `[[spa_domain]]` table. Currently
+/// just the bare host — the entry exists as its own struct so a
+/// future field (e.g. a per-SPA `path_prefix` matcher, or a
+/// `requires_auth: true` flag) can be added without churning the
+/// deserializer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpaDomainEntry {
+    pub domain: String,
+}
+
+impl SensitivePlatforms {
+    /// Phase 31: borrow the list of hosts that should short-circuit
+    /// the navigation detector to `SpaTransition`. Returned as a
+    /// `Vec<String>` because the agent passes the list to
+    /// `mew_cdp::classify_navigation`, which takes `&[String]`. A
+    /// fresh `Vec` is built on each call (the list is small —
+    /// typically 5-10 entries — so this is fine; if a future
+    /// operator seeds hundreds of entries, switch this to return
+    /// `&[String]` and add a `OnceCell` cache).
+    pub fn spa_domains(&self) -> Vec<String> {
+        self.spa_domains.iter().map(|e| e.domain.clone()).collect()
+    }
 }
 
 /// TOML file shape — what `config/sensitive_platforms.toml` actually
@@ -270,6 +302,13 @@ pub struct SensitivePlatforms {
 struct SensitivePlatformsFile {
     #[serde(default, rename = "entry")]
     entry: Vec<SensitivePlatformEntry>,
+    /// Phase 31: optional `[[spa_domain]]` array. The `#[serde(default)]`
+    /// is the backward-compat knob: a pre-Phase-31 TOML file with
+    /// no `[[spa_domain]]` block still parses to an empty list, and
+    /// the agent falls back to the `performance.getEntriesByType`
+    /// eval for every URL change.
+    #[serde(default, rename = "spa_domain")]
+    spa_domain: Vec<SpaDomainEntry>,
 }
 
 impl SensitivePlatforms {
@@ -357,8 +396,7 @@ impl SensitivePlatforms {
         const MAX_PARENT_DEPTH: usize = 16;
         if let Some(mut current_dir) = current_dir_opt {
             for _ in 0..MAX_PARENT_DEPTH {
-                let candidate =
-                    current_dir.join("config").join("sensitive_platforms.toml");
+                let candidate = current_dir.join("config").join("sensitive_platforms.toml");
                 if candidate.exists() {
                     if let Ok(s) = Self::load_from(&candidate) {
                         tracing::info!(
@@ -391,13 +429,20 @@ impl SensitivePlatforms {
     /// Load from an explicit path. Returns Err on I/O or parse
     /// failure — the caller decides whether that's fatal.
     pub fn load_from(path: &std::path::Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            anyhow::anyhow!("read {}: {e}", path.display())
-        })?;
-        let parsed: SensitivePlatformsFile = toml::from_str(&content).map_err(|e| {
-            anyhow::anyhow!("parse {}: {e}", path.display())
-        })?;
-        Ok(Self { entries: parsed.entry })
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+        let parsed: SensitivePlatformsFile = toml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+        Ok(Self {
+            entries: parsed.entry,
+            // Phase 31: carry the spa_domains list through the
+            // loader so callers can pass it to
+            // `mew_cdp::classify_navigation`. `serde(default)` on
+            // the file struct means a missing `[[spa_domain]]`
+            // block parses to an empty Vec — backward-compatible
+            // with pre-Phase-31 TOML files.
+            spa_domains: parsed.spa_domain,
+        })
     }
 
     /// Look up an entry by host. Returns the matching strategy if
@@ -478,10 +523,7 @@ impl SensitivePlatforms {
                 if let Some(label_end) = host.find('.') {
                     let (label, rest) = host.split_at(label_end);
                     let rest = &rest[1..];
-                    if !label.is_empty()
-                        && rest == suffix
-                        && e.known_to_challenge_bots
-                    {
+                    if !label.is_empty() && rest == suffix && e.known_to_challenge_bots {
                         return true;
                     }
                 }
@@ -628,7 +670,6 @@ pub(crate) fn strip_site_query(raw: &str) -> String {
     }
     raw.trim().to_string()
 }
-
 
 /// spaces-only segments, and strip anything that isn't `[a-z0-9]`. This is
 /// what lets "the shopping site I like" fail loudly into the search fallback
@@ -793,9 +834,9 @@ pub async fn resolve_with_probe_sensitive(
                 let path = match strategy {
                     EntryStrategy::ViaSearch => ResolutionPath::ViaSearch,
                     EntryStrategy::ViaSearchConfirm => ResolutionPath::ViaSearchConfirm,
-                    EntryStrategy::Direct => unreachable!(
-                        "Direct strategy should never reach the sensitive branch"
-                    ),
+                    EntryStrategy::Direct => {
+                        unreachable!("Direct strategy should never reach the sensitive branch")
+                    }
                 };
                 tracing::info!(
                     event = "url_resolution",
@@ -908,9 +949,9 @@ fn resolve_inner(input: &str, sensitive: &SensitivePlatforms) -> ResolutionResul
                 let path = match strategy {
                     EntryStrategy::ViaSearch => ResolutionPath::ViaSearch,
                     EntryStrategy::ViaSearchConfirm => ResolutionPath::ViaSearchConfirm,
-                    EntryStrategy::Direct => unreachable!(
-                        "Direct strategy should never reach the sensitive branch"
-                    ),
+                    EntryStrategy::Direct => {
+                        unreachable!("Direct strategy should never reach the sensitive branch")
+                    }
                 };
                 return ResolutionResult {
                     url,
@@ -1014,11 +1055,7 @@ fn second_level_label(input: &str) -> Option<&str> {
 /// miss the stealth / session layer the real nav uses, and would not
 /// match what the user would actually see.)
 async fn probe_url_loads(page: &Page, url: &str) -> bool {
-    let res = tokio::time::timeout(
-        DIRECT_GUESS_PROBE_TIMEOUT,
-        page.goto(url),
-    )
-    .await;
+    let res = tokio::time::timeout(DIRECT_GUESS_PROBE_TIMEOUT, page.goto(url)).await;
 
     match res {
         Ok(Ok(_)) => {
@@ -1028,18 +1065,12 @@ async fn probe_url_loads(page: &Page, url: &str) -> bool {
             // successful guess. `wait_for_navigation` is the right
             // primitive — it blocks until the load event (or a CDP
             // timeout inside it).
-            let wait = tokio::time::timeout(
-                DIRECT_GUESS_PROBE_TIMEOUT,
-                page.wait_for_navigation(),
-            )
-            .await;
+            let wait =
+                tokio::time::timeout(DIRECT_GUESS_PROBE_TIMEOUT, page.wait_for_navigation()).await;
             match wait {
                 Ok(Ok(_)) => true,
                 _ => {
-                    tracing::debug!(
-                        "probe: {} returned but wait_for_navigation did not",
-                        url
-                    );
+                    tracing::debug!("probe: {} returned but wait_for_navigation did not", url);
                     false
                 }
             }
@@ -1062,11 +1093,8 @@ fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.as_bytes() {
         let b = *byte;
-        let is_unreserved = b.is_ascii_alphanumeric()
-            || b == b'-'
-            || b == b'_'
-            || b == b'.'
-            || b == b'~';
+        let is_unreserved =
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~';
         if is_unreserved {
             out.push(b as char);
         } else {
@@ -1119,7 +1147,10 @@ mod tests {
 
     #[test]
     fn sanitize_strips_punctuation() {
-        assert_eq!(sanitize_for_domain_guess("the shopping site!"), "theshoppingsite");
+        assert_eq!(
+            sanitize_for_domain_guess("the shopping site!"),
+            "theshoppingsite"
+        );
         assert_eq!(sanitize_for_domain_guess("  My-Site  "), "mysite");
         assert_eq!(sanitize_for_domain_guess("a.b.c"), "abc");
     }
@@ -1134,11 +1165,11 @@ mod tests {
 
     #[test]
     fn known_short_aliases_work() {
+        assert_eq!(resolve_without_probe("gh").url, "https://github.com");
         assert_eq!(
-            resolve_without_probe("gh").url,
-            "https://github.com"
+            resolve_without_probe("hn").url,
+            "https://news.ycombinator.com"
         );
-        assert_eq!(resolve_without_probe("hn").url, "https://news.ycombinator.com");
         assert_eq!(resolve_without_probe("yt").url, "https://www.youtube.com");
     }
 
@@ -1186,7 +1217,10 @@ mod tests {
         assert_eq!(ResolutionPath::DirectGuess.as_str(), "direct-guess");
         assert_eq!(ResolutionPath::SearchFallback.as_str(), "search-fallback");
         assert_eq!(ResolutionPath::ViaSearch.as_str(), "via-search");
-        assert_eq!(ResolutionPath::ViaSearchConfirm.as_str(), "via-search-confirm");
+        assert_eq!(
+            ResolutionPath::ViaSearchConfirm.as_str(),
+            "via-search-confirm"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1217,6 +1251,12 @@ mod tests {
                     known_to_challenge_bots: true,
                 },
             ],
+            // Phase 31: empty SPA list in this fixture. The
+            // spa_domains tests live in mew-cdp and use the
+            // pre-seeded Maps / Yelp / etc. list. Keeping this
+            // fixture minimal preserves the pre-Phase-31 lookup
+            // assertions.
+            spa_domains: vec![],
         }
     }
 
@@ -1244,6 +1284,10 @@ mod tests {
                     known_to_challenge_bots: false,
                 },
             ],
+            // Phase 31: no SPA-domain short-circuit in this
+            // fixture; the `is_known_challenger` tests focus on
+            // the entry table.
+            spa_domains: vec![],
         }
     }
 
@@ -1251,21 +1295,33 @@ mod tests {
     fn sensitive_table_lookup_exact_match() {
         let t = test_sensitive_table();
         assert_eq!(t.lookup("instagram.com"), Some(EntryStrategy::ViaSearch));
-        assert_eq!(t.lookup("linkedin.com"), Some(EntryStrategy::ViaSearchConfirm));
+        assert_eq!(
+            t.lookup("linkedin.com"),
+            Some(EntryStrategy::ViaSearchConfirm)
+        );
         assert_eq!(t.lookup("example.com"), None);
     }
 
     #[test]
     fn sensitive_table_strips_www() {
         let t = test_sensitive_table();
-        assert_eq!(t.lookup("www.instagram.com"), Some(EntryStrategy::ViaSearch));
-        assert_eq!(t.lookup("WWW.Linkedin.com"), Some(EntryStrategy::ViaSearchConfirm));
+        assert_eq!(
+            t.lookup("www.instagram.com"),
+            Some(EntryStrategy::ViaSearch)
+        );
+        assert_eq!(
+            t.lookup("WWW.Linkedin.com"),
+            Some(EntryStrategy::ViaSearchConfirm)
+        );
     }
 
     #[test]
     fn sensitive_table_wildcard_matches_one_subdomain() {
         let t = test_sensitive_table();
-        assert_eq!(t.lookup("mobile.twitter.com"), Some(EntryStrategy::ViaSearch));
+        assert_eq!(
+            t.lookup("mobile.twitter.com"),
+            Some(EntryStrategy::ViaSearch)
+        );
         assert_eq!(t.lookup("m.twitter.com"), Some(EntryStrategy::ViaSearch));
         // Look-alike attack must NOT match.
         assert_eq!(t.lookup("evil-twitter.com"), None);
@@ -1290,7 +1346,11 @@ mod tests {
         assert_eq!(r.path, ResolutionPath::ViaSearch);
         assert!(r.url.contains("google.com/search"), "url={}", r.url);
         assert!(r.url.contains("instagram"), "url={}", r.url);
-        assert!(!r.url.contains("login"), "via_search must not add login: url={}", r.url);
+        assert!(
+            !r.url.contains("login"),
+            "via_search must not add login: url={}",
+            r.url
+        );
     }
 
     #[test]
@@ -1300,7 +1360,11 @@ mod tests {
         assert_eq!(r.path, ResolutionPath::ViaSearchConfirm);
         let decoded = r.url.replace("%20", " ").replace("%3A", ":");
         assert!(decoded.contains("linkedin"), "url={}", r.url);
-        assert!(decoded.contains("login"), "via_search_confirm must add login keyword: url={}", r.url);
+        assert!(
+            decoded.contains("login"),
+            "via_search_confirm must add login keyword: url={}",
+            r.url
+        );
     }
 
     #[test]
@@ -1320,8 +1384,7 @@ mod tests {
         // The bare-host query `q=instagram.com` returns the
         // canonical homepage as Google's first organic result.
         let t = test_sensitive_table();
-        let r =
-            resolve_without_probe_sensitive("https://www.instagram.com/feed", &t);
+        let r = resolve_without_probe_sensitive("https://www.instagram.com/feed", &t);
         assert_eq!(r.path, ResolutionPath::ViaSearch);
         let decoded = r.url.replace("%3A", ":");
         assert!(decoded.contains("instagram.com"), "url={}", r.url);
@@ -1362,8 +1425,7 @@ mod tests {
         // produce the same via-search URL as the bare-name form.
         let t = test_sensitive_table();
         let bare = resolve_without_probe_sensitive("instagram", &t);
-        let with_op =
-            resolve_without_probe_sensitive("site:instagram.com", &t);
+        let with_op = resolve_without_probe_sensitive("site:instagram.com", &t);
         assert_eq!(bare.path, with_op.path);
         assert_eq!(bare.url, with_op.url);
     }
@@ -1391,7 +1453,10 @@ mod tests {
     fn entry_strategy_as_str_is_stable() {
         assert_eq!(EntryStrategy::Direct.as_str(), "direct");
         assert_eq!(EntryStrategy::ViaSearch.as_str(), "via_search");
-        assert_eq!(EntryStrategy::ViaSearchConfirm.as_str(), "via_search_confirm");
+        assert_eq!(
+            EntryStrategy::ViaSearchConfirm.as_str(),
+            "via_search_confirm"
+        );
     }
 
     // -----------------------------------------------------------------

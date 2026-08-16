@@ -499,14 +499,40 @@ mod tests {
         // actions" likely to trip bot detection; navigate is also
         // paced because rapid navigations are a clear bot
         // signature.
-        assert_eq!(PacedAction::from_tool_name("click"), Some(PacedAction::Click));
+        assert_eq!(
+            PacedAction::from_tool_name("click"),
+            Some(PacedAction::Click)
+        );
         assert_eq!(PacedAction::from_tool_name("type"), Some(PacedAction::Type));
-        assert_eq!(PacedAction::from_tool_name("scroll"), Some(PacedAction::Scroll));
-        assert_eq!(PacedAction::from_tool_name("press_key"), Some(PacedAction::PressKey));
-        assert_eq!(PacedAction::from_tool_name("navigate"), Some(PacedAction::Navigate));
+        assert_eq!(
+            PacedAction::from_tool_name("scroll"),
+            Some(PacedAction::Scroll)
+        );
+        assert_eq!(
+            PacedAction::from_tool_name("press_key"),
+            Some(PacedAction::PressKey)
+        );
+        assert_eq!(
+            PacedAction::from_tool_name("navigate"),
+            Some(PacedAction::Navigate)
+        );
         // Non-paced tool names return None.
-        for name in &["snapshot", "finish", "mark_subtask_done", "mark_subtask_skipped", "mark_subtask_failed", "declare_subtasks", "vision_inspect", "no_such_tool"] {
-            assert_eq!(PacedAction::from_tool_name(name), None, "expected None for {}", name);
+        for name in &[
+            "snapshot",
+            "finish",
+            "mark_subtask_done",
+            "mark_subtask_skipped",
+            "mark_subtask_failed",
+            "declare_subtasks",
+            "vision_inspect",
+            "no_such_tool",
+        ] {
+            assert_eq!(
+                PacedAction::from_tool_name(name),
+                None,
+                "expected None for {}",
+                name
+            );
         }
     }
 

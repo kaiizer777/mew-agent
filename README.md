@@ -2,7 +2,7 @@
 
 **mew** is a Rust-native computer-use agent that drives a real, visible Chromium window through the Chrome DevTools Protocol (CDP). It perceives pages via accessibility-tree snapshots for speed and low token cost, falls back to vision only when necessary, runs a stealth Chromium binary, and is orchestrated by a two-agent LLM harness (intent-routing **ChatAgent** + ReAct-loop **BrowserAgent**) designed to stay cheap on a $0 infrastructure budget.
 
-All ten phases of the work plan are shipped: from the original accessibility-first perception and the two-agent handoff, through sensitive-platform routing, live step summarization, the resilience core, the long-horizon research loop, CAPTCHA / challenge handling, the pure-Rust evaluation harness wired into CI, and the production hardening pass.
+All thirty phases of the work plan are shipped: from the original accessibility-first perception and the two-agent handoff, through sensitive-platform routing, live step summarization, the resilience core, long-horizon research loop, CAPTCHA handling, pure-Rust evaluation harness, production hardening, N-worker supervisor pool, domain vertical packs (Jobs & SaaS Lead-Gen), single-call intent/shape routing, local result dedup & verification, Reflexion-style episodic memory, worker health heartbeats & stuck detection, supervisor respawn policy engines with cross-worker context preservation, and user-facing self-learning surfaces.
 
 The Tauri shell is a single chat surface docked alongside Chromium: intent classification, live mid-task steering, structured `ChatAgent → BrowserAgent → ChatAgent` handoffs, and live human-readable progress lines instead of raw JSON.
 
@@ -26,6 +26,8 @@ You type something in the chat box — "go to instagram and text my friend hi" o
 - **Pacing guard.** Site-aware anti-ban jitter. Consecutive identical actions in a tight loop are spaced by a configurable random delay; one-off and mixed actions never get paced. Opt-in (`pacing.enabled: false` by default).
 - **Evaluation harness + CI gate.** A pure-Rust mock-page scenario runner in `mew_agent::eval` replays fixed tasks end-to-end (no live Chrome, no LLM calls) and grades the handoff contract: right task dispatched, result reflected in chat reply, failure paths still produce a user-facing message. Wired into CI as `cargo test --features eval` so future changes can't silently regress the Bug #1 / #2 fixes.
 - **Production hardening.** All error messages are rewritten through a plain-language `error_message` layer routed via `ChatAgent`. Tracing is quiet by default in production builds (opt in via `MEW_TRACING_DIR`). End-of-task LLM summary and pre-flight decomposition are cached and reused where possible. Final pass against the three motivating scenarios: (1) "visit instagram and text my friend hi" works directly, (2) any browser task shows a clean chat summary in the UI, never raw JSON, (3) a multi-platform job-search task returns one consolidated list of roles + emails/URLs.
+- **Supervisor & Worker Pool.** (Phase 13-18) BrowserAgent runs as a long-lived supervised worker managed by an orchestrator pool, processing explicit `Todo` schemas with completion checks and budgets. The supervisor handles pause/resume, early cancellations, and replanning seamlessly.
+- **Agent State Machine & Pacing.** (Phase 12-17) Explicit state machine transitions (`Stopped` → `Running` → `Paused` → `Done` | `Failed`). Built-in site-aware pacing guards inject random delays between rapid repetitive actions to evade bot detectors.
 
 ## Workspace layout
 
@@ -241,7 +243,7 @@ If your task is to *visit* a public site and *interact* with it normally, **the 
 
 ## Project status
 
-All ten phases from `work.md` are **shipped**:
+All eighteen phases from `work.md` are **shipped**:
 
 - **Phase 1** — structured tracing, URL Resolution span instrumentation, `SessionHandle` transition spans, intent-router boundary tracing, live reproductions of Bug #1 (both phrasings) and Bug #2 captured.
 - **Phase 1.5** — minimum `chat-reply` emit fix, frontend listener, root-cause doc update, replaced `browser_task_result_dropped` tripwire with the positive `browser_task_result_delivered`.
@@ -254,6 +256,11 @@ All ten phases from `work.md` are **shipped**:
 - **Phase 8** — challenge-page detector, pause-and-message default, `CaptchaSolver` trait + 2captcha / anti-captcha / capmonster implementations, `known_to_challenge_bots` flag, local-only telemetry, README ethical / ToS boundary.
 - **Phase 9** — `mew_agent::eval` mock-page harness, `cargo test --features eval -p mew-agent` CI gate, handoff-contract assertions, `docs/eval-history.md` pass-rate log.
 - **Phase 10** — error-messaging pass through `mew_ui::error_message`, consolidated config schema, quiet-by-default tracing, end-of-task summary + planner cache, README / docs final pass, three motivating-scenario acceptance pass.
+- **Phases 11–12** — Todo schema and decomposition contract, Agent state machine.
+- **Phases 13–14** — Supervisor signal model (Pause, Resume, Cancel, Replan), Browser Agent as a long-lived supervised worker, TodoRejectedEvent user-cancel path.
+- **Phases 23–25** — Episodic Memory & Self-Learning (`mew-memory`). Reflexion-style write path (`LessonStore`), prompt injection read path to avoid repeating mistakes, confidence scoring (`confidence_score`), memory decay, and contradiction resolution.
+- **Phases 26–28** — Worker Health & Supervisor Respawn Core (`WorkerHealth`, `RespawnPolicy`, `RespawnHandoff`). Heartbeat tracking, action loop stuck detection, corrective prompt nudging, proactive token budget cutoff respawns, crash recovery, and zero-duplicate subtask context transplant on respawn.
+- **Phase 29** — Chat-Agent Awareness of Respawns & Self-Learning Surface. UI/UX layer featuring `task_recovered` card state (cyan/teal border accent), synthesized plain-language chat reply respawn notes (no internal Rust terms exposed), and read-only `get_recent_lessons` Tauri command to surface learned insights.
 
 See `proj.md` for the full phase-by-phase architecture and design history, and `work.md` for the authoritative checkbox state of every phase.
 

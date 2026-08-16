@@ -27,8 +27,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for page settled (the fix).
     let settle = wait_for_page_settled(&page).await;
-    println!("[diag] wait_for_page_settled: {}ms ({} polls, settled={})",
-             settle.elapsed_ms, settle.polls, settle.settled);
+    println!(
+        "[diag] wait_for_page_settled: {}ms ({} polls, settled={})",
+        settle.elapsed_ms, settle.polls, settle.settled
+    );
 
     // Now poll the AX tree every 200ms for 5 seconds, counting
     // nodes each time. We want to see when (or if) the tree
@@ -52,8 +54,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                     false
                 });
-                println!("[diag] poll {}/10: {} nodes, has_root={}, has_RootWebArea={}",
-                         i, r.nodes.len(), has_root, has_root_web_area);
+                println!(
+                    "[diag] poll {}/10: {} nodes, has_root={}, has_RootWebArea={}",
+                    i,
+                    r.nodes.len(),
+                    has_root,
+                    has_root_web_area
+                );
             }
             Ok(Err(e)) => println!("[diag] poll {}/10: error {}", i, e),
             Err(_) => println!("[diag] poll {}/10: timeout", i),

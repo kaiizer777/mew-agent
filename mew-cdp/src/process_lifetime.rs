@@ -42,8 +42,8 @@ mod imp {
     use std::io;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
@@ -164,9 +164,8 @@ mod imp {
             // already exited, the handle will be valid but
             // AssignProcessToJobObject will return an error,
             // which we propagate.
-            let process_handle = unsafe {
-                OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid)
-            };
+            let process_handle =
+                unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
             if process_handle.is_null() {
                 return Err(io::Error::last_os_error());
             }
@@ -340,6 +339,10 @@ mod tests {
         // should reliably fail. We don't assert a specific
         // error code — just that it's an error.
         let res = job.assign_pid(0);
-        assert!(res.is_err(), "expected AssignProcessToJobObject(0) to fail, got {:?}", res);
+        assert!(
+            res.is_err(),
+            "expected AssignProcessToJobObject(0) to fail, got {:?}",
+            res
+        );
     }
 }

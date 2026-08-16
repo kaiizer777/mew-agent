@@ -110,3 +110,47 @@ known_to_challenge_bots = true
 domain = "www.tiktok.com"
 strategy = "via_search"
 known_to_challenge_bots = true
+
+# Phase 31: SPA navigation short-circuit. Hosts listed here are
+# known to use `history.pushState` / client-side routing for the
+# common user flows (clicking a search result, opening a listing
+# panel, switching tabs). The agent's per-iteration navigation
+# detector short-circuits to `SpaTransition` on any same-domain
+# URL change for these hosts — no CDP `performance.getEntriesByType`
+# eval, no short-term history wipe, no pacing reset. Keeps the
+# agent's memory of "I just clicked listing 3" intact while
+# clicking listing 4, 5, 6, ... on the same page.
+#
+# This is the structural fix for the Maps / Yelp enumeration
+# infinite loop reported by the user: pre-Phase-31, every panel
+# open wiped the history and the agent re-clicked listing 1
+# forever. Now the loop only resets on a real page load.
+#
+# Matching rules: same as [[entry]] — bare host, lowercased,
+# `www.` stripped. Exact-host only (no wildcards in this section
+# yet — add `*.example.com` if a subdomain variant is ever seen).
+#
+# Note on the spec's `google.com/maps`: the matcher is host-only,
+# so a literal `google.com/maps` entry can never match. Maps lives
+# on `maps.google.com` (listed below), which is what the agent
+# actually lands on when the LLM clicks a Maps result. We
+# deliberately do NOT add bare `google.com` here — that would
+# short-circuit real Google Search navigations (LLM clicks an
+# organic result → URL changes from `google.com/search?q=...` to
+# the target domain → that's a real navigation, not an SPA
+# transition). Maps-specific URLs are the only Google host in
+# the list.
+[[spa_domain]]
+domain = "maps.google.com"
+
+[[spa_domain]]
+domain = "yelp.com"
+
+[[spa_domain]]
+domain = "tripadvisor.com"
+
+[[spa_domain]]
+domain = "justdial.com"
+
+[[spa_domain]]
+domain = "sulekha.com"
