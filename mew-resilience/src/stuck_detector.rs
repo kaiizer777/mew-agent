@@ -19,6 +19,15 @@ pub struct WorkerHealth {
     pub distinct_snapshot_signatures_seen: HashSet<u64>,
     pub action_history_capacity: usize,
     pub snapshot_capacity: usize,
+    /// Phase 7: rolling window of the most recent snapshot
+    /// signatures, in order. Used to detect a worker that is
+    /// *technically active* (different actions) but not
+    /// making forward progress (the AX tree is the same N
+    /// snapshots in a row). Capacity matches
+    /// `action_history_capacity` so a worker that exhausts
+    /// the action-loop check has the same data window for
+    /// the no-forward-progress check.
+    pub recent_snapshot_signatures: VecDeque<u64>,
 }
 
 impl WorkerHealth {
@@ -34,6 +43,7 @@ impl WorkerHealth {
             distinct_snapshot_signatures_seen: HashSet::with_capacity(100),
             action_history_capacity: 8,
             snapshot_capacity: 100,
+            recent_snapshot_signatures: VecDeque::with_capacity(8),
         }
     }
 
@@ -53,7 +63,18 @@ impl WorkerHealth {
         }
         self.recent_action_hashes.push_back(action_hash);
 
+        // Phase 7: also push the snapshot signature into the
+        // rolling window used by `StuckReason::NoForwardProgress`.
+        // When the agent only calls `record_action` without
+        // a signature (older call sites), the snapshot window
+        // is not updated — the no-forward-progress detector
+        // only fires on signatures the loop actually saw.
         if let Some(sig) = snapshot_sig {
+            if self.recent_snapshot_signatures.len() >= self.action_history_capacity {
+                self.recent_snapshot_signatures.pop_front();
+            }
+            self.recent_snapshot_signatures.push_back(sig);
+
             if self.distinct_snapshot_signatures_seen.len() >= self.snapshot_capacity
                 && !self.distinct_snapshot_signatures_seen.contains(&sig)
             {
@@ -89,6 +110,24 @@ pub enum StuckReason {
         elapsed: Duration,
         iterations_completed: u32,
     },
+    /// Phase 7: the worker is technically active (different
+    /// actions are being dispatched) but the page state is
+    /// not evolving — the same AX-tree signature has been
+    /// observed for `consecutive_count` consecutive
+    /// snapshots. This is the canonical "spinner" pattern:
+    /// the LLM is doing work, but the page it sees is
+    /// identical to the page it saw N iterations ago. Common
+    /// triggers: a click that triggers no visible change
+    /// (e.g. clicking a label, not the input it labels), an
+    /// off-screen element, a modal that's been auto-dismissed
+    /// but the LLM keeps "clicking" inside it, a navigation
+    /// that the browser swallowed.
+    NoForwardProgress {
+        /// The snapshot signature that hasn't changed.
+        stuck_signature: u64,
+        /// How many consecutive snapshots matched it.
+        consecutive_count: usize,
+    },
 }
 
 /// Evaluated health report for supervisor inspection.
@@ -114,6 +153,16 @@ pub struct StuckDetectorConfig {
     pub no_progress_timeout: Duration,
     pub token_warning_threshold: f32,
     pub max_token_budget: Option<u32>,
+    /// Phase 7: how many consecutive identical snapshot
+    /// signatures the worker must observe before the
+    /// "no forward progress" detector fires. The default (4)
+    /// is one greater than the default action-loop threshold
+    /// (3) so a worker that genuinely needs a couple of
+    /// iterations to land (e.g. "click into a field", "type
+    /// query", "press enter" — three same-tree actions
+    /// before the page actually changes) is not flagged.
+    /// `usize::MAX` disables the check.
+    pub max_identical_snapshot_repeat: usize,
 }
 
 impl Default for StuckDetectorConfig {
@@ -123,6 +172,7 @@ impl Default for StuckDetectorConfig {
             no_progress_timeout: Duration::from_secs(60),
             token_warning_threshold: 0.85,
             max_token_budget: None,
+            max_identical_snapshot_repeat: 4,
         }
     }
 }
@@ -165,6 +215,38 @@ pub fn detect_stuck(health: &WorkerHealth, config: &StuckDetectorConfig) -> Work
             elapsed: last_progress_elapsed,
             iterations_completed: health.iteration_count,
         });
+    }
+
+    // 2b. Phase 7: no-forward-progress check. The worker
+    // has dispatched N consecutive iterations on the same
+    // AX-tree signature — actions may have been different
+    // (so the action-loop check didn't fire) but the page
+    // itself hasn't moved. This is the "spinner" pattern:
+    // technically active, not stuck, but not making
+    // observable progress. Runs only when the action-loop
+    // check didn't already fire (it has the same data
+    // window, so a single iteration can't trigger both
+    // reasons) and only when the config threshold is finite.
+    if stuck_reason.is_none() && config.max_identical_snapshot_repeat >= 2 {
+        let threshold = config.max_identical_snapshot_repeat.max(2);
+        if health.recent_snapshot_signatures.len() >= threshold {
+            let tail: Vec<u64> = health
+                .recent_snapshot_signatures
+                .iter()
+                .rev()
+                .take(threshold)
+                .copied()
+                .collect();
+            let last_sig = tail[0];
+            let all_same = tail.iter().all(|&s| s == last_sig);
+
+            if all_same {
+                stuck_reason = Some(StuckReason::NoForwardProgress {
+                    stuck_signature: last_sig,
+                    consecutive_count: threshold,
+                });
+            }
+        }
     }
 
     // 3. Token budget warning calculation
@@ -292,5 +374,215 @@ mod tests {
         let report_below = detect_stuck(&health, &cfg);
         assert!(!report_below.token_limit_approaching);
         assert!(report_below.is_healthy);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 7: NoForwardProgress detection
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_no_forward_progress_flags_identical_snapshots() {
+        // The motivating case: the worker is *active* (each
+        // recorded action is different) but the AX-tree
+        // signature is identical across N consecutive
+        // snapshots. This is the spinner pattern — the
+        // LLM is doing work, the page is not changing.
+        // Action hashes MUST differ so the action-loop
+        // check (which runs first) does not pre-empt this
+        // check.
+        let mut health = WorkerHealth::new("w-spinner");
+        let cfg = StuckDetectorConfig::default(); // threshold 4
+
+        let mut action_counter = 0u64;
+        for _ in 0..4 {
+            health.on_checkpoint();
+            action_counter += 1;
+            health.record_action(action_counter, Some(0xAABBCCDD));
+        }
+
+        let report = detect_stuck(&health, &cfg);
+        assert!(report.suspected_stuck);
+        assert!(!report.is_healthy);
+        match report.stuck_reason {
+            Some(StuckReason::NoForwardProgress {
+                stuck_signature,
+                consecutive_count,
+            }) => {
+                assert_eq!(stuck_signature, 0xAABBCCDD);
+                assert_eq!(consecutive_count, 4);
+            }
+            other => panic!("Expected NoForwardProgress, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_forward_progress_resolves_when_snapshot_changes() {
+        // Healthy worker: 4 different actions, the
+        // snapshot evolves. The detector must NOT fire.
+        let mut health = WorkerHealth::new("w-evolving");
+        let cfg = StuckDetectorConfig::default();
+
+        let mut action_counter = 0u64;
+        for sig in [0x1000u64, 0x1000, 0x1000, 0x2000] {
+            health.on_checkpoint();
+            action_counter += 1;
+            health.record_action(action_counter, Some(sig));
+        }
+
+        let report = detect_stuck(&health, &cfg);
+        assert!(!report.suspected_stuck);
+        assert!(report.is_healthy);
+        assert!(report.stuck_reason.is_none());
+    }
+
+    #[test]
+    fn test_no_forward_progress_under_threshold_does_not_fire() {
+        // 3 identical snapshots with the default threshold
+        // of 4 — the "click into field, type, press enter"
+        // legitimate case. The detector must not fire.
+        // Action hashes differ so the action-loop check
+        // doesn't pre-empt.
+        let mut health = WorkerHealth::new("w-typing");
+        let cfg = StuckDetectorConfig::default();
+
+        let mut action_counter = 0u64;
+        for _ in 0..3 {
+            health.on_checkpoint();
+            action_counter += 1;
+            health.record_action(action_counter, Some(0xCAFE));
+        }
+
+        let report = detect_stuck(&health, &cfg);
+        assert!(!report.suspected_stuck);
+        assert!(report.is_healthy);
+    }
+
+    #[test]
+    fn test_no_forward_progress_disabled_when_threshold_max() {
+        // Operator opt-out: setting the threshold to
+        // usize::MAX disables the check. The detector must
+        // not fire even with N identical snapshots.
+        // Action hashes differ so the action-loop check
+        // doesn't pre-empt.
+        let mut health = WorkerHealth::new("w-disabled");
+        let cfg = StuckDetectorConfig {
+            max_identical_snapshot_repeat: usize::MAX,
+            ..Default::default()
+        };
+
+        let mut action_counter = 0u64;
+        for _ in 0..20 {
+            health.on_checkpoint();
+            action_counter += 1;
+            health.record_action(action_counter, Some(0xDEAD));
+        }
+
+        let report = detect_stuck(&health, &cfg);
+        assert!(!report.suspected_stuck);
+    }
+
+    #[test]
+    fn test_action_loop_wins_over_no_forward_progress() {
+        // When the same action is being repeated AND the
+        // snapshot is identical, ActionLoop is the more
+        // specific signal — it tells the supervisor
+        // *exactly* what to do (issue a nudge, "click
+        // something different"). The no-forward-progress
+        // check must not override it.
+        let mut health = WorkerHealth::new("w-both");
+        let cfg = StuckDetectorConfig::default();
+
+        for _ in 0..4 {
+            health.on_checkpoint();
+            health.record_action(0xBEEF, Some(0xABCD));
+        }
+
+        let report = detect_stuck(&health, &cfg);
+        assert!(matches!(report.stuck_reason, Some(StuckReason::ActionLoop { .. })));
+    }
+
+    #[test]
+    fn test_no_forward_progress_with_mixed_action_loop_history() {
+        // The realistic spinner: an action loop happens,
+        // the supervisor nudges, the worker tries a
+        // different action — but the snapshot is still
+        // unchanged. The action-loop check no longer
+        // fires (the action is now different), so the
+        // no-forward-progress check takes over. To test
+        // this cleanly we need the recent-action window
+        // to NOT contain 3 same-hash actions, but the
+        // recent-snapshot window to contain 4 same
+        // signatures.
+        let mut health = WorkerHealth::new("w-post-nudge");
+        let cfg = StuckDetectorConfig::default();
+
+        // Phase 1: 3 same-action ticks with same snapshot.
+        // This drops out of the recent_action window as
+        // we add more ticks below.
+        for _ in 0..3 {
+            health.on_checkpoint();
+            health.record_action(0xA, Some(0xCAFE));
+        }
+        // Phase 2: 4 different-action ticks but the
+        // snapshot is still unchanged. The most recent 4
+        // actions are now (B, B, B, B) — wait, that's
+        // still an action loop. We need the actions in
+        // the most recent 3 to differ. Use 3 different
+        // action hashes in the most recent 3 ticks; the
+        // 4th tick can match one of the earlier ones.
+        // Simplest: alternate two distinct hashes so the
+        // rolling 3-window never has 3 identical.
+        for hash in [0xB, 0xC, 0xD, 0xE] {
+            health.on_checkpoint();
+            health.record_action(hash, Some(0xCAFE));
+        }
+
+        let report = detect_stuck(&health, &cfg);
+        assert!(report.suspected_stuck);
+        match report.stuck_reason {
+            Some(StuckReason::NoForwardProgress {
+                stuck_signature,
+                consecutive_count,
+            }) => {
+                assert_eq!(stuck_signature, 0xCAFE);
+                assert_eq!(consecutive_count, 4);
+            }
+            other => panic!(
+                "Expected NoForwardProgress after action-loop history, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_window_resets_on_signature_change() {
+        // If a single snapshot changes mid-window, the
+        // rolling window must reset — the most recent 4
+        // must all match for the detector to fire. Use
+        // different action hashes so the action-loop
+        // check doesn't pre-empt.
+        let mut health = WorkerHealth::new("w-reset");
+        let cfg = StuckDetectorConfig::default();
+
+        let mut action_counter = 0u64;
+        // 3 identical, 1 different, 3 identical — only
+        // the most recent 3 are the same, threshold is 4,
+        // so no fire.
+        for _ in 0..3 {
+            health.on_checkpoint();
+            action_counter += 1;
+            health.record_action(action_counter, Some(0xAAAA));
+        }
+        health.on_checkpoint();
+        action_counter += 1;
+        health.record_action(action_counter, Some(0xBBBB));
+        for _ in 0..3 {
+            health.on_checkpoint();
+            action_counter += 1;
+            health.record_action(action_counter, Some(0xAAAA));
+        }
+
+        let report = detect_stuck(&health, &cfg);
+        assert!(!report.suspected_stuck);
     }
 }

@@ -1618,6 +1618,21 @@ pub struct RespawnHandoff {
     pub last_known_good_snapshot_signature: Option<String>,
     pub respawn_reason: RespawnReason,
     pub failure_context: String,
+    /// Phase 7: per-session authentication state carried
+    /// across the respawn boundary. A respawned worker
+    /// shouldn't have to re-login if the session cookie /
+    /// Google SSO state is still valid — the auth state on
+    /// the old session is "linkedin.com is authenticated"
+    /// and the new session inherits that without forcing a
+    /// fresh OAuth round-trip. The orchestrator's
+    /// `set_respawn_handoff` reads this field and writes it
+    /// to the new worker's `SessionHandle::update_auth` so
+    /// subsequent platform navigation skips the
+    /// re-authentication flow. Empty (default) when the
+    /// original session never authenticated, so the
+    /// replacement worker's auth state starts clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_state: Option<crate::auth::AuthState>,
 }
 
 impl RespawnHandoff {
@@ -1636,6 +1651,33 @@ impl RespawnHandoff {
             last_known_good_snapshot_signature,
             respawn_reason,
             failure_context: failure_context.into(),
+            auth_state: None,
+        }
+    }
+
+    /// Phase 7: build a `RespawnHandoff` that explicitly
+    /// carries the prior session's authentication state.
+    /// Use this on the supervisor's respawn path so the
+    /// replacement worker inherits the original worker's
+    /// authenticated domains and doesn't have to re-login
+    /// via Google.
+    pub fn with_auth_state(
+        original_task_description: impl Into<String>,
+        subtasks_completed: Vec<SubTask>,
+        subtasks_remaining: Vec<SubTask>,
+        last_known_good_snapshot_signature: Option<String>,
+        respawn_reason: RespawnReason,
+        failure_context: impl Into<String>,
+        auth_state: crate::auth::AuthState,
+    ) -> Self {
+        Self {
+            original_task_description: original_task_description.into(),
+            subtasks_completed,
+            subtasks_remaining,
+            last_known_good_snapshot_signature,
+            respawn_reason,
+            failure_context: failure_context.into(),
+            auth_state: Some(auth_state),
         }
     }
 

@@ -38,7 +38,7 @@ pub enum LoginResult {
 
 /// Per-session authentication state. Stored on `SessionHandle`
 /// so subsequent subtasks in the same run skip re-login.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthState {
     /// Whether the agent has successfully authenticated via Google
     /// in this session.

@@ -762,6 +762,17 @@ impl BrowserAgentFactory for AgentFactory {
             if let Some(respawn_h) = handoff.respawn_handoff.clone() {
                 agent.set_respawn_handoff(respawn_h);
             }
+            // Phase 7: drain any pending auth state from the
+            // respawn handoff into the live SessionHandle
+            // now that we're in a tokio context. This is the
+            // moment the replacement worker's session is
+            // "born" and inherits the prior worker's
+            // authenticated domains. Without this call, the
+            // cached auth state never reaches the session
+            // and the replacement worker would re-trigger
+            // the Google OAuth flow on its first LinkedIn
+            // navigation.
+            let _ = agent.apply_pending_auth_state().await;
             let session_id = agent.session_id().to_string();
             // Mirror the agent's constructor: `transcript_dir` or
             // the default "transcripts" subfolder.
@@ -889,6 +900,12 @@ impl BrowserAgentFactory for ParallelMapsFactory {
             if let Some(respawn_h) = handoff.respawn_handoff.clone() {
                 agent.set_respawn_handoff(respawn_h);
             }
+            // Phase 7: same drain as the other factory —
+            // the auth state cached on the agent by
+            // `set_respawn_handoff` is now written to the
+            // live session before the worker starts
+            // dispatching.
+            let _ = agent.apply_pending_auth_state().await;
             let session_id = agent.session_id().to_string();
             let dir = transcript_dir.unwrap_or_else(|| std::path::PathBuf::from("transcripts"));
             let transcript_ref = Some(

@@ -105,6 +105,14 @@ pub struct Agent {
     /// `mark_subtask_done`. The `finish()` tool handler is gated on
     /// this; the per-subtask end-of-session summary is read from this.
     completeness: CompletenessTracker,
+    /// Phase 7: pending `AuthState` cached by
+    /// `set_respawn_handoff` for the orchestrator's respawn
+    /// path to drain into the live `SessionHandle` via
+    /// `apply_pending_auth_state`. Lives on the Agent (not
+    /// the session) because `set_respawn_handoff` is
+    /// synchronous and the session lock is async; we defer
+    /// the actual write to the next async call site.
+    pending_auth_state: Option<crate::auth::AuthState>,
     /// Phase 15.1: how many `finish()` calls have been made *for the
     /// current gate pass*. The first call is a "force a re-prompt if
     /// any subtask is still incomplete"; the second call is the real
@@ -615,6 +623,11 @@ Calling `finish()` while any subtask is still pending is intercepted: the agent 
             session,
             bus: Some(MessageBus::new()),
             completeness: CompletenessTracker::new(),
+            // Phase 7: no auth state pending at construction.
+            // Populated by `set_respawn_handoff` on the
+            // orchestrator's respawn path, drained by
+            // `apply_pending_auth_state`.
+            pending_auth_state: None,
             finish_calls_this_gate: 0,
             pending_finish_result: None,
             summary_written: false,
@@ -1095,25 +1108,129 @@ see config.yaml `agent.allowed_domains` (resolver path: {resolution_path})"
         self.messages.clone()
     }
 
+    /// Phase 7: test/integration helper. Read-only handle to
+    /// the `SessionHandle` so tests can assert on
+    /// session-level state (auth, transitions) without
+    /// going through the orchestrator. The handle is cheap
+    /// to clone (it's an `Arc` underneath); tests can keep
+    /// it across `await` points.
+    pub fn session(&self) -> crate::session::SessionHandle {
+        self.session.clone()
+    }
+
     /// Read-only accessor for the session id. Used by example tests
     /// to find the transcript file path on disk.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
-    /// Phase 30 stub: stash a respawn handoff payload on the
-    /// agent. The real implementation lives in
-    /// `mew_agent::respawn_policy` / `mew_agent::handoff`; until
-    /// Phase 30 ships, the orchestrator's call site fails to
-    /// compile without this method existing. The stub is a
-    /// no-op — it accepts the handoff so the lib builds, but
-    /// doesn't apply it. A real implementation is a Phase 30
-    /// follow-up.
-    pub fn set_respawn_handoff<T: serde::Serialize>(
-        &mut self,
-        _respawn_h: T,
-    ) {
-        // No-op until Phase 30 lands.
+    /// Phase 7 (was Phase 30 stub): apply a respawn handoff to
+    /// this agent. Replaces the pre-Phase-7 no-op stub.
+    /// Concretely, applies the typed payload to the agent
+    /// state so the replacement worker inherits:
+    ///
+    ///   * `subtasks_completed` / `subtasks_remaining` —
+    ///     forwarded to the `CompletenessTracker` via
+    ///     `seed_from_handoff` so the LLM doesn't re-do
+    ///     already-completed work and doesn't re-pick
+    ///     already-failed sub-tasks.
+    ///   * `auth_state` (Phase 7 addition) — cached on the
+    ///     agent as `pending_auth_state` so the next call
+    ///     to `apply_pending_auth_state` (which the
+    ///     orchestrator's respawn path invokes from a tokio
+    ///     context) writes it to the `SessionHandle` via
+    ///     `update_auth`. A respawned worker inherits the
+    ///     authenticated-domain knowledge and skips the
+    ///     Google OAuth round-trip when it navigates to a
+    ///     platform the prior worker had already logged in
+    ///     to. This is the key fix for "after a respawn, the
+    ///     agent has to re-login to LinkedIn every time" —
+    ///     pre-Phase-7 the auth state lived only on the dead
+    ///     session and the new worker started blank.
+    ///   * `respawn_reason` / `failure_context` are recorded
+    ///     on the live progress buffer so the transcript
+    ///     shows why the respawn happened and what to be
+    ///     careful about.
+    pub fn set_respawn_handoff(&mut self, respawn_h: crate::handoff::RespawnHandoff) {
+        // 1. Seed the completeness tracker with the prior
+        // worker's completed/remaining subtasks so the new
+        // worker doesn't repeat work and the gate tracker
+        // doesn't reset.
+        self.completeness
+            .seed_from_handoff(respawn_h.subtasks_completed, respawn_h.subtasks_remaining);
+
+        // 2. Cache the prior worker's authentication state
+        // on the agent. The next call to
+        // `apply_pending_auth_state` (from a tokio context)
+        // writes it to the session. We don't `block_on` the
+        // session lock here because `set_respawn_handoff`
+        // may itself be called from a tokio context (the
+        // orchestrator's worker pool), and nested
+        // `block_on` panics.
+        if let Some(auth_state) = respawn_h.auth_state.clone() {
+            // A respawn boundary is the right place to
+            // clear the awaiting flag: a fresh worker is
+            // the right time to give the user a fresh
+            // confirmation prompt if the prior one is
+            // still pending.
+            let mut next = auth_state;
+            next.awaiting_user = false;
+            next.awaiting_reason = None;
+            self.pending_auth_state = Some(next);
+        }
+
+        // 3. Log the respawn into the live progress buffer
+        // so the transcript shows the supervisor's reasoning
+        // and the warning about what went wrong.
+        self.live_progress.push(summarizer::ProgressLine::new(
+            summarizer::ProgressKind::Other,
+            format!(
+                "[respawn] previous attempt failed: {} (warning: {})",
+                respawn_h.respawn_reason.as_str(),
+                respawn_h.failure_context
+            ),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            false,
+        ));
+
+        tracing::warn!(
+            event = "respawn_handoff_applied",
+            respawn_reason = respawn_h.respawn_reason.as_str(),
+            failure_context = %respawn_h.failure_context,
+            auth_state_carried = respawn_h.auth_state.is_some(),
+            "applied respawn handoff to replacement worker"
+        );
+    }
+
+    /// Phase 7: drain a pending `AuthState` cached on this
+    /// agent by `set_respawn_handoff` into the live
+    /// `SessionHandle`. Called once, by the orchestrator's
+    /// respawn path, *after* `set_respawn_handoff` and
+    /// before the replacement worker starts dispatching.
+    /// No-op when no auth state is pending (e.g. the prior
+    /// session never authenticated). Takes the pending
+    /// state out so a second call is a no-op (the drain is
+    /// one-shot — calling it twice would be a double-write
+    /// of the same state).
+    pub async fn apply_pending_auth_state(&mut self) -> bool {
+        let pending = match self.pending_auth_state.take() {
+            Some(s) => s,
+            None => return false,
+        };
+        self.session
+            .update_auth(|s| {
+                *s = pending.clone();
+            })
+            .await;
+        tracing::info!(
+            event = "auth_state_carried_across_respawn",
+            authenticated_domains = ?pending.authenticated_domains,
+            "replacement worker inherited prior session's auth state"
+        );
+        true
     }
 
     /// Phase 8: read-only handle to the captcha telemetry. The
@@ -2770,6 +2887,71 @@ see config.yaml `agent.allowed_domains` (resolver path: {resolution_path})"
                         ),
                     }));
                 }
+                crate::resilience::ResilienceHookOutcome::PauseForAccountRestriction { reason, hint } => {
+                    // Phase 7: the platform's "your account has
+                    // been restricted" page was detected. This
+                    // is *not* a session loss (re-authenticating
+                    // wouldn't help — the user's account itself
+                    // is restricted) and *not* a CAPTCHA (no
+                    // challenge to solve). The right user
+                    // action is to sign in to the platform in a
+                    // real browser, verify their identity, and
+                    // try again later. The message must be calm
+                    // and non-alarming because the user did
+                    // nothing wrong — automated agent activity
+                    // just tripped a generic risk threshold.
+                    //
+                    // We do three things here, mirroring the
+                    // captcha pause path:
+                    //
+                    //   1. Log a structured resilience event +
+                    //      tracing warning so the transcript
+                    //      and the JSONL trace both show the
+                    //      pause.
+                    //   2. Pause the session (the existing
+                    //      `Paused` state) so a future
+                    //      `resume()` (after the user has
+                    //      verified their identity) continues
+                    //      the loop.
+                    //   3. Return Err from `run_inner` so the
+                    //      outer wrapper records `Failed` (with
+                    //      the reason as the failure text) and
+                    //      the orchestrator's catch-all path
+                    //      turns it into a user-facing chat
+                    //      message. The user reads the calm,
+                    //      non-alarming `reason` and the
+                    //      actionable `hint`.
+                    crate::resilience::log_resilience_event(
+                        self.transcript_file.as_ref(),
+                        &self.session_id,
+                        "AccountRestrictionPause",
+                        &format!("reason=\"{reason}\" hint=\"{hint}\""),
+                    );
+                    tracing::warn!(
+                        event = "account_restriction_detected",
+                        session_id = %self.session_id,
+                        reason = %reason,
+                        "platform restricted the account; pausing for human verification"
+                    );
+                    if let Err(e) = self.session.pause(Some(format!(
+                        "account_restriction: {reason}"
+                    ))).await {
+                        tracing::warn!(
+                            event = "account_restriction_pause_failed",
+                            error = %e,
+                            "could not pause session for account restriction; returning Err anyway"
+                        );
+                    }
+                    self.messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!(
+                            "[resilience:account_restriction] {reason}\n\n{hint}\n\nThe agent has paused to protect your account. Resume once you've verified your identity in a real browser."
+                        ),
+                    }));
+                    return Err(anyhow::anyhow!(
+                        "account restriction detected: {reason} — {hint}"
+                    ));
+                }
             }
             // Refresh the "did the prior look like a dashboard?"
             // flag for the *next* iteration. The session-loss
@@ -3460,7 +3642,33 @@ see config.yaml `agent.allowed_domains` (resolver path: {resolution_path})"
             // exactly one transcript line. Putting it at the
             // dispatch boundary (one call site) makes that
             // structural rather than convention-based.
-            let pacing_decision = self.pacing.before_action(&effective_name);
+            //
+            // Phase 7: pick the right pacing path based on
+            // the current domain. The challenger-domain path
+            // activates automatically on
+            // `known_to_challenge_bots` hosts regardless of
+            // the global `enabled` flag, with a more
+            // conservative delay range (default 1.5s..3s vs
+            // the global 0.8s..2.5s). Operators who want
+            // raw speed on a non-challenger domain leave
+            // `enabled` false and `force_for_challenger_domains`
+            // true — only the LinkedIn / Indeed / Upwork
+            // actions get paced, not the bulk of the
+            // agent's work.
+            let is_challenger_domain = self
+                .current_url
+                .as_deref()
+                .and_then(|u| url::Url::parse(u).ok())
+                .and_then(|p| p.host_str().map(|s| s.to_string()))
+                .map(|host| self.sensitive_platforms.is_known_challenger(&host))
+                .unwrap_or(false);
+            let pacing_decision = if is_challenger_domain
+                && self.config.agent.pacing.force_for_challenger_domains
+            {
+                self.pacing.before_action_for_challenger(&effective_name)
+            } else {
+                self.pacing.before_action(&effective_name)
+            };
             match &pacing_decision {
                 PacingDecision::NoPacing => {
                     // No log line, no sleep. (17.1 spec: log

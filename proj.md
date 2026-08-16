@@ -185,6 +185,35 @@ Wired into CI as `cargo test --features eval -p mew-agent`. Pass-rate over time 
 - **Local-only telemetry.** Per-domain challenge counts in `<data_dir>/captcha_telemetry.json`. No data leaves the machine.
 - **`known_to_challenge_bots` flag in `sensitive_platforms.toml`.** Per-domain, used by pacing and telemetry. Pacing slows before the navigation and the telemetry baseline is seeded at the higher "expected" level.
 
+#### 2.5.11 Auto-apply action layer (Phase 6)
+
+The Phase 6 layer extends the existing `Paused`-checkpoint irreversible-action pattern rather than introducing a separate submission path. Three modules compose the surface:
+
+- **`mew_agent::application_dedup::ApplicationDedup`.** Local on-disk dedup store at `<data_dir>/applications_sent.json` keyed by `(platform, posting_identifier)`. Append-only, schema-versioned, append-on-confirmed. Normalizes the platform (lowercased, `www.` stripped) so Monday's `linkedin.com` and Tuesday's `WWW.LinkedIn.com` hit the same row. Falls back to empty on a corrupted or missing file so a fresh install never blocks. 16 unit tests cover load/mark/idempotency, normalization, snapshot ordering, flush, recover-from-corrupt, and unknown-schema-version.
+- **`mew_agent::auto_apply::AutoApply`.** Orchestration layer that folds `AutoApplyConfig` + the dedup store + a per-run `AtomicUsize` counter into a single `AutoApplyDecision` enum the dispatch site can match on (`Disabled` / `NotApplicable` / `AlreadyApplied` / `CapReached` / `PauseForDraft` / `AutoSubmit`). The decision function is pure logic — no I/O on the hot path. 17 unit tests cover the full decision matrix, dedup normalization, missing-`posting_id` short-circuit, per-run cap enforcement (including the exact-boundary case), fire-and-forget dedup+cap interaction, the three spec scenarios, and the explain-every-variant contract.
+- **`mew_resilience::irreversible_actions`.** Extended with three new typed `ActionKind` variants (`SubmitApplication` / `SendProposal` / `SendConnectionRequest`) and the rule rows that map `apply_to_job` / `send_proposal` / `send_connection_request` (and friends) to them. The existing `submit_application` rule stays unchanged at `ActionKind::Submit` so a future regression that conflated the two would surface in tests.
+
+**Config surface.** New `agent.auto_apply` block in `config.yaml`:
+
+```yaml
+agent:
+  auto_apply:
+    enabled: false                                # default: pure no-op (pre-Phase-6 byte-for-byte)
+    require_confirmation_per_application: true    # default: pause for every application
+    max_applications_per_run: 10                  # hard cap, hard-clamped to [1, 1000]
+```
+
+**Dispatch wiring.** The `mew-agent::agent::dispatch_single_tool_call` site now consults the auto-apply layer at the existing irreversible-gate boundary. The `Paused`-checkpoint pause message is unchanged — the auto-apply layer folds in (a) the dedup-check short-circuit (silent drop with a structured `AUTO_APPLY:` tool result), (b) the per-run cap short-circuit (same), (c) the fire-and-forget auto-submit path (counter committed, match arm runs without pausing), and (d) the standard pause path (counter committed, existing pause message surfaces).
+
+**Safety properties.**
+
+- The agent **never** auto-submits unless `enabled: true` AND `require_confirmation_per_application: false` AND the dedup check passes AND the cap is not yet hit — all four gates are required.
+- The per-run counter is bumped on `PauseForDraft` *before* the user confirms so a runaway loop on a flaky platform cannot draft more than `max_applications_per_run` applications per session.
+- The dedup store is flushed at session end (mirroring the captcha-telemetry pattern) so a Monday-then-Tuesday dedup hit is reliable across runs.
+- The dedup store keys on the user's *intentional* `(platform, posting_id)` pair, not the modal-dismiss override's `ref` — a modal intercepting the dispatch never breaks the dedup contract.
+
+**Tauri / CLI visibility.** Mirrors the captcha-telemetry pattern: `Agent::auto_apply()` and `Agent::application_dedup()` return cheap `Arc`-cloned handles a future Tauri command or CLI subcommand can use to surface a "X applications sent this session" tile or a "you already applied on <date>" hint without going through the agent.
+
 ### 2.6 `mew-cli` — headless entry point
 
 The CLI is still useful for debugging and the no-UI examples (`stdin_chat`, `test_stale`, `test_messy`, `test_stealth`, `test_timeout`, `debug_github`). Every example writes a session transcript under `mew-ui/src-tauri/transcripts/` so a CI run can diff transcripts against a golden.

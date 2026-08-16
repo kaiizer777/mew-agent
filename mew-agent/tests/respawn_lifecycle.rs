@@ -394,3 +394,157 @@ fn test_respawn_max_cap_narrates_multi_attempt_history() {
         ),
     }
 }
+
+// ----------------------------------------------------------------------
+// Phase 7: auth-state carry-over across respawn
+// ----------------------------------------------------------------------
+
+#[test]
+fn test_respawn_handoff_carries_auth_state_via_with_auth_state() {
+    use mew_agent::auth::AuthState;
+
+    // Original worker had logged in via Google to LinkedIn
+    // and Indeed. Its auth state carries that knowledge
+    // forward to the replacement worker.
+    let mut prior_auth = AuthState::default();
+    prior_auth.mark_authenticated("linkedin.com");
+    prior_auth.mark_authenticated("indeed.com");
+    prior_auth.google_authenticated = true;
+    // Set a stale awaiting flag to confirm it gets cleared
+    // on the replacement side.
+    prior_auth.set_awaiting("prior 2FA timeout".to_string());
+
+    let handoff = RespawnHandoff::with_auth_state(
+        "find remote jobs",
+        vec![],
+        vec![],
+        Some("sig_last_good".into()),
+        RespawnReason::Stuck("action loop".into()),
+        "Worker stuck on a filter UI",
+        prior_auth,
+    );
+
+    // The handoff carries the auth state — the supervisor
+    // can see what the new worker will inherit.
+    let carried = handoff
+        .auth_state
+        .as_ref()
+        .expect("handoff must carry auth state");
+    assert!(carried.google_authenticated);
+    assert!(carried.is_authenticated_for("linkedin.com"));
+    assert!(carried.is_authenticated_for("indeed.com"));
+    assert!(!carried.is_authenticated_for("glassdoor.com"));
+    // The awaiting flag is preserved on the handoff itself;
+    // the agent clears it on apply.
+    assert!(carried.awaiting_user);
+    assert_eq!(
+        carried.awaiting_reason.as_deref(),
+        Some("prior 2FA timeout")
+    );
+}
+
+#[test]
+fn test_respawn_handoff_without_auth_state_has_none() {
+    // The default `RespawnHandoff::new` path — the prior
+    // worker never authenticated. The replacement worker
+    // starts with no auth state (None, not Some(empty)).
+    let handoff = RespawnHandoff::new(
+        "task",
+        vec![],
+        vec![],
+        None,
+        RespawnReason::Crashed("ws dropped".into()),
+        "crash",
+    );
+    assert!(handoff.auth_state.is_none());
+}
+
+#[tokio::test]
+async fn test_set_respawn_handoff_seeds_completeness_and_pending_auth() {
+    use mew_agent::auth::AuthState;
+
+    // The agent's set_respawn_handoff is sync; it caches
+    // auth state on the agent and seeds the completeness
+    // tracker synchronously. A subsequent async call to
+    // `apply_pending_auth_state` writes the cached state
+    // to the live session.
+    let mut agent = Agent::new_for_test("search jobs");
+
+    let mut prior_auth = AuthState::default();
+    prior_auth.mark_authenticated("linkedin.com");
+    prior_auth.google_authenticated = true;
+
+    let completed = vec![SubTask {
+        id: "step-1".into(),
+        description: "Search LinkedIn".into(),
+        status: SubTaskStatus::Done,
+        evidence_iteration: Some(1),
+        evidence_signature: Some("sig_a".into()),
+        decided_at_secs: Some(100),
+    }];
+    let remaining = vec![SubTask {
+        id: "step-2".into(),
+        description: "Search Indeed".into(),
+        status: SubTaskStatus::Pending,
+        evidence_iteration: None,
+        evidence_signature: None,
+        decided_at_secs: None,
+    }];
+
+    let handoff = RespawnHandoff::with_auth_state(
+        "search jobs",
+        completed,
+        remaining,
+        Some("sig_a".into()),
+        RespawnReason::Stuck("loop on filter".into()),
+        "Worker stuck on the LinkedIn filter UI",
+        prior_auth,
+    );
+
+    agent.set_respawn_handoff(handoff);
+
+    // Completeness was seeded synchronously: 1 done, 1 pending.
+    assert_eq!(agent.completeness().subtasks.len(), 2);
+    assert_eq!(agent.completeness().incomplete_count(), 1);
+
+    // Auth state was cached on the agent. The async
+    // `apply_pending_auth_state` drains it into the live
+    // session and reports `true` (drained).
+    let drained = agent.apply_pending_auth_state().await;
+    assert!(drained);
+
+    let session_auth = agent.session().auth_state().await;
+    assert!(session_auth.google_authenticated);
+    assert!(session_auth.is_authenticated_for("linkedin.com"));
+    // Awaiting flag was cleared at apply time (the prior
+    // worker's pause for 2FA shouldn't carry over to the
+    // fresh worker — a fresh confirmation is the right
+    // user experience).
+    assert!(!session_auth.awaiting_user);
+    assert!(session_auth.awaiting_reason.is_none());
+
+    // A second `apply_pending_auth_state` is a no-op (no
+    // pending state to drain).
+    let drained_again = agent.apply_pending_auth_state().await;
+    assert!(!drained_again);
+}
+
+#[tokio::test]
+async fn test_set_respawn_handoff_without_auth_state_does_not_drain() {
+    // A handoff without an AuthState (e.g. the prior
+    // worker never authenticated) leaves the agent with no
+    // pending state. The first apply returns `false` and
+    // the session auth remains at its default.
+    let mut agent = Agent::new_for_test("task");
+    let handoff = RespawnHandoff::new(
+        "task",
+        vec![],
+        vec![],
+        None,
+        RespawnReason::Crashed("ws".into()),
+        "crash",
+    );
+    agent.set_respawn_handoff(handoff);
+    let drained = agent.apply_pending_auth_state().await;
+    assert!(!drained);
+}

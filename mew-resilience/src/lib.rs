@@ -53,6 +53,7 @@
 //! pure functions at the right moments.
 
 pub mod captcha;
+pub mod account_restriction;
 pub mod irreversible_actions;
 pub mod mock_fixtures;
 pub mod modal_interrupts;
@@ -63,6 +64,9 @@ pub mod stuck_detector;
 pub mod vision_confidence;
 
 pub use captcha::{detect as detect_captcha, Challenge, ChallengeKind};
+pub use account_restriction::{
+    detect as detect_account_restriction, AccountRestrictionKind, AccountRestrictionSignal,
+};
 pub use irreversible_actions::{
     classify as classify_irreversible, ActionKind, IrreverisbleVerdict,
 };
@@ -134,6 +138,17 @@ pub enum ResilienceFinding {
     /// solve it in-window — mew runs a real visible headed
     /// browser and the human is the safest solver.
     Captcha(Challenge),
+    /// Phase 7: a platform's "your account has been restricted
+    /// because of unusual activity" page was detected. Distinct
+    /// from `RateLimit` (which is per-IP) and from `Captcha`
+    /// (which is per-session). The right user action is
+    /// "sign in to the platform in a real browser, verify your
+    /// identity, try again later" — and the chat message must
+    /// be calm because the user did nothing wrong, automated
+    /// agent activity just tripped a generic risk threshold.
+    /// The default action is `PauseForUser` with a clear,
+    /// non-alarming reason string.
+    AccountRestriction(AccountRestrictionSignal),
     /// Phase 26: Worker health report indicating suspected stuck or token limit approaching.
     Stuck(WorkerHealthReport),
     /// Phase 40: the navigate tool's domain allowlist check
@@ -169,6 +184,7 @@ impl ResilienceFinding {
             ResilienceFinding::Captcha(_) => 6,
             ResilienceFinding::Stuck(_) => 7,
             ResilienceFinding::AllowlistViolation(_) => 8,
+            ResilienceFinding::AccountRestriction(_) => 9,
         }
     }
 
@@ -184,6 +200,7 @@ impl ResilienceFinding {
             ResilienceFinding::Captcha(_) => "captcha_challenge",
             ResilienceFinding::Stuck(_) => "stuck_worker",
             ResilienceFinding::AllowlistViolation(_) => "allowlist_violation",
+            ResilienceFinding::AccountRestriction(_) => "account_restriction",
         }
     }
 
@@ -221,10 +238,37 @@ impl ResilienceFinding {
                 format!("challenge detected: {}", c.label)
             }
             ResilienceFinding::Stuck(r) => {
-                format!(
-                    "worker health signal: suspected_stuck={}, token_limit_approaching={}",
-                    r.suspected_stuck, r.token_limit_approaching
-                )
+                // Phase 7: include the specific stuck
+                // reason so a user reading the chat
+                // transcript can see whether the
+                // supervisor flagged an action loop,
+                // a no-progress timeout, or a
+                // no-forward-progress spinner (the
+                // new variant — same AX-tree signature
+                // N snapshots in a row).
+                let reason = match &r.stuck_reason {
+                    Some(crate::stuck_detector::StuckReason::ActionLoop { repeat_count, .. }) => {
+                        format!("action_loop({} repeats)", repeat_count)
+                    }
+                    Some(crate::stuck_detector::StuckReason::NoProgressTimeout { iterations_completed, .. }) => {
+                        format!("no_progress_timeout({} iter)", iterations_completed)
+                    }
+                    Some(crate::stuck_detector::StuckReason::NoForwardProgress { consecutive_count, .. }) => {
+                        format!("no_forward_progress({} snapshots)", consecutive_count)
+                    }
+                    None => String::new(),
+                };
+                if reason.is_empty() {
+                    format!(
+                        "worker health signal: suspected_stuck={}, token_limit_approaching={}",
+                        r.suspected_stuck, r.token_limit_approaching
+                    )
+                } else {
+                    format!(
+                        "worker health signal: {}; token_limit_approaching={}",
+                        reason, r.token_limit_approaching
+                    )
+                }
             }
             ResilienceFinding::AllowlistViolation(v) => {
                 // Compact one-liner: domain + the short
@@ -241,20 +285,30 @@ impl ResilienceFinding {
                     dom = v.domain,
                 )
             }
+            ResilienceFinding::AccountRestriction(s) => {
+                // Calm, non-alarming. The user did nothing
+                // wrong — automated agent activity just
+                // tripped a generic risk threshold.
+                s.reason.clone()
+            }
         }
     }
 
     /// Whether the finding requires the loop to pause and ask the
-    /// user (vs. an automatic recovery). `IrreversibleGate` and
-    /// `Captcha` both pause — the former because the action is
-    /// one-way, the latter because the challenge cannot be
-    /// programmatically solved without a third-party solving
-    /// service (an opt-in capability, see `mew_agent::AgentConfig
-    /// ::captcha`).
+    /// user (vs. an automatic recovery). `IrreversibleGate`,
+    /// `Captcha`, and `AccountRestriction` all pause — the
+    /// former because the action is one-way, the latter two
+    /// because the user must be the one to act. Account
+    /// restriction in particular must NOT be auto-recovered
+    /// by the agent: the right user action is to sign in
+    /// to the platform in a real browser, verify their
+    /// identity, and try again later.
     pub fn requires_pause(&self) -> bool {
         matches!(
             self,
-            ResilienceFinding::IrreversibleGate(_) | ResilienceFinding::Captcha(_)
+            ResilienceFinding::IrreversibleGate(_)
+                | ResilienceFinding::Captcha(_)
+                | ResilienceFinding::AccountRestriction(_)
         )
     }
 }
@@ -283,6 +337,14 @@ pub fn severity_rank(finding: &ResilienceFinding) -> u8 {
         // the enum match is still exhaustive without a
         // `_ => unreachable!()` arm.
         ResilienceFinding::AllowlistViolation(_) => 8,
+        // Phase 7: account restriction is a hard stop
+        // (the user must verify their identity in a real
+        // browser). Severity slots between
+        // `AllowlistViolation` and `AccountRestriction`
+        // so the order is monotonic. The agent cannot
+        // recover from this; clicking through would risk
+        // permanent lock-out.
+        ResilienceFinding::AccountRestriction(_) => 9,
     }
 }
 

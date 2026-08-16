@@ -151,6 +151,23 @@ impl RespawnPolicy {
                         iterations_completed, elapsed
                     )
                 }
+                // Phase 7: the worker is active but the page
+                // hasn't changed across N consecutive
+                // snapshots. The supervisor's nudge text
+                // needs to call this out so the LLM
+                // re-orients ("the same AX tree N times in a
+                // row — try a fundamentally different
+                // approach, not a different click on the
+                // same tree").
+                Some(StuckReason::NoForwardProgress {
+                    stuck_signature: _,
+                    consecutive_count,
+                }) => {
+                    format!(
+                        "No forward progress: same AX-tree signature observed for {} consecutive snapshots (page state isn't evolving despite different actions)",
+                        consecutive_count
+                    )
+                }
                 None => "Suspected stuck state detected".to_string(),
             };
 

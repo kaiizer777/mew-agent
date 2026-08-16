@@ -130,6 +130,12 @@ fn test_tight_loop_is_paced() {
         // gives us a clear "first two no-pace, last two pace"
         // shape to assert against.
         streak_threshold: 3,
+        // Phase 7: test the global path explicitly. The
+        // challenger knob is off in this test so we
+        // don't accidentally hit it.
+        force_for_challenger_domains: false,
+        challenger_min_delay_ms: 0,
+        challenger_max_delay_ms: 0,
     });
     let mut driver = LoopDriver::new("t1_tight_loop");
 
@@ -194,6 +200,9 @@ fn test_one_off_is_not_paced() {
         min_delay_ms: 1000,
         max_delay_ms: 2000,
         streak_threshold: 2,
+        force_for_challenger_domains: false,
+        challenger_min_delay_ms: 0,
+        challenger_max_delay_ms: 0,
     });
     let mut driver = LoopDriver::new("t2_one_off");
 
@@ -246,6 +255,9 @@ fn test_different_action_resets_streak() {
         min_delay_ms: 200,
         max_delay_ms: 400,
         streak_threshold: 2,
+        force_for_challenger_domains: false,
+        challenger_min_delay_ms: 0,
+        challenger_max_delay_ms: 0,
     });
     let mut driver = LoopDriver::new("t3_streak_reset");
 
@@ -301,6 +313,9 @@ fn test_disabled_is_no_op() {
         min_delay_ms: 5000,
         max_delay_ms: 9000,
         streak_threshold: 1,
+        force_for_challenger_domains: false,
+        challenger_min_delay_ms: 0,
+        challenger_max_delay_ms: 0,
     });
     let mut driver = LoopDriver::new("t4_disabled");
 
@@ -368,6 +383,9 @@ fn test_agent_integration() {
         min_delay_ms: 30,
         max_delay_ms: 60,
         streak_threshold: 3,
+        force_for_challenger_domains: false,
+        challenger_min_delay_ms: 0,
+        challenger_max_delay_ms: 0,
     });
     let mut driver2 = LoopDriver::new("t5_agent_b");
     let mut total2 = Duration::ZERO;
@@ -424,6 +442,9 @@ fn test_absurdly_low_range_still_logs() {
         min_delay_ms: 0,
         max_delay_ms: 0,
         streak_threshold: 1,
+        force_for_challenger_domains: false,
+        challenger_min_delay_ms: 0,
+        challenger_max_delay_ms: 0,
     });
     let mut driver = LoopDriver::new("t6_zero_range");
 

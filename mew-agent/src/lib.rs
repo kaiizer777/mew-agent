@@ -44,6 +44,7 @@ pub mod resilience;
 pub mod respawn_policy;
 pub mod router;
 pub mod session;
+pub mod session_summary;
 pub mod summarizer;
 pub mod supervisor;
 pub mod todo;

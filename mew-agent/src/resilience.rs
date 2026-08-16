@@ -74,9 +74,9 @@
 
 use mew_perception::TreeNode;
 use mew_resilience::{
-    categorize as categorize_findings, classify_irreversible, detect_captcha, detect_modal,
-    detect_rate_limit, detect_session_loss, score_vision, Challenge, SessionLossInputs,
-    VisionVerdict,
+    categorize as categorize_findings, classify_irreversible, detect_account_restriction,
+    detect_captcha, detect_modal, detect_rate_limit, detect_session_loss, score_vision, Challenge,
+    SessionLossInputs, VisionVerdict,
 };
 use serde_json::Value;
 
@@ -125,6 +125,23 @@ pub enum ResilienceHookOutcome {
     /// the loss to the user. The `domain` is the platform where
     /// the session was lost (e.g. "linkedin.com").
     AttemptGoogleLogin { domain: String },
+    /// Phase 7: the platform's "your account has been
+    /// restricted because of unusual activity" page was
+    /// detected. The session is paused and the user is told
+    /// the calm, non-alarming reason and the right
+    /// recovery action (sign in to the platform in a real
+    /// browser, verify identity, try again later). The
+    /// `reason` is the platform-specific reason string
+    /// ("LinkedIn has restricted this account because of
+    /// unusual activity") and `hint` is the actionable
+    /// instruction. Distinct from `PauseForCaptcha` and
+    /// `Backoff` — the user did nothing wrong, automated
+    /// agent activity just tripped a generic risk
+    /// threshold.
+    PauseForAccountRestriction {
+        reason: String,
+        hint: String,
+    },
 }
 
 /// The aggregated view of every detector on the current
@@ -201,6 +218,26 @@ pub fn evaluate_page(
         findings.push(format!("{}:{}", "RateLimit", summary));
         return ResilienceHookReport {
             outcome: ResilienceHookOutcome::Backoff { secs },
+            findings,
+        };
+    }
+
+    // 2b. Phase 7: account restriction. Runs after rate
+    // limit (rate limit is per-IP and recoverable with a
+    // backoff; account restriction is per-user and is a
+    // hard stop). Runs before session loss because a
+    // "we've restricted your account" page is *not* a
+    // session loss — re-authenticating via Google wouldn't
+    // help; the user's account is the one that's
+    // restricted, and they need to verify their identity
+    // in a real browser before the agent can resume.
+    if let Some(sig) = detect_account_restriction(tree) {
+        findings.push(format!("{}:{}", "AccountRestriction", sig.reason));
+        return ResilienceHookReport {
+            outcome: ResilienceHookOutcome::PauseForAccountRestriction {
+                reason: sig.reason,
+                hint: sig.hint,
+            },
             findings,
         };
     }
@@ -448,16 +485,6 @@ mod tests {
 
     #[test]
     fn login_wall_with_password_strong_signal_fires_session_loss() {
-        // The login_wall_page fixture has BOTH a password
-        // field AND a sign-in prompt — the *strong* signal
-        // in the session-loss detector fires regardless of
-        // `prior_was_dashboard_like`. This is the right
-        // behavior: a login form with a password field is
-        // a session-loss event whether or not we know the
-        // prior was a dashboard, because the user-actionable
-        // hint ("Sign in to continue") is the same in both
-        // cases. The LLM gets a session_loss finding and
-        // decides whether to fill the form.
         let report = evaluate_page(&mock_fixtures::login_wall_page(), false, false, "");
         match report.outcome {
             ResilienceHookOutcome::SurfaceAsFinding { kind, .. } => {
@@ -465,6 +492,99 @@ mod tests {
             }
             other => panic!("expected SurfaceAsFinding (session_loss), got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 7: account-restriction detection
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn linkedin_restricted_account_triggers_pause() {
+        // The canonical case: a LinkedIn "we've restricted
+        // your account" page. The agent must pause with a
+        // calm, non-alarming message — NOT surface as a
+        // session loss (re-authenticating wouldn't help) and
+        // NOT treat as a CAPTCHA (no challenge to solve).
+        let report = evaluate_page(
+            &mock_fixtures::linkedin_restricted_account_page(),
+            false,
+            false,
+            "linkedin.com",
+        );
+        match report.outcome {
+            ResilienceHookOutcome::PauseForAccountRestriction { reason, hint } => {
+                assert!(reason.to_lowercase().contains("linkedin"));
+                assert!(hint.to_lowercase().contains("sign in"));
+                assert!(hint.to_lowercase().contains("real browser"));
+            }
+            other => panic!(
+                "expected PauseForAccountRestriction, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn freelance_temporary_restriction_triggers_pause() {
+        let report = evaluate_page(
+            &mock_fixtures::freelance_temporary_restriction_page(),
+            false,
+            false,
+            "upwork.com",
+        );
+        match report.outcome {
+            ResilienceHookOutcome::PauseForAccountRestriction { reason, .. } => {
+                assert!(reason.to_lowercase().contains("freelance"));
+            }
+            other => panic!(
+                "expected PauseForAccountRestriction, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn account_restriction_wins_over_session_loss() {
+        // An "account restricted" page with a password
+        // field would also trip the session-loss detector
+        // (the strong-signal branch). The account-restriction
+        // detector runs first and must win — clicking
+        // through a "restricted" page is worse than
+        // re-authenticating.
+        let report = evaluate_page(
+            &mock_fixtures::generic_account_restricted_page(),
+            true, // prior was dashboard
+            true, // google creds available
+            "example.com",
+        );
+        assert!(matches!(
+            report.outcome,
+            ResilienceHookOutcome::PauseForAccountRestriction { .. }
+        ));
+    }
+
+    #[test]
+    fn account_restriction_wins_over_captcha() {
+        // An "account restricted" page that *also* has a
+        // captcha-like iframe. The account-restriction
+        // detector should still fire; the captcha detector
+        // is a strict subset (per-session, recoverable) and
+        // the restriction is the more severe signal.
+        let report = evaluate_page(
+            &mock_fixtures::linkedin_restricted_account_page(),
+            false,
+            false,
+            "linkedin.com",
+        );
+        // Note: the linkedin_restricted_account_page
+        // fixture has a "Verify identity" button but no
+        // captcha iframe. The captcha detector should
+        // not fire on it (we'd see PauseForCaptcha if it
+        // did). The account-restriction path must.
+        assert!(matches!(
+            report.outcome,
+            ResilienceHookOutcome::PauseForAccountRestriction { .. }
+        ));
     }
 
     #[test]

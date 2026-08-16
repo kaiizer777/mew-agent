@@ -352,6 +352,66 @@ pub fn token_approaching_worker_health() -> crate::WorkerHealth {
 }
 
 // -------------------------------------------------------------------------
+// Phase 7 fixtures: account-restriction / unusual-activity pages
+// -------------------------------------------------------------------------
+
+/// LinkedIn "We've restricted your account" page. Positive
+/// case for the `AccountRestrictionKind::LinkedInRestricted`
+/// detector branch.
+pub fn linkedin_restricted_account_page() -> TreeNode {
+    n(
+        "RootWebArea",
+        "LinkedIn",
+        vec![
+            n("heading", "We've restricted your account", vec![]),
+            n(
+                "paragraph",
+                "We've restricted your account because of unusual activity. Please verify your identity to continue using LinkedIn.",
+                vec![],
+            ),
+            n_with_ref("button", "Verify identity", Some("@e1"), vec![]),
+        ],
+    )
+}
+
+/// Upwork / freelance board "Account temporarily restricted"
+/// page. Positive case for the
+/// `AccountRestrictionKind::FreelanceBoardRestricted` branch.
+pub fn freelance_temporary_restriction_page() -> TreeNode {
+    n(
+        "RootWebArea",
+        "Upwork",
+        vec![
+            n("heading", "Account temporarily restricted", vec![]),
+            n(
+                "paragraph",
+                "Your account has been temporarily restricted. Please try again in 24 hours or contact support.",
+                vec![],
+            ),
+            n_with_ref("link", "Contact support", Some("@e1"), vec![]),
+        ],
+    )
+}
+
+/// Generic "Account restricted" page (a job board we don't
+/// have a specific pattern for). Positive case for
+/// `AccountRestrictionKind::Generic`.
+pub fn generic_account_restricted_page() -> TreeNode {
+    n(
+        "RootWebArea",
+        "Example Job Board",
+        vec![
+            n("heading", "Account restricted", vec![]),
+            n(
+                "paragraph",
+                "Your account has been restricted due to violations of our terms of service.",
+                vec![],
+            ),
+        ],
+    )
+}
+
+// -------------------------------------------------------------------------
 // Phase 4 fixtures: Google authenticated session pages
 // -------------------------------------------------------------------------
 
@@ -555,5 +615,9 @@ mod tests {
         let _ = google_password_input_page();
         let _ = google_2fa_page();
         let _ = post_login_dashboard_page();
+        // Phase 7 account-restriction fixtures.
+        let _ = linkedin_restricted_account_page();
+        let _ = freelance_temporary_restriction_page();
+        let _ = generic_account_restricted_page();
     }
 }

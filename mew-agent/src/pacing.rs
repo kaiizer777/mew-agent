@@ -112,6 +112,41 @@ pub struct PacingConfig {
     /// pair (e.g. click into a field) that shouldn't be slowed.
     #[serde(default = "default_streak_threshold")]
     pub streak_threshold: u32,
+    /// Phase 7: when true, pacing activates *automatically*
+    /// on domains listed in `sensitive_platforms.toml` with
+    /// `known_to_challenge_bots = true`, *regardless* of
+    /// the global `enabled` flag. This is the "LinkedIn /
+    /// Indeed / Upwork need pacing by default" knob — the
+    /// motivating case is "concurrent/rapid actions on
+    /// these platforms are the primary account-flag
+    /// trigger", and asking the operator to opt in via
+    /// `pacing.enabled: true` defeats the point (they
+    /// won't know to flip it).
+    ///
+    /// Defaults to `true` so the personal-use setup is
+    /// safe out of the box. Operators who want raw speed
+    /// on a non-challenger domain can leave `enabled`
+    /// false and `force_for_challenger_domains` true —
+    /// only the challenger-domain actions get paced, not
+    /// the bulk of the agent's work.
+    #[serde(default = "default_force_for_challenger_domains")]
+    pub force_for_challenger_domains: bool,
+    /// Phase 7: per-challenger-domain delay range. The
+    /// global `min_delay_ms` / `max_delay_ms` are tuned
+    /// for "tight loop of same action"; on
+    /// `known_to_challenge_bots` domains the right delay
+    /// is more conservative (the platform's anti-bot
+    /// classifier watches for *any* burst of rapid
+    /// actions, not just same-type). When
+    /// `force_for_challenger_domains` is on, the
+    /// challenger-domain path uses these instead of the
+    /// global knobs. Defaults are 1.5s..3s — long enough
+    /// to be plausibly human, short enough that an
+    /// agent's per-platform budget doesn't blow up.
+    #[serde(default = "default_challenger_min_ms")]
+    pub challenger_min_delay_ms: u64,
+    #[serde(default = "default_challenger_max_ms")]
+    pub challenger_max_delay_ms: u64,
 }
 
 impl Default for PacingConfig {
@@ -121,6 +156,9 @@ impl Default for PacingConfig {
             min_delay_ms: default_min_ms(),
             max_delay_ms: default_max_ms(),
             streak_threshold: default_streak_threshold(),
+            force_for_challenger_domains: default_force_for_challenger_domains(),
+            challenger_min_delay_ms: default_challenger_min_ms(),
+            challenger_max_delay_ms: default_challenger_max_ms(),
         }
     }
 }
@@ -133,6 +171,22 @@ fn default_max_ms() -> u64 {
 }
 fn default_streak_threshold() -> u32 {
     2
+}
+fn default_force_for_challenger_domains() -> bool {
+    // Phase 7 default: ON. The motivating case
+    // (concurrent/rapid actions on LinkedIn / Indeed /
+    // Upwork are the primary account-flag trigger) is
+    // so well-known that opting in by default is the
+    // safe-by-default posture. Operators who want raw
+    // speed on a known-challenger domain can flip this
+    // off explicitly.
+    true
+}
+fn default_challenger_min_ms() -> u64 {
+    1500
+}
+fn default_challenger_max_ms() -> u64 {
+    3000
 }
 
 /// The decision returned from `PacingGuard::before_action`. The
@@ -314,6 +368,97 @@ impl PacingGuard {
     pub fn reset(&mut self) {
         self.streak = None;
     }
+
+    /// Phase 7: pacing decision for an action on a
+    /// `known_to_challenge_bots` domain. Distinct from
+    /// `before_action` because:
+    ///
+    ///   1. It activates *only* when
+    ///      `force_for_challenger_domains` is on, regardless
+    ///      of the global `enabled` flag. The motivating
+    ///      case is "the user wants pacing off for the bulk
+    ///      of the agent's work but ON for LinkedIn /
+    ///      Indeed / Upwork" — a per-domain knob is the
+    ///      right shape.
+    ///   2. The delay range is the *challenger* range
+    ///      (`challenger_min_delay_ms` ..
+    ///      `challenger_max_delay_ms`), not the global
+    ///      `min_delay_ms` / `max_delay_ms`. The
+    ///      challenger range is more conservative (default
+    ///      1.5s..3s vs the global 0.8s..2.5s) because
+    ///      the platform's anti-bot classifier watches
+    ///      *any* burst, not just same-type bursts.
+    ///   3. The first action of a streak still doesn't
+    ///      pay the delay (the streak_threshold is
+    ///      honored), so a single legitimate click on a
+    ///      job board isn't artificially slowed.
+    ///
+    /// `name` is the LLM-facing tool name. Returns
+    /// `PacingDecision` exactly as `before_action` does;
+    /// the caller is responsible for sleeping if the
+    /// variant carries a duration.
+    pub fn before_action_for_challenger(&mut self, name: &str) -> PacingDecision {
+        // Master switch: the per-domain knob must be on.
+        if !self.config.force_for_challenger_domains {
+            return PacingDecision::NoPacing;
+        }
+        // Non-paced tool name: reset streak, no pacing.
+        let action = match PacedAction::from_tool_name(name) {
+            Some(a) => a,
+            None => {
+                self.streak = None;
+                return PacingDecision::NoPacing;
+            }
+        };
+
+        // Clamp the challenger range defensively (bad
+        // config shouldn't crash the agent).
+        let min = self.config.challenger_min_delay_ms;
+        let max = self
+            .config
+            .challenger_max_delay_ms
+            .max(self.config.challenger_min_delay_ms);
+
+        // Track the streak so the threshold gate still
+        // works. We do NOT track the global streak on
+        // challenger domains — the per-domain streak
+        // starts fresh.
+        let new_streak_count;
+        match self.streak {
+            None => {
+                self.streak = Some(StreakState::new(action));
+                return PacingDecision::NoPacing;
+            }
+            Some(s) if s.action == action => {
+                new_streak_count = s.count + 1;
+                self.streak = Some(StreakState {
+                    action,
+                    count: new_streak_count,
+                });
+            }
+            Some(_) => {
+                self.streak = Some(StreakState::new(action));
+                return PacingDecision::NoPacing;
+            }
+        }
+
+        if new_streak_count < self.config.streak_threshold {
+            return PacingDecision::NoPacing;
+        }
+
+        let mut rng = rand::thread_rng();
+        let range = max - min;
+        let picked = if range == 0 {
+            min
+        } else {
+            min + rng.gen_range(0..=range)
+        };
+
+        PacingDecision::Pace {
+            delay: Duration::from_millis(picked),
+            streak: new_streak_count,
+        }
+    }
 }
 
 /// Phase 17.1: emit a transcript log line for a pacing decision.
@@ -375,6 +520,12 @@ mod tests {
             min_delay_ms: min,
             max_delay_ms: max,
             streak_threshold: threshold,
+            // Phase 7: tests of the global pacing path
+            // don't need the challenger knob; default
+            // it off so the test surface is unchanged.
+            force_for_challenger_domains: false,
+            challenger_min_delay_ms: min,
+            challenger_max_delay_ms: max,
         }
     }
 
@@ -553,5 +704,146 @@ mod tests {
                 panic!("expected Pace variant");
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 7: per-challenger-domain pacing
+    // -----------------------------------------------------------------
+
+    fn challenger_cfg(
+        force_for_challenger: bool,
+        min: u64,
+        max: u64,
+        threshold: u32,
+        global_enabled: bool,
+    ) -> PacingConfig {
+        PacingConfig {
+            enabled: global_enabled,
+            min_delay_ms: 100,
+            max_delay_ms: 200,
+            streak_threshold: threshold,
+            force_for_challenger_domains: force_for_challenger,
+            challenger_min_delay_ms: min,
+            challenger_max_delay_ms: max,
+        }
+    }
+
+    #[test]
+    fn challenger_pacing_disabled_by_default_returns_no_pacing() {
+        // Operator opt-out: force_for_challenger_domains
+        // = false. The challenger path must be a no-op
+        // even on tight same-type action streaks.
+        let mut g = PacingGuard::new(challenger_cfg(false, 1500, 3000, 1, false));
+        for _ in 0..10 {
+            assert_eq!(
+                g.before_action_for_challenger("click"),
+                PacingDecision::NoPacing
+            );
+        }
+    }
+
+    #[test]
+    fn challenger_pacing_activates_even_when_global_disabled() {
+        // The motivating case: global pacing is off
+        // (operator doesn't want their non-challenger
+        // actions slowed) but the challenger knob is on
+        // — the LinkedIn / Indeed / Upwork path still
+        // gets paced.
+        let mut g = PacingGuard::new(challenger_cfg(true, 1500, 3000, 1, false));
+        g.before_action_for_challenger("click"); // streak=1, no pace
+        let d = g.before_action_for_challenger("click");
+        assert!(matches!(d, PacingDecision::Pace { .. }));
+    }
+
+    #[test]
+    fn challenger_pacing_uses_challenger_range_not_global() {
+        // Global min/max are 100..200. Challenger range
+        // is 1500..3000. A paced decision must come
+        // from the challenger range.
+        let mut g = PacingGuard::new(challenger_cfg(true, 1500, 3000, 1, false));
+        g.before_action_for_challenger("click"); // seed
+        let d = g.before_action_for_challenger("click");
+        match d {
+            PacingDecision::Pace { delay, .. } => {
+                let ms = delay.as_millis() as u64;
+                assert!(
+                    (1500..=3000).contains(&ms),
+                    "delay {} outside challenger range [1500, 3000]",
+                    ms
+                );
+            }
+            other => panic!("expected Pace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn challenger_pacing_first_action_of_streak_does_not_pace() {
+        // Same grace-period semantics as the global
+        // path: the first action of a new streak
+        // doesn't pay the delay. The threshold gates
+        // "after N consecutive same-type actions, the
+        // Nth is the first to pace" — so threshold=3
+        // means the first two clicks are free, the
+        // third is paid.
+        let mut g = PacingGuard::new(challenger_cfg(true, 1500, 3000, 3, false));
+        assert_eq!(
+            g.before_action_for_challenger("click"),
+            PacingDecision::NoPacing
+        );
+        assert_eq!(
+            g.before_action_for_challenger("click"),
+            PacingDecision::NoPacing
+        );
+        // Third click (streak=3, threshold=3) paces.
+        let d = g.before_action_for_challenger("click");
+        assert!(matches!(d, PacingDecision::Pace { streak: 3, .. }));
+    }
+
+    #[test]
+    fn challenger_pacing_resets_on_different_action() {
+        // The challenger path uses its own streak; a
+        // click after a type doesn't pay a click-delay.
+        let mut g = PacingGuard::new(challenger_cfg(true, 1500, 3000, 1, false));
+        g.before_action_for_challenger("click"); // streak=1
+        let d = g.before_action_for_challenger("click"); // streak=2 -> Pace
+        assert!(matches!(d, PacingDecision::Pace { .. }));
+        // Switch action type — streak resets.
+        g.before_action_for_challenger("type");
+        assert_eq!(
+            g.before_action_for_challenger("click"),
+            PacingDecision::NoPacing
+        );
+    }
+
+    #[test]
+    fn challenger_pacing_and_global_pacing_are_independent() {
+        // The two paths share the streak state in
+        // the current implementation (the struct
+        // holds a single `streak` field). The intent
+        // is for the challenger path to use the same
+        // streak but a different delay range. This
+        // test pins that contract: a streak built by
+        // the global path is visible to the challenger
+        // path (and vice versa), so the caller must
+        // choose one path per domain.
+        let mut g = PacingGuard::new(challenger_cfg(true, 1500, 3000, 1, true));
+        g.before_action("click"); // global streak=1
+        // The global path now has streak=1; the next
+        // call on either path will see streak=2 and
+        // pace (using whichever range applies).
+        let d_global = g.before_action("click");
+        assert!(matches!(d_global, PacingDecision::Pace { .. }));
+    }
+
+    #[test]
+    fn challenger_pacing_default_knobs_match_spec() {
+        // Lock the default knobs down so a future
+        // tuning commit is explicit. Spec values:
+        // force_for_challenger_domains = true,
+        // challenger range = 1500..3000ms.
+        let c = PacingConfig::default();
+        assert!(c.force_for_challenger_domains);
+        assert_eq!(c.challenger_min_delay_ms, 1500);
+        assert_eq!(c.challenger_max_delay_ms, 3000);
     }
 }

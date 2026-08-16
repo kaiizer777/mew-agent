@@ -118,6 +118,9 @@ fn scenario_a_repeated_actions_are_paced() {
         min_delay_ms: 200,
         max_delay_ms: 400,
         streak_threshold: 3,
+        force_for_challenger_domains: false,
+        challenger_min_delay_ms: 0,
+        challenger_max_delay_ms: 0,
     };
     write_transcript_header("A_repeated_actions", &config);
     let mut guard = PacingGuard::new(config);
@@ -186,6 +189,9 @@ fn scenario_b_one_off_is_not_paced() {
         min_delay_ms: 200,
         max_delay_ms: 400,
         streak_threshold: 2,
+        force_for_challenger_domains: false,
+        challenger_min_delay_ms: 0,
+        challenger_max_delay_ms: 0,
     };
     write_transcript_header("B_one_off", &config);
     let mut guard = PacingGuard::new(config);
@@ -242,6 +248,9 @@ fn scenario_c_zero_range_still_logs() {
         min_delay_ms: 0,
         max_delay_ms: 0,
         streak_threshold: 1,
+        force_for_challenger_domains: false,
+        challenger_min_delay_ms: 0,
+        challenger_max_delay_ms: 0,
     };
     write_transcript_header("C_zero_range", &config);
     let mut guard = PacingGuard::new(config);
