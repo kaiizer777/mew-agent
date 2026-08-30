@@ -28,3 +28,7 @@ profile/
 *.log
 *.err
 *.out
+
+# Root markdown files (except README.md)
+/*.md
+!/README.md
