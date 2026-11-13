@@ -29,6 +29,6 @@ profile/
 *.err
 *.out
 
-# Root markdown files (except README.md)
-/*.md
-!/README.md
+.trash/
+__pycache__/
+traces/*.jsonl
