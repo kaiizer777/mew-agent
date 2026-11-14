@@ -6,7 +6,7 @@
 [![Tauri 2](https://img.shields.io/badge/UI-Tauri_2-24c8db?style=flat-square&logo=tauri)](https://v2.tauri.app/)
 [![Protocol](https://img.shields.io/badge/Protocol-CDP-4285F4?style=flat-square&logo=googlechrome)](https://chromedevtools.github.io/devtools-protocol/)
 
-**Mew** is a Rust-native computer-use agent that drives a visible Chromium window via the Chrome DevTools Protocol (CDP). Rather than relying on slow, expensive full-page vision models for every step, Mew perceives pages through fast accessibility-tree snapshots and diffs, falling back to targeted regional screenshots only for visual-only or canvas elements. Built to run locally on a $0 budget, it pairs a stealth Chromium runtime with a clean Tauri 2 desktop UI docked alongside the live browser.
+**Mew** is a Rust-native computer-use agent that drives a visible Chromium window via the Chrome DevTools Protocol (CDP). Rather than relying on slow, expensive full-page vision models for every step, Mew perceives pages through fast accessibility-tree snapshots and diffs, falling back to targeted regional screenshots only for visual-only or canvas elements.
 
 [How It Works](#-how-it-works) • [Core Capabilities](#-core-capabilities) • [System Overview](#-system-overview) • [Ethical Design](#-ethical-design)
 
