@@ -1,6 +1,6 @@
 <div align="center">
 
-#  Mew — A Fast, Robust, Visible Browser Agent in Rust
+#  Mew — A Fast & Robust Browser Agent in Rust
 
 [![Rust](https://img.shields.io/badge/Rust-97.5%25-dea584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Tauri 2](https://img.shields.io/badge/UI-Tauri_2-24c8db?style=flat-square&logo=tauri)](https://v2.tauri.app/)
